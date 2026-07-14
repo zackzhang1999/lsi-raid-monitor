@@ -1,0 +1,14 @@
+# Local data and logs
+data/
+*.log
+*.log.*
+charts/
+report-*.html
+__pycache__/
+*.pyc
+.env
+.venv/
+
+# Generated packages
+build/
+dist/

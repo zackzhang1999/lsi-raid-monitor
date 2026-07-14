@@ -1,0 +1,213 @@
+/* LSI RAID Monitor Web UI — Element Plus custom styles */
+
+[v-cloak] {
+  display: none !important;
+}
+
+body {
+  margin: 0;
+  font-family: 'Helvetica Neue', Helvetica, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;
+}
+
+.dark body {
+  background-color: #0f172a;
+}
+
+.dark-app .el-card {
+  background-color: #1e293b;
+  border-color: #334155;
+  color: #f1f5f9;
+}
+
+.dark-app .el-card__header {
+  border-bottom-color: #334155;
+}
+
+.dark-app .el-descriptions__body,
+.dark-app .el-descriptions__label,
+.dark-app .el-descriptions__content {
+  background-color: #1e293b !important;
+  color: #e2e8f0 !important;
+  border-color: #334155 !important;
+}
+
+.dark-app .el-table,
+.dark-app .el-table__expanded-cell,
+.dark-app .el-table th.el-table__cell,
+.dark-app .el-table tr,
+.dark-app .el-table td.el-table__cell {
+  background-color: #1e293b;
+  color: #e2e8f0;
+  border-color: #334155;
+}
+
+.dark-app .el-table--striped .el-table__body tr.el-table__row--striped td.el-table__cell {
+  background-color: #26354d;
+}
+
+.dark-app .el-table--enable-row-hover .el-table__body tr:hover > td.el-table__cell {
+  background-color: #334155;
+}
+
+.dark-app .el-empty__description {
+  color: #94a3b8;
+}
+
+.dark-app .el-timeline-item__content {
+  color: #e2e8f0;
+}
+
+.dark-app .el-timeline-item__timestamp {
+  color: #94a3b8;
+}
+
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.text-emerald-600 {
+  color: #059669;
+}
+
+.text-amber-600 {
+  color: #d97706;
+}
+
+.text-red-600 {
+  color: #dc2626;
+}
+
+.dark .text-emerald-400 {
+  color: #34d399;
+}
+
+.dark .text-amber-400 {
+  color: #fbbf24;
+}
+
+.dark .text-red-400 {
+  color: #f87171;
+}
+
+/* Health ring animation */
+circle[stroke-dasharray="264"] {
+  transition: stroke-dashoffset 0.8s ease-out, stroke 0.3s ease;
+}
+
+/* Dialog footer */
+.dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+/* Disk bay topology */
+.disk-slot {
+  width: 90px;
+  padding: 12px 6px;
+  border-radius: 8px;
+  text-align: center;
+  cursor: pointer;
+  border: 1px solid #e2e8f0;
+  background-color: #f8fafc;
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.disk-slot:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+}
+
+.disk-slot-ok {
+  border-left: 4px solid #10b981;
+}
+
+.disk-slot-warn {
+  border-left: 4px solid #f59e0b;
+  background-color: #fffbeb;
+}
+
+.disk-slot-error {
+  border-left: 4px solid #ef4444;
+  background-color: #fef2f2;
+}
+
+.dark .disk-slot {
+  background-color: #1e293b;
+  border-color: #334155;
+}
+
+.dark .disk-slot-warn {
+  background-color: #451a03;
+}
+
+.dark .disk-slot-error {
+  background-color: #450a0a;
+}
+
+/* SMART output */
+.smart-output {
+  overflow-x: auto;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background-color: #f8fafc;
+}
+
+.smart-pre {
+  margin: 0;
+  padding: 12px 16px;
+  min-width: 100%;
+  width: max-content;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, 'Courier New', monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre;
+  color: #334155;
+}
+
+.smart-output::-webkit-scrollbar {
+  height: 8px;
+}
+
+.smart-output::-webkit-scrollbar-track {
+  background: #e2e8f0;
+  border-radius: 4px;
+}
+
+.smart-output::-webkit-scrollbar-thumb {
+  background: #94a3b8;
+  border-radius: 4px;
+}
+
+.dark .smart-output {
+  border-color: #334155;
+  background-color: #0f172a;
+}
+
+.dark .smart-pre {
+  color: #cbd5e1;
+}
+
+.dark .smart-output::-webkit-scrollbar-track {
+  background: #334155;
+}
+
+.dark .smart-output::-webkit-scrollbar-thumb {
+  background: #64748b;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+  .el-header .flex {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .el-header .flex.items-center.gap-3 {
+    width: 100%;
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+}

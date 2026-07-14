@@ -1,0 +1,24 @@
+version: "3.8"
+
+services:
+  lsi-raid-monitor:
+    build: .
+    image: lsi-raid-monitor:latest
+    container_name: lsi-raid-monitor
+    restart: unless-stopped
+    ports:
+      - "5200:5200"
+    environment:
+      - LSI_DATA_DIR=/app/data
+      - STORCLI_PATH=/app/storcli64
+      - FLASK_RUN_HOST=0.0.0.0
+      - FLASK_RUN_PORT=5200
+      - TEMP_WARN=45
+      - TEMP_CRIT=50
+    volumes:
+      - ./data:/app/data
+      # 如需使用宿主机 storcli64，可取消下面注释
+      # - ./storcli64:/app/storcli64:ro
+      # 如需调用 smartctl 扫描设备，可映射 /dev
+      # - /dev:/dev
+    # privileged: true  # 如需访问 RAID 控制器硬件，可取消注释
