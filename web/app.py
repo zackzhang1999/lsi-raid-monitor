@@ -11,6 +11,7 @@ import csv
 import io
 import json
 import subprocess
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -38,6 +39,12 @@ TEMP_WARN = int(os.environ.get("TEMP_WARN", "45"))
 TEMP_CRIT = int(os.environ.get("TEMP_CRIT", "50"))
 
 EVENTS_FILE = BASE_DIR / "events.jsonl"
+COLLECTION_CONFIG_FILE = BASE_DIR / "collection_config.json"
+COLLECTION_INTERVALS = {5, 30, 60}
+DEFAULT_COLLECTION_INTERVAL = 30
+_collection_lock = threading.Lock()
+_scheduler_wakeup = threading.Event()
+_scheduler_started = False
 
 
 # ---- 工具函数 ----
@@ -620,7 +627,29 @@ def export_csv(hours: int = 24) -> str:
 # ---- 采集 ----
 
 
+def get_collection_config() -> dict:
+    interval = DEFAULT_COLLECTION_INTERVAL
+    if COLLECTION_CONFIG_FILE.exists():
+        try:
+            with open(COLLECTION_CONFIG_FILE, "r", encoding="utf-8") as f:
+                interval = int(json.load(f).get("interval_minutes", interval))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+    if interval not in COLLECTION_INTERVALS:
+        interval = DEFAULT_COLLECTION_INTERVAL
+    return {"interval_minutes": interval}
+
+
+def save_collection_config(interval_minutes: int):
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(COLLECTION_CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump({"interval_minutes": interval_minutes}, f, ensure_ascii=False, indent=2)
+
+
 def trigger_collection() -> dict:
+    if not _collection_lock.acquire(blocking=False):
+        return {"success": False, "busy": True, "error": "采集任务正在运行"}
+
     collector = PROJECT_ROOT / "lsi_collectd.py"
     try:
         result = subprocess.run(
@@ -637,6 +666,34 @@ def trigger_collection() -> dict:
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
+    finally:
+        _collection_lock.release()
+
+
+def _collection_scheduler():
+    while True:
+        result = trigger_collection()
+        if not result.get("success") and not result.get("busy"):
+            print(
+                f"[{_now():%Y-%m-%d %H:%M:%S}] automatic collection failed: "
+                f"{result.get('stderr') or result.get('error') or 'unknown error'}",
+                file=sys.stderr,
+            )
+        interval = get_collection_config()["interval_minutes"]
+        _scheduler_wakeup.wait(interval * 60)
+        _scheduler_wakeup.clear()
+
+
+def start_collection_scheduler():
+    global _scheduler_started
+    if _scheduler_started:
+        return
+    _scheduler_started = True
+    threading.Thread(
+        target=_collection_scheduler,
+        name="lsi-collection-scheduler",
+        daemon=True,
+    ).start()
 
 
 # ---- 磁盘操作 ----
@@ -880,6 +937,28 @@ def api_collect():
     return jsonify(trigger_collection())
 
 
+@app.route("/api/collection/config")
+def api_collection_config():
+    return jsonify(get_collection_config())
+
+
+@app.route("/api/collection/config", methods=["POST"])
+def api_collection_config_update():
+    data = request.get_json(silent=True) or {}
+    try:
+        interval = int(data.get("interval_minutes"))
+    except (ValueError, TypeError):
+        return jsonify({"success": False, "error": "采集周期无效"}), 400
+    if interval not in COLLECTION_INTERVALS:
+        return jsonify({"success": False, "error": "采集周期仅支持 5、30 或 60 分钟"}), 400
+    try:
+        save_collection_config(interval)
+    except OSError as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    _scheduler_wakeup.set()
+    return jsonify({"success": True, "interval_minutes": interval})
+
+
 # ---- 报警配置 ----
 
 
@@ -1010,4 +1089,6 @@ if __name__ == "__main__":
     host = os.environ.get("FLASK_RUN_HOST", "127.0.0.1")
     port = int(os.environ.get("FLASK_RUN_PORT", "5200"))
     debug = os.environ.get("FLASK_DEBUG", "0") == "1"
+    if not debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        start_collection_scheduler()
     app.run(host=host, port=port, debug=debug)

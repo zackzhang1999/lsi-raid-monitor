@@ -43,8 +43,16 @@
                 &nbsp;|&nbsp; 最后更新：<span>{{ status.timestamp ? status.timestamp : '—' }}</span>
               </p>
             </div>
-            <div class="flex items-center gap-3">
+            <div class="flex items-center gap-3 flex-wrap">
               <el-tag :type="statusType" size="large" effect="dark">{{ statusText }}</el-tag>
+              <div class="flex items-center gap-2">
+                <span class="text-sm text-slate-500 dark:text-slate-400">自动采集</span>
+                <el-select v-model="collectionInterval" style="width: 110px" @change="saveCollectionConfig" :loading="collectionConfigSaving">
+                  <el-option :value="5" label="5 分钟"></el-option>
+                  <el-option :value="30" label="30 分钟"></el-option>
+                  <el-option :value="60" label="1 小时"></el-option>
+                </el-select>
+              </div>
               <el-button type="primary" :icon="Download" @click="exportCsv">导出 CSV</el-button>
               <el-button type="success" :icon="RefreshRight" :loading="collecting" @click="collectNow">立即采集</el-button>
               <el-switch

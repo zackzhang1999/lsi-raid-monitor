@@ -29,7 +29,7 @@ sys.path.insert(0, str(exe_dir))
 # Create runtime directories
 Path(os.environ["LSI_DATA_DIR"]).mkdir(parents=True, exist_ok=True)
 
-from web.app import app  # noqa: E402
+from web.app import app, start_collection_scheduler  # noqa: E402
 
 
 if __name__ == "__main__":
@@ -38,4 +38,5 @@ if __name__ == "__main__":
     print(f"LSI RAID Monitor starting at http://{host}:{port}")
     print(f"Data directory: {os.environ.get('LSI_DATA_DIR')}")
     print(f"storcli64 path: {os.environ.get('STORCLI_PATH')}")
+    start_collection_scheduler()
     app.run(host=host, port=port, debug=False)

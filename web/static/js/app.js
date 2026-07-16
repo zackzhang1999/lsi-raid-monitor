@@ -18,6 +18,8 @@ const state = reactive({
   history: { datasets: [] },
   currentHistoryHours: 24,
   collecting: false,
+  collectionInterval: 30,
+  collectionConfigSaving: false,
   isDark: false,
   diskOperations: [],
   dialogVisible: false,
@@ -166,6 +168,23 @@ async function triggerCollect() {
   const res = await fetch('/api/collect', { method: 'POST' });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
+}
+
+async function fetchCollectionConfig() {
+  const res = await fetch('/api/collection/config');
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+async function updateCollectionConfig(intervalMinutes) {
+  const res = await fetch('/api/collection/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ interval_minutes: intervalMinutes })
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
 }
 
 async function operateDisk(eid, slot, action) {
@@ -346,6 +365,8 @@ async function collectNow() {
     if (result.success) {
       ElMessage.success('采集完成');
       await refresh();
+    } else if (result.busy) {
+      ElMessage.warning('采集任务正在运行');
     } else {
       ElMessage.error('采集失败: ' + (result.stderr || result.error || '未知'));
     }
@@ -353,6 +374,19 @@ async function collectNow() {
     ElMessage.error('采集请求失败: ' + err.message);
   } finally {
     state.collecting = false;
+  }
+}
+
+async function saveCollectionConfig() {
+  state.collectionConfigSaving = true;
+  try {
+    const result = await updateCollectionConfig(state.collectionInterval);
+    state.collectionInterval = result.interval_minutes;
+    ElMessage.success(`自动采集周期已设为 ${result.interval_minutes === 60 ? '1 小时' : result.interval_minutes + ' 分钟'}`);
+  } catch (err) {
+    ElMessage.error('保存采集周期失败: ' + err.message);
+  } finally {
+    state.collectionConfigSaving = false;
   }
 }
 
@@ -554,6 +588,9 @@ const app = createApp({
         state.alertConfig = cfg;
         syncAlertConfigForm();
       }).catch(() => {});
+      fetchCollectionConfig().then(cfg => {
+        state.collectionInterval = cfg.interval_minutes;
+      }).catch(() => {});
       startPolling();
     });
 
@@ -588,6 +625,7 @@ const app = createApp({
       storCounters: (row) => countersHtml(row, ['media_error', 'other_error', 'predictive_failure'], ['ME', 'OE', 'PF']),
       smartCounters: (row) => countersHtml(row, ['reallocated', 'pending', 'uncorrectable'], ['R', 'P', 'U']),
       collectNow,
+      saveCollectionConfig,
       exportCsv,
       testAlert,
       saveAlertConfig,
