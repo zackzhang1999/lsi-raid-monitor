@@ -3,7 +3,7 @@
  */
 
 const { createApp, reactive, computed, onMounted, onUnmounted, watch, nextTick, toRefs } = Vue;
-const { ElMessage } = ElementPlus;
+const { ElMessage, ElMessageBox } = ElementPlus;
 const { Sunny, Moon, RefreshRight, Download } = ElementPlusIconsVue;
 
 const STATUS_INTERVAL = 5000;
@@ -22,6 +22,8 @@ const state = reactive({
   collectionConfigSaving: false,
   isDark: false,
   diskOperations: [],
+  // 磁盘操作后待确认的状态覆盖：CSV 采集追上之前，轮询不把它刷回旧值
+  pendingDiskStates: {},
   dialogVisible: false,
   actionLoading: false,
   pendingAction: null,
@@ -39,10 +41,174 @@ const state = reactive({
   alertSaving: false,
   smartLoading: false,
   smartOutput: '',
-  smartError: ''
+  smartError: '',
+  authRequired: false,
+  loggedIn: true,
+  username: '',
+  userRole: '',
+  activeTab: 'overview',
+  loginForm: { username: 'admin', password: '' },
+  loginError: '',
+  loginLoading: false,
+  users: [],
+  usersLoading: false,
+  userSaving: false,
+  newUser: { username: '', password: '', role: 'viewer' },
+  resetDialog: { visible: false, username: '', password: '', loading: false }
 });
 
+// 供 storage.js 等独立组件读取当前登录角色
+window.LSI_STATE = state;
+
 let tempChart = null;
+
+// 401 统一处理：启用口令认证后，任何受保护接口返回 401 都回到登录遮罩
+const _rawFetch = window.fetch.bind(window);
+window.fetch = async (...args) => {
+  const res = await _rawFetch(...args);
+  if (res.status === 401 && state.authRequired) {
+    state.loggedIn = false;
+  }
+  return res;
+};
+
+// ---- 认证 ----
+
+async function fetchAuthStatus() {
+  try {
+    const res = await _rawFetch('/api/auth/status');
+    if (!res.ok) return;
+    const data = await res.json();
+    state.authRequired = !!data.auth_required;
+    state.loggedIn = !!data.logged_in;
+    state.username = data.username || '';
+    state.userRole = data.role || '';
+  } catch (err) { /* 忽略，默认免登录 */ }
+}
+
+async function doLogin() {
+  state.loginLoading = true;
+  state.loginError = '';
+  try {
+    const res = await _rawFetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: state.loginForm.username, password: state.loginForm.password })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || '登录失败');
+    state.loggedIn = true;
+    state.username = data.username || state.loginForm.username;
+    state.userRole = data.role || '';
+    state.loginForm.password = '';
+    loadUsers();
+    refresh();
+  } catch (err) {
+    state.loginError = err.message;
+  } finally {
+    state.loginLoading = false;
+  }
+}
+
+async function doLogout() {
+  try { await _rawFetch('/api/logout', { method: 'POST' }); } catch (err) { /* 忽略 */ }
+  state.loggedIn = false;
+  state.username = '';
+  state.userRole = '';
+}
+
+// ---- 用户管理（仅管理员） ----
+
+async function loadUsers() {
+  state.usersLoading = true;
+  try {
+    const res = await fetch('/api/users');
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    state.users = data.users || [];
+  } catch (err) {
+    state.users = [];
+    console.error('加载用户列表失败:', err);
+  } finally {
+    state.usersLoading = false;
+  }
+}
+
+async function createUser() {
+  if (!state.newUser.username || !state.newUser.password) {
+    ElMessage.warning('请填写用户名和口令');
+    return;
+  }
+  state.userSaving = true;
+  try {
+    const res = await fetch('/api/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(state.newUser)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    ElMessage.success('用户已创建: ' + state.newUser.username);
+    state.newUser = { username: '', password: '', role: 'viewer' };
+    // 创建首个管理员后认证随即启用，刷新登录状态
+    await fetchAuthStatus();
+    await loadUsers();
+  } catch (err) {
+    ElMessage.error('创建用户失败: ' + err.message);
+  } finally {
+    state.userSaving = false;
+  }
+}
+
+function openResetPassword(row) {
+  state.resetDialog = { visible: true, username: row.username, password: '', loading: false };
+}
+
+async function doResetPassword() {
+  if (!state.resetDialog.password) {
+    ElMessage.warning('请输入新口令');
+    return;
+  }
+  state.resetDialog.loading = true;
+  try {
+    const res = await fetch('/api/users/password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: state.resetDialog.username, password: state.resetDialog.password })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    ElMessage.success('口令已重置: ' + state.resetDialog.username);
+    state.resetDialog.visible = false;
+  } catch (err) {
+    ElMessage.error('重置口令失败: ' + err.message);
+  } finally {
+    state.resetDialog.loading = false;
+  }
+}
+
+function confirmDeleteUser(row) {
+  ElMessageBox.confirm(
+    `确定要删除用户「${row.username}」吗？`,
+    '删除用户',
+    { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' }
+  ).then(async () => {
+    try {
+      const res = await fetch('/api/users/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: row.username })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      ElMessage.success('已删除用户: ' + row.username);
+      await fetchAuthStatus();
+      await loadUsers();
+    } catch (err) {
+      ElMessage.error('删除用户失败: ' + err.message);
+    }
+  }).catch(() => {});
+}
 
 // ---- helpers ----
 
@@ -327,6 +493,21 @@ function renderChart() {
 
 // ---- actions ----
 
+// 把操作后回读到的磁盘状态覆盖到表格上（90 秒内有效，等 CSV 采集追上）
+function applyPendingDiskStates() {
+  const now = Date.now();
+  const disks = state.status.physical_disks || [];
+  for (const key of Object.keys(state.pendingDiskStates)) {
+    const pending = state.pendingDiskStates[key];
+    if (now > pending.expires) {
+      delete state.pendingDiskStates[key];
+      continue;
+    }
+    const row = disks.find(d => d.label === key);
+    if (row && row.state !== pending.state) row.state = pending.state;
+  }
+}
+
 async function refresh() {
   try {
     const offset = (state.eventPage - 1) * state.eventPageSize;
@@ -336,6 +517,7 @@ async function refresh() {
       fetchEvents(state.eventPageSize, offset, state.eventFilter)
     ]);
     state.status = status;
+    applyPendingDiskStates();
     state.history = history;
     state.events = events.events || [];
     state.eventTotal = events.total || 0;
@@ -471,7 +653,16 @@ async function confirmDiskAction() {
   try {
     const result = await operateDisk(row.eid, row.slot, action);
     if (result.success) {
-      ElMessage.success(`磁盘 ${label} 操作成功`);
+      // 立即把表格中该盘状态更新为 storcli 回读的真实值，不等下次采集；
+      // 90 秒内的轮询也不会把它刷回旧值，直到 CSV 采集追上
+      if (result.current_state) {
+        row.state = result.current_state;
+        state.pendingDiskStates[label] = { state: result.current_state, expires: Date.now() + 90000 };
+      }
+      ElMessage.success(`磁盘 ${label} 操作成功` + (result.current_state ? `，当前状态: ${result.current_state}` : ''));
+      // 后台采集完成后再从 CSV 刷新全量数据（事件、温度等）
+      setTimeout(refresh, 8000);
+      setTimeout(refresh, 20000);
     } else {
       ElMessage.error(`磁盘 ${label} 操作失败: ${result.stderr || result.error || '未知错误'}`);
     }
@@ -581,9 +772,14 @@ const app = createApp({
 
     const healthLevelLabel = computed(() => healthLevelText(healthLevel.value));
 
+    // 未启用认证时视为管理员（无限制）；启用后按登录角色判断
+    const isAdmin = computed(() => !state.authRequired || state.userRole === 'admin');
+
     onMounted(() => {
       initTheme();
+      fetchAuthStatus();
       loadDiskOperations();
+      loadUsers();
       fetchAlertConfig().then(cfg => {
         state.alertConfig = cfg;
         syncAlertConfigForm();
@@ -600,6 +796,7 @@ const app = createApp({
 
     return {
       ...toRefs(state),
+      isAdmin,
       statusType,
       statusText,
       healthScore,
@@ -631,6 +828,13 @@ const app = createApp({
       saveAlertConfig,
       syncAlertConfigForm,
       toggleTheme,
+      doLogin,
+      doLogout,
+      loadUsers,
+      createUser,
+      openResetPassword,
+      doResetPassword,
+      confirmDeleteUser,
       onHistoryRangeChange,
       onEventPageChange,
       onEventFilterChange,
@@ -651,5 +855,8 @@ const USED_ICONS = { Sunny, Moon, RefreshRight, Download };
 for (const [key, component] of Object.entries(USED_ICONS)) {
   app.component(key, component);
 }
+
+// 注册磁盘管理面板（storage.js 中定义的全局组件）
+if (window.StoragePanel) app.component('storage-panel', window.StoragePanel);
 
 app.mount('#app');

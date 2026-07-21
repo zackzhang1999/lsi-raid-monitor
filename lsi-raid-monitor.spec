@@ -5,7 +5,7 @@ a = Analysis(
     ['bundle_entry.py'],
     pathex=[],
     binaries=[],
-    datas=[('web', 'web'), ('lsi_report.py', '.'), ('lsi_collectd.py', '.'), ('requirements.txt', '.')],
+    datas=[('web', 'web'), ('lsi_report.py', '.'), ('lsi_collectd.py', '.'), ('storage_mgr.py', '.'), ('user_mgr.py', '.'), ('requirements.txt', '.')],
     hiddenimports=['flask', 'matplotlib', 'matplotlib.backends.backend_agg'],
     hookspath=[],
     hooksconfig={},

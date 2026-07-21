@@ -61,6 +61,23 @@ prompt_secret() {
   fi
 }
 
+prompt_secret_optional() {
+  local name="$1" label="$2" current="${3:-}" value=""
+  if [ -n "$current" ]; then
+    read -r -s -p "$label [已配置，回车保持不变，输入空格后回车可清空]: " value
+    printf '\n'
+    if [ "$value" = " " ]; then
+      printf -v "$name" '%s' ""
+    else
+      printf -v "$name" '%s' "${value:-$current}"
+    fi
+  else
+    read -r -s -p "$label: " value
+    printf '\n'
+    printf -v "$name" '%s' "$value"
+  fi
+}
+
 check_project_files() {
   [ -f "$PROJECT_DIR/lsi_collectd.py" ] || die "未找到 lsi_collectd.py，请把本脚本放到项目根目录。"
   [ -f "$PROJECT_DIR/lsi_report.py" ] || die "未找到 lsi_report.py，请把本脚本放到项目根目录。"
@@ -109,6 +126,7 @@ configure_env() {
   prompt_value TEMP_CRIT "硬盘温度严重阈值" "${TEMP_CRIT:-50}"
   prompt_value REPORT_HOUR "每日报告小时" "${REPORT_HOUR:-10}"
   prompt_value REPORT_MINUTE "每日报告分钟" "${REPORT_MINUTE:-0}"
+  prompt_secret_optional WEB_PASSWORD "Web 管理口令（留空=不启用认证，不启用时 Web 写操作无保护，请勿暴露到公网）" "${WEB_PASSWORD:-}"
 }
 
 write_env() {
@@ -130,6 +148,7 @@ TEMP_WARN="$TEMP_WARN"
 TEMP_CRIT="$TEMP_CRIT"
 REPORT_HOUR="$REPORT_HOUR"
 REPORT_MINUTE="$REPORT_MINUTE"
+WEB_PASSWORD="$WEB_PASSWORD"
 ENVEOF
   chmod 600 "$ENV_FILE"
   chown "$TARGET_USER":"$TARGET_USER" "$ENV_FILE" 2>/dev/null || true
@@ -152,9 +171,23 @@ install_sudoers() {
   log "配置免密 sudo"
   [ -x "$STORCLI_PATH" ] || warn "未确认 storcli64 可执行：$STORCLI_PATH"
   [ -x "$SMARTCTL_PATH" ] || warn "未确认 smartctl 可执行：$SMARTCTL_PATH"
+  # 磁盘管理所需命令，路径随发行版不同，用 command -v 解析，找不到则回退到常见路径
+  local mount_bin umount_bin mkfs_ext4_bin mkfs_xfs_bin mkdir_bin lsblk_bin
+  mount_bin="$(find_binary /bin/mount mount)"
+  umount_bin="$(find_binary /bin/umount umount)"
+  mkfs_ext4_bin="$(find_binary /sbin/mkfs.ext4 mkfs.ext4)"
+  mkfs_xfs_bin="$(find_binary /sbin/mkfs.xfs mkfs.xfs)"
+  mkdir_bin="$(find_binary /bin/mkdir mkdir)"
+  lsblk_bin="$(find_binary /bin/lsblk lsblk)"
   cat > "$SUDOERS_FILE" <<SUDOEOF
 $TARGET_USER ALL=(root) NOPASSWD: $STORCLI_PATH
 $TARGET_USER ALL=(root) NOPASSWD: $SMARTCTL_PATH
+$TARGET_USER ALL=(root) NOPASSWD: $mount_bin
+$TARGET_USER ALL=(root) NOPASSWD: $umount_bin
+$TARGET_USER ALL=(root) NOPASSWD: $mkfs_ext4_bin
+$TARGET_USER ALL=(root) NOPASSWD: $mkfs_xfs_bin
+$TARGET_USER ALL=(root) NOPASSWD: $mkdir_bin
+$TARGET_USER ALL=(root) NOPASSWD: $lsblk_bin
 SUDOEOF
   chmod 440 "$SUDOERS_FILE"
   visudo -cf "$SUDOERS_FILE" >/dev/null

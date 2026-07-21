@@ -10,13 +10,16 @@ import sys
 import csv
 import io
 import json
+import secrets
 import subprocess
 import threading
+import time
+from functools import wraps
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict
 
-from flask import Flask, jsonify, render_template, request, Response
+from flask import Flask, jsonify, render_template, request, Response, session
 
 # 引入项目根目录，复用 lsi_report 的数据读取逻辑
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -24,6 +27,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import lsi_report
 import lsi_alert
+import storage_mgr
+import user_mgr
 
 # ---- Flask 配置 ----
 WEB_DIR = Path(__file__).resolve().parent
@@ -45,6 +50,60 @@ DEFAULT_COLLECTION_INTERVAL = 30
 _collection_lock = threading.Lock()
 _scheduler_wakeup = threading.Event()
 _scheduler_started = False
+
+# ---- 认证配置 ----
+WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "")
+
+
+def _load_secret_key() -> str:
+    """优先取环境变量，否则用持久化的随机密钥文件。"""
+    env_key = os.environ.get("WEB_SECRET_KEY")
+    if env_key:
+        return env_key
+    key_file = BASE_DIR / ".secret_key"
+    try:
+        if key_file.exists():
+            return key_file.read_text().strip()
+        BASE_DIR.mkdir(parents=True, exist_ok=True)
+        key = secrets.token_hex(32)
+        key_file.write_text(key)
+        os.chmod(key_file, 0o600)
+        return key
+    except OSError:
+        return secrets.token_hex(32)
+
+
+app.secret_key = _load_secret_key()
+
+# 无用户时按旧版 WEB_PASSWORD 迁移出一个 admin 用户
+user_mgr.ensure_bootstrap(WEB_PASSWORD)
+
+
+def auth_enabled() -> bool:
+    return user_mgr.users_exist()
+
+
+def current_role() -> str | None:
+    """当前会话角色；未启用认证时视为 admin（无限制）。"""
+    if not auth_enabled():
+        return "admin"
+    return session.get("role")
+
+
+def require_admin(view):
+    """危险/写操作仅管理员可用；普通用户返回 403，未登录返回 401。"""
+
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        if not auth_enabled():
+            return view(*args, **kwargs)
+        if not session.get("user"):
+            return jsonify({"success": False, "error": "unauthorized"}), 401
+        if session.get("role") != "admin":
+            return jsonify({"success": False, "error": "需要管理员权限"}), 403
+        return view(*args, **kwargs)
+
+    return wrapper
 
 
 # ---- 工具函数 ----
@@ -463,6 +522,8 @@ def build_status() -> dict:
         current_disk_details.append(
             {
                 **d,
+                # summary 的 state 是 24h 内出现过的状态集合，实时视图应显示最新状态
+                "state": current.get("state") or d.get("state"),
                 "temperature": current.get("temperature", d.get("temp_max")),
                 "media_error": current.get("media_error", d.get("media_error")),
                 "other_error": current.get("other_error", d.get("other_error")),
@@ -767,9 +828,48 @@ def operate_disk(eid: int, slot: int, action: str) -> dict:
                     "message": f"磁盘 E{eid}:S{slot} 执行操作: {cfg['label']}",
                 }
             )
+            # 立即回读最新状态，并后台触发一次采集刷新 CSV，
+            # 使界面数秒内显示操作后的真实状态而不是等下个采集周期
+            response["current_state"] = _read_disk_state(storcli, controller, eid, slot)
+            try:
+                storage_mgr.invalidate_cache()
+            except Exception:
+                pass
+            threading.Thread(target=_post_op_collection, daemon=True).start()
         return response
     except Exception as e:
         return {"success": False, "error": str(e), "command": full_cmd}
+
+
+def _read_disk_state(storcli: str, controller: str, eid: int, slot: int) -> str | None:
+    """操作后立即从 storcli 回读磁盘当前状态，失败返回 None。"""
+    try:
+        result = subprocess.run(
+            ["sudo", storcli, f"{controller}/e{eid}/s{slot}", "show", "J"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        data = json.loads(result.stdout or "{}")
+        info = data["Controllers"][0]["Response Data"]["Drive Information"]
+        for entry in info:
+            if entry.get("EID:Slt") == f"{eid}:{slot}":
+                return entry.get("State")
+    except Exception:
+        pass
+    return None
+
+
+def _post_op_collection() -> None:
+    """磁盘操作后稍等控制器状态稳定，再触发一次完整采集。"""
+    time.sleep(3)
+    result = trigger_collection()
+    if not result.get("success") and not result.get("busy"):
+        print(
+            f"[{_now():%Y-%m-%d %H:%M:%S}] post-operation collection failed: "
+            f"{result.get('stderr') or result.get('error') or 'unknown error'}",
+            file=sys.stderr,
+        )
 
 
 def _find_did_for_disk(eid: int, slot: int) -> int | None:
@@ -921,6 +1021,7 @@ def api_disk_operations():
 
 
 @app.route("/api/disk/<int:eid>/<int:slot>/operate", methods=["POST"])
+@require_admin
 def api_disk_operate(eid: int, slot: int):
     data = request.get_json(silent=True) or {}
     action = data.get("action", "").strip().lower()
@@ -933,6 +1034,7 @@ def api_disk_smart(eid: int, slot: int):
 
 
 @app.route("/api/collect", methods=["POST"])
+@require_admin
 def api_collect():
     return jsonify(trigger_collection())
 
@@ -943,6 +1045,7 @@ def api_collection_config():
 
 
 @app.route("/api/collection/config", methods=["POST"])
+@require_admin
 def api_collection_config_update():
     data = request.get_json(silent=True) or {}
     try:
@@ -993,6 +1096,7 @@ def api_alert_config():
 
 
 @app.route("/api/alert/config", methods=["POST"])
+@require_admin
 def api_alert_config_update():
     data = request.get_json(silent=True) or {}
 
@@ -1044,6 +1148,7 @@ def api_alert_config_update():
 
 
 @app.route("/api/alert/test", methods=["POST"])
+@require_admin
 def api_alert_test():
     cfg = lsi_alert.get_alert_config()
     alert_email_to = cfg.get("alert_email_to", "")
@@ -1080,6 +1185,193 @@ def api_alert_test():
         )
         return jsonify({"success": True, "recipients": recipients})
     return jsonify({"success": False, "error": "sendmail command failed"}), 500
+
+
+# ---- 认证 ----
+
+
+@app.route("/api/auth/status")
+def api_auth_status():
+    role = current_role() if (session.get("user") or not auth_enabled()) else None
+    return jsonify(
+        {
+            "auth_required": auth_enabled(),
+            "logged_in": bool(session.get("user")) or not auth_enabled(),
+            "username": session.get("user") or "",
+            "role": role or "",
+        }
+    )
+
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    if not auth_enabled():
+        return jsonify({"success": True})
+    data = request.get_json(silent=True) or {}
+    username = str(data.get("username", "")).strip()
+    role = user_mgr.verify(username, str(data.get("password", "")))
+    if role:
+        session["user"] = username
+        session["role"] = role
+        return jsonify({"success": True, "username": username, "role": role})
+    return jsonify({"success": False, "error": "用户名或口令错误"}), 401
+
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    session.pop("user", None)
+    session.pop("role", None)
+    return jsonify({"success": True})
+
+
+# ---- 用户管理（仅管理员） ----
+
+
+@app.route("/api/users")
+@require_admin
+def api_users_list():
+    return jsonify({"success": True, "users": user_mgr.list_users()})
+
+
+@app.route("/api/users", methods=["POST"])
+@require_admin
+def api_users_create():
+    data = request.get_json(silent=True) or {}
+    ok, msg = user_mgr.create_user(
+        str(data.get("username", "")).strip(),
+        str(data.get("password", "")),
+        str(data.get("role", "viewer")).strip() or "viewer",
+    )
+    if not ok:
+        return jsonify({"success": False, "error": msg}), 400
+    append_event(
+        {
+            "type": "user_op",
+            "level": "info",
+            "message": f"管理员 {session.get('user')} 新建用户 {msg}（{data.get('role', 'viewer')}）",
+        }
+    )
+    return jsonify({"success": True, "username": msg})
+
+
+@app.route("/api/users/password", methods=["POST"])
+@require_admin
+def api_users_password():
+    data = request.get_json(silent=True) or {}
+    ok, msg = user_mgr.set_password(
+        str(data.get("username", "")).strip(), str(data.get("password", ""))
+    )
+    if not ok:
+        return jsonify({"success": False, "error": msg}), 400
+    append_event(
+        {
+            "type": "user_op",
+            "level": "info",
+            "message": f"管理员 {session.get('user')} 重置了用户 {msg} 的口令",
+        }
+    )
+    return jsonify({"success": True})
+
+
+@app.route("/api/users/delete", methods=["POST"])
+@require_admin
+def api_users_delete():
+    data = request.get_json(silent=True) or {}
+    ok, msg = user_mgr.delete_user(
+        str(data.get("username", "")).strip(), session.get("user", "")
+    )
+    if not ok:
+        return jsonify({"success": False, "error": msg}), 400
+    append_event(
+        {
+            "type": "user_op",
+            "level": "warn",
+            "message": f"管理员 {session.get('user')} 删除了用户 {msg}",
+        }
+    )
+    return jsonify({"success": True})
+
+
+def _dev_name(value) -> str:
+    """统一设备参数：接受 'sdb1' 或 '/dev/sdb1'，返回裸设备名。"""
+    name = str(value or "").strip()
+    if name.startswith("/dev/"):
+        name = name[len("/dev/"):]
+    return name
+
+
+# ---- 存储管理 ----
+
+
+@app.route("/api/storage/disks")
+def api_storage_disks():
+    try:
+        tree = storage_mgr.build_storage_tree()
+        tree["success"] = True
+        return jsonify(tree)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/storage/disk/<name>/smart")
+def api_storage_disk_smart(name: str):
+    try:
+        return jsonify(storage_mgr.get_smart_any(name))
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/storage/mount", methods=["POST"])
+@require_admin
+def api_storage_mount():
+    data = request.get_json(silent=True) or {}
+    device = _dev_name(data.get("device"))
+    mountpoint = data.get("mountpoint") or None
+    if mountpoint:
+        mountpoint = str(mountpoint).strip()
+    ok, result = storage_mgr.mount_device(device, mountpoint)
+    _log_storage_op("挂载", device, ok, result)
+    if ok:
+        return jsonify({"success": True, **result})
+    return jsonify({"success": False, "error": str(result)}), 400
+
+
+@app.route("/api/storage/umount", methods=["POST"])
+@require_admin
+def api_storage_umount():
+    data = request.get_json(silent=True) or {}
+    device = _dev_name(data.get("device"))
+    ok, result = storage_mgr.umount_device(device)
+    _log_storage_op("卸载", device, ok, result)
+    if ok:
+        return jsonify({"success": True, **result})
+    return jsonify({"success": False, "error": str(result)}), 400
+
+
+@app.route("/api/storage/format", methods=["POST"])
+@require_admin
+def api_storage_format():
+    data = request.get_json(silent=True) or {}
+    device = _dev_name(data.get("device"))
+    fstype = str(data.get("fstype", "")).strip()
+    label = data.get("label") or None
+    confirm_name = _dev_name(data.get("confirm_name"))
+    ok, result = storage_mgr.format_device(device, fstype, label, confirm_name)
+    _log_storage_op(f"格式化为 {fstype}", device, ok, result)
+    if ok:
+        return jsonify({"success": True, **result})
+    return jsonify({"success": False, "error": str(result)}), 400
+
+
+def _log_storage_op(op: str, device: str, ok: bool, result) -> None:
+    detail = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+    append_event(
+        {
+            "type": "storage_op",
+            "level": "info" if ok else "warn",
+            "message": f"存储操作[{op}] 设备 {device}: {'成功' if ok else '失败'} — {detail}",
+        }
+    )
 
 
 # ---- 主入口 ----

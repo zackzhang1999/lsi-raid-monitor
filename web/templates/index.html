@@ -18,7 +18,6 @@
   <script src="/static/vendor/chart.umd.min.js"></script>
 
   <!-- Element Plus 图标 -->
-  <link rel="stylesheet" href="">
   <script src="/static/vendor/element-plus-icons.iife.js"></script>
 
     <script src="/static/vendor/tailwind.js"></script>
@@ -29,6 +28,18 @@
 {% raw %}
   <div id="app" v-cloak class="min-h-screen">
     <el-config-provider :locale="locale">
+      <!-- 登录遮罩（启用用户认证时显示） -->
+      <div v-if="authRequired && !loggedIn" class="fixed inset-0 z-[4000] flex items-center justify-center bg-slate-900/60">
+        <el-card class="w-80" shadow="always">
+          <template #header>
+            <div class="card-header"><span>存储管理登录</span></div>
+          </template>
+          <el-input v-model="loginForm.username" placeholder="用户名" class="mb-3" @keyup.enter="doLogin"></el-input>
+          <el-input v-model="loginForm.password" type="password" placeholder="口令" show-password @keyup.enter="doLogin"></el-input>
+          <el-alert v-if="loginError" :title="loginError" type="error" class="mt-3" :closable="false"></el-alert>
+          <el-button type="primary" class="w-full mt-4" :loading="loginLoading" @click="doLogin">登录</el-button>
+        </el-card>
+      </div>
       <el-container class="max-w-7xl mx-auto px-4 py-6" :class="{ 'dark-app': isDark }">
         <!-- Header -->
         <el-header class="!h-auto !p-0 mb-6">
@@ -47,14 +58,14 @@
               <el-tag :type="statusType" size="large" effect="dark">{{ statusText }}</el-tag>
               <div class="flex items-center gap-2">
                 <span class="text-sm text-slate-500 dark:text-slate-400">自动采集</span>
-                <el-select v-model="collectionInterval" style="width: 110px" @change="saveCollectionConfig" :loading="collectionConfigSaving">
+                <el-select v-model="collectionInterval" style="width: 110px" @change="saveCollectionConfig" :loading="collectionConfigSaving" :disabled="!isAdmin">
                   <el-option :value="5" label="5 分钟"></el-option>
                   <el-option :value="30" label="30 分钟"></el-option>
                   <el-option :value="60" label="1 小时"></el-option>
                 </el-select>
               </div>
               <el-button type="primary" :icon="Download" @click="exportCsv">导出 CSV</el-button>
-              <el-button type="success" :icon="RefreshRight" :loading="collecting" @click="collectNow">立即采集</el-button>
+              <el-button v-if="isAdmin" type="success" :icon="RefreshRight" :loading="collecting" @click="collectNow">立即采集</el-button>
               <el-switch
                 v-model="isDark"
                 active-text="暗色"
@@ -64,11 +75,17 @@
                 :inactive-icon="Sunny"
                 @change="toggleTheme"
               ></el-switch>
+              <template v-if="authRequired && loggedIn">
+                <el-tag :type="userRole === 'admin' ? 'danger' : 'info'" effect="plain">{{ username }}（{{ userRole === 'admin' ? '管理员' : '只读' }}）</el-tag>
+                <el-button type="warning" plain @click="doLogout">退出登录</el-button>
+              </template>
             </div>
           </div>
         </el-header>
 
         <el-main class="!p-0">
+          <el-tabs v-model="activeTab" class="main-tabs">
+            <el-tab-pane label="监控概览" name="overview">
           <!-- Health Score -->
           <el-card class="mb-6" shadow="hover">
             <template #header>
@@ -168,8 +185,8 @@
               </el-form-item>
 
               <el-form-item>
-                <el-button type="primary" :loading="alertSaving" @click="saveAlertConfig">保存配置</el-button>
-                <el-button type="warning" :loading="alertTesting" @click="testAlert">测试报警</el-button>
+                <el-button type="primary" :loading="alertSaving" :disabled="!isAdmin" @click="saveAlertConfig">保存配置</el-button>
+                <el-button type="warning" :loading="alertTesting" :disabled="!isAdmin" @click="testAlert">测试报警</el-button>
               </el-form-item>
             </el-form>
 
@@ -377,6 +394,7 @@
                 <template #default="scope">
                   <el-button type="primary" link size="small" @click="showDiskDetail(scope.row)">详情</el-button>
                   <el-select
+                    v-if="isAdmin"
                     v-model="scope.row._action"
                     placeholder="选择操作"
                     size="small"
@@ -447,6 +465,58 @@
           </el-card>
 
           <p class="text-center text-xs text-slate-400 dark:text-slate-500 mt-8">LSI RAID 监控 Web 界面</p>
+            </el-tab-pane>
+            <el-tab-pane label="磁盘管理" name="storage" lazy>
+              <storage-panel></storage-panel>
+            </el-tab-pane>
+            <el-tab-pane v-if="isAdmin" label="用户管理" name="users" lazy>
+              <el-card shadow="hover">
+                <template #header>
+                  <div class="card-header">
+                    <span>用户管理</span>
+                    <el-tag v-if="authRequired" type="success" effect="plain">认证已启用</el-tag>
+                    <el-tag v-else type="info" effect="plain">未启用认证</el-tag>
+                  </div>
+                </template>
+                <el-alert
+                  v-if="!authRequired"
+                  type="warning"
+                  show-icon
+                  :closable="false"
+                  title="当前未启用认证，任何能访问本页面的人都拥有全部权限。创建第一个管理员账号后将启用登录认证，写操作仅管理员可用。"
+                  class="mb-4"
+                ></el-alert>
+                <el-table :data="users" size="small" border stripe v-loading="usersLoading" empty-text="暂无用户">
+                  <el-table-column prop="username" label="用户名" min-width="120"></el-table-column>
+                  <el-table-column label="角色" width="110">
+                    <template #default="scope">
+                      <el-tag :type="scope.row.role === 'admin' ? 'danger' : 'info'" effect="plain">
+                        {{ scope.row.role === 'admin' ? '管理员' : '只读用户' }}
+                      </el-tag>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="操作" width="170">
+                    <template #default="scope">
+                      <el-button type="primary" link size="small" @click="openResetPassword(scope.row)">重置口令</el-button>
+                      <el-button type="danger" link size="small" @click="confirmDeleteUser(scope.row)">删除</el-button>
+                    </template>
+                  </el-table-column>
+                </el-table>
+
+                <el-divider content-position="left">新建用户</el-divider>
+                <div class="flex items-center gap-2 flex-wrap">
+                  <el-input v-model="newUser.username" placeholder="用户名" style="width: 150px"></el-input>
+                  <el-input v-model="newUser.password" type="password" placeholder="口令" show-password style="width: 180px"></el-input>
+                  <el-select v-model="newUser.role" style="width: 120px">
+                    <el-option value="viewer" label="只读用户"></el-option>
+                    <el-option value="admin" label="管理员"></el-option>
+                  </el-select>
+                  <el-button type="primary" :loading="userSaving" @click="createUser">添加</el-button>
+                </div>
+                <p class="text-xs text-slate-400 mt-2">管理员拥有全部权限（磁盘操作、格式化、用户管理等）；只读用户仅可查看。</p>
+              </el-card>
+            </el-tab-pane>
+          </el-tabs>
         </el-main>
       </el-container>
 
@@ -468,6 +538,15 @@
             <el-button @click="dialogVisible = false">取消</el-button>
             <el-button type="primary" :loading="actionLoading" @click="confirmDiskAction">确认执行</el-button>
           </span>
+        </template>
+      </el-dialog>
+
+      <!-- 重置口令 Dialog -->
+      <el-dialog v-model="resetDialog.visible" :title="'重置口令 — ' + resetDialog.username" width="400px" align-center>
+        <el-input v-model="resetDialog.password" type="password" placeholder="新口令" show-password @keyup.enter="doResetPassword"></el-input>
+        <template #footer>
+          <el-button @click="resetDialog.visible = false">取消</el-button>
+          <el-button type="primary" :loading="resetDialog.loading" @click="doResetPassword">确认重置</el-button>
         </template>
       </el-dialog>
 
@@ -530,6 +609,7 @@
     </el-config-provider>
   </div>
 {% endraw %}
+  <script src="{{ url_for('static', filename='js/storage.js') }}"></script>
   <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>
 </html>

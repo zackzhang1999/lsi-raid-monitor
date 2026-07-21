@@ -301,7 +301,7 @@ def collect_disk_attributes() -> list[dict]:
 
 # ---- SMART 数据 (smartctl) ----
 
-SMARTCTL = "/usr/sbin/smartctl"
+SMARTCTL = os.environ.get("SMARTCTL_PATH", "/usr/sbin/smartctl")
 
 
 def collect_smart(dids: list[int]) -> list[dict]:
@@ -320,6 +320,8 @@ def collect_smart(dids: list[int]) -> list[dict]:
                 "reallocated": 0,
                 "pending": 0,
                 "uncorrectable": 0,
+                "reported_uncorrectable": 0,
+                "command_timeout": 0,
                 "power_on_hours": 0,
                 "smart_temp": None,
             }
@@ -381,6 +383,10 @@ def _parse_ata_table(output: str, smart: dict):
             continue
         if aid == 5:
             smart["reallocated"] = max(smart.get("reallocated", 0), raw)
+        elif aid == 187:
+            smart["reported_uncorrectable"] = raw
+        elif aid == 188:
+            smart["command_timeout"] = raw
         elif aid == 197:
             smart["pending"] = raw
         elif aid == 198:
@@ -567,6 +573,8 @@ def main():
         "reallocated",
         "pending",
         "uncorrectable",
+        "reported_uncorrectable",
+        "command_timeout",
         "power_on_hours",
         "smart_temp",
     ]
@@ -647,6 +655,8 @@ def main():
             for s in smart_data:
                 s["timestamp"] = timestamp
             write_csv_once(date_dir, "smart.csv", smart_fields, smart_data)
+            # SMART 关键属性 (5/187/188/197/198) 数值变化邮件告警
+            lsi_alert.check_smart_attr_changes(smart_data)
 
     # 巡读 / CC（每次覆盖写入）
     pr = collect_patrol_read()

@@ -359,6 +359,105 @@ def check_and_alert(disks: list[dict], controller: dict | None):
     )
 
 
+# ---- SMART 关键属性变化监控 ----
+
+# (采集字段名, SMART 属性 ID, 属性说明)
+SMART_WATCH_ATTRS = [
+    ("reallocated", 5, "Reallocated Sector Count 重映射扇区数"),
+    ("reported_uncorrectable", 187, "Reported Uncorrectable Errors 不可恢复错误"),
+    ("command_timeout", 188, "Command Timeout 命令超时"),
+    ("pending", 197, "Current Pending Sector Count 待映射扇区数"),
+    ("uncorrectable", 198, "Offline Uncorrectable 离线不可校正扇区数"),
+]
+
+
+def detect_smart_attr_changes(
+    smart_rows: list[dict], prev_values: dict
+) -> tuple[list[str], dict]:
+    """
+    对比上次采集值，返回 (变化描述列表, 本次基线 dict)。
+    首次见到的磁盘只建立基线，不告警。
+    """
+    changes: list[str] = []
+    current: dict = {}
+    for row in smart_rows:
+        did = row.get("did")
+        # collect_smart 失败时以 {"did": did, "reallocated": -1} 占位，跳过
+        if did is None or row.get("reallocated") == -1:
+            continue
+        key = str(did)
+        cur = {}
+        for field, aid, _name in SMART_WATCH_ATTRS:
+            value = row.get(field)
+            if isinstance(value, int) and not isinstance(value, bool):
+                cur[str(aid)] = value
+        current[key] = cur
+        old = prev_values.get(key)
+        if not isinstance(old, dict):
+            continue
+        for _field, aid, name in SMART_WATCH_ATTRS:
+            aid_key = str(aid)
+            if aid_key in cur and aid_key in old and cur[aid_key] != old[aid_key]:
+                changes.append(
+                    f"DID {did} SMART 属性 {aid} ({name}): "
+                    f"{old[aid_key]} → {cur[aid_key]}"
+                )
+    return changes, current
+
+
+def check_smart_attr_changes(smart_rows: list[dict]):
+    """
+    SMART 关键属性 (5/187/188/197/198) 数值一旦变化即发送邮件告警。
+    基线存于 alert_state.json 的 smart_attr_values；发送失败时不更新基线，
+    下次采集会重新检测，避免告警丢失。
+    """
+    cfg = get_alert_config()
+    alert_email_to = cfg.get("alert_email_to", "")
+    if not alert_email_to:
+        return
+
+    state = load_alert_state()
+    prev_values = state.get("smart_attr_values") or {}
+    changes, current = detect_smart_attr_changes(smart_rows, prev_values)
+
+    if not changes:
+        state["smart_attr_values"] = current
+        save_alert_state(state)
+        return
+
+    sendmail_path = cfg.get("sendmail_path", DEFAULT_SENDMAIL_PATH)
+    if not sendmail_available(sendmail_path):
+        print(
+            f"[{_ts()}] SMART 属性变化但 sendmail 不可用: {sendmail_path}",
+            file=sys.stderr,
+        )
+        return
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    host = os.uname().nodename
+    subject = f"[LSI RAID ALERT] {host} 检测到 {len(changes)} 项 SMART 属性变化"
+    lines = [
+        f"LSI RAID SMART 属性变化告警 — {host}",
+        f"时间: {timestamp}",
+        "",
+        "以下 SMART 关键属性数值发生变化（可能预示磁盘劣化）:",
+    ]
+    lines += [f"  - {c}" for c in changes]
+    lines += [
+        "",
+        "监控属性: 5 (重映射扇区), 187 (不可恢复错误), 188 (命令超时),",
+        "          197 (待映射扇区), 198 (离线不可校正)",
+        "",
+        "本邮件由 lsi-raid-monitor 自动发送。",
+    ]
+
+    recipients = [addr.strip() for addr in alert_email_to.split(",") if addr.strip()]
+    if recipients and send_alert_email(subject, "\n".join(lines), recipients, sendmail_path):
+        print(f"[{_ts()}] SMART attr change alert sent to {', '.join(recipients)}")
+        state["smart_attr_values"] = current
+        save_alert_state(state)
+
+
 if __name__ == "__main__":
     # 简单自测：读取环境变量并尝试发送一封测试邮件
     cfg = get_alert_config()
