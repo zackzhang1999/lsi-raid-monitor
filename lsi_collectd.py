@@ -627,13 +627,15 @@ def main():
     sys_info["timestamp"] = timestamp
     write_csv(date_dir, "system.csv", sys_fields, [sys_info])
 
-    # VD（当天首次采集）
-    if not (date_dir / "vds.csv").exists():
-        vds = collect_vds()
-        if vds:
-            for v in vds:
-                v["timestamp"] = timestamp
-            write_csv_once(date_dir, "vds.csv", vd_fields, vds)
+    # VD（CSV 当天首次采集写入；状态变化告警每分钟检测）
+    vds = collect_vds()
+    if vds and not (date_dir / "vds.csv").exists():
+        for v in vds:
+            v["timestamp"] = timestamp
+        write_csv_once(date_dir, "vds.csv", vd_fields, vds)
+
+    # 磁盘状态变化 / VD 变化邮件告警（基于本次采集结果）
+    lsi_alert.check_state_changes(disks, vds)
 
     # 磁盘属性（当天首次采集）
     if not (date_dir / "attributes.csv").exists():

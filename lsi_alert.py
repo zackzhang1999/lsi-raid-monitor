@@ -24,6 +24,9 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from email.header import Header
+from email.mime.text import MIMEText
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_DIR = Path(os.environ.get("LSI_DATA_DIR", str(PROJECT_ROOT / "data")))
 ALERT_STATE_FILE = BASE_DIR / "alert_state.json"
@@ -138,14 +141,12 @@ def send_alert_email(
         return False
 
     to_header = ", ".join(to_addresses)
-    message = (
-        f"To: {to_header}\n"
-        f"Subject: {subject}\n"
-        "Content-Type: text/plain; charset=utf-8\n"
-        "Content-Transfer-Encoding: 8bit\n"
-        "\n"
-        f"{body}"
-    )
+    # 用标准 MIME 构造邮件：Subject 按 RFC 2047 编码、正文 base64，
+    # 使整封邮件为 7bit ASCII，避免投递时要求 SMTPUTF8 而被中继拒收
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["To"] = to_header
+    msg["Subject"] = Header(subject, "utf-8")
+    message = msg.as_string()
 
     try:
         result = subprocess.run(
@@ -455,6 +456,134 @@ def check_smart_attr_changes(smart_rows: list[dict]):
     if recipients and send_alert_email(subject, "\n".join(lines), recipients, sendmail_path):
         print(f"[{_ts()}] SMART attr change alert sent to {', '.join(recipients)}")
         state["smart_attr_values"] = current
+        save_alert_state(state)
+
+
+# ---- 磁盘 / VD 状态变化监控 ----
+
+
+def detect_state_changes(
+    disks: list[dict],
+    vds: list[dict],
+    prev_disk_states: dict | None,
+    prev_vd_states: dict | None,
+) -> tuple[list[str], dict, dict]:
+    """
+    对比上次采集快照，返回 (变化描述列表, 当前磁盘快照, 当前VD快照)。
+    首次采集（prev 为 None）只建立基线，不告警。
+    本次采集为空的一侧（storcli 失败）不参与对比，也不覆盖基线。
+    """
+    cur_disks: dict = {}
+    for d in disks or []:
+        eid, slot = d.get("eid"), d.get("slot")
+        if eid is None or slot is None:
+            continue
+        cur_disks[f"E{eid}:S{slot}"] = str(d.get("state", "")).strip() or "Unknown"
+
+    cur_vds: dict = {}
+    for v in vds or []:
+        key = str(v.get("dg_vd", "")).strip()
+        if key:
+            cur_vds[key] = str(v.get("state", "")).strip() or "Unknown"
+
+    changes: list[str] = []
+
+    if prev_disk_states is not None and cur_disks:
+        for label, st in cur_disks.items():
+            if label not in prev_disk_states:
+                changes.append(f"新增物理磁盘 {label}，当前状态: {st}")
+            elif prev_disk_states[label] != st:
+                changes.append(
+                    f"物理磁盘 {label} 状态变化: {prev_disk_states[label]} → {st}"
+                )
+        for label, st in prev_disk_states.items():
+            if label not in cur_disks:
+                changes.append(f"物理磁盘 {label} 已移除（此前状态: {st}）")
+
+    if prev_vd_states is not None and cur_vds:
+        for key, st in cur_vds.items():
+            if key not in prev_vd_states:
+                changes.append(f"新增虚拟磁盘 VD {key}，当前状态: {st}")
+            elif prev_vd_states[key] != st:
+                changes.append(
+                    f"虚拟磁盘 VD {key} 状态变化: {prev_vd_states[key]} → {st}"
+                )
+        for key, st in prev_vd_states.items():
+            if key not in cur_vds:
+                changes.append(f"虚拟磁盘 VD {key} 已移除（此前状态: {st}）")
+
+    return changes, cur_disks, cur_vds
+
+
+def check_state_changes(disks: list[dict], vds: list[dict]):
+    """
+    磁盘状态变化（Onln→Failed 等迁移、增删盘）与 VD 变化邮件告警。
+    基线存于 alert_state.json 的 disk_states / vd_states；首次采集只建立
+    基线不告警；发送失败时不更新基线，下次采集重新检测，避免告警丢失。
+    """
+    cfg = get_alert_config()
+    alert_email_to = cfg.get("alert_email_to", "")
+    if not alert_email_to:
+        return
+
+    state = load_alert_state()
+    prev_disks = state.get("disk_states")
+    prev_vds = state.get("vd_states")
+    changes, cur_disks, cur_vds = detect_state_changes(
+        disks, vds, prev_disks, prev_vds
+    )
+
+    if not changes:
+        # 无变化：更新基线（采集为空的一侧保留旧基线）
+        if cur_disks:
+            state["disk_states"] = cur_disks
+        if cur_vds:
+            state["vd_states"] = cur_vds
+        save_alert_state(state)
+        return
+
+    sendmail_path = cfg.get("sendmail_path", DEFAULT_SENDMAIL_PATH)
+    if not sendmail_available(sendmail_path):
+        print(
+            f"[{_ts()}] 磁盘/VD 状态变化但 sendmail 不可用: {sendmail_path}",
+            file=sys.stderr,
+        )
+        return
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    host = os.uname().nodename
+    subject = f"[LSI RAID ALERT] {host} 检测到 {len(changes)} 项磁盘/VD 状态变化"
+    lines = [
+        f"LSI RAID 磁盘/VD 状态变化告警 — {host}",
+        f"时间: {timestamp}",
+        "",
+        "检测到以下磁盘 / 虚拟磁盘（VD）变化:",
+    ]
+    lines += [f"  - {c}" for c in changes]
+    lines += [
+        "",
+        "当前物理磁盘状态:",
+    ]
+    for label in sorted(cur_disks):
+        lines.append(f"  {label} | 状态: {cur_disks[label]}")
+    if cur_vds:
+        lines += ["", "当前虚拟磁盘（VD）状态:"]
+        for key in sorted(cur_vds):
+            lines.append(f"  VD {key} | 状态: {cur_vds[key]}")
+    lines += [
+        "",
+        "本邮件由 lsi-raid-monitor 自动发送。",
+    ]
+
+    recipients = [addr.strip() for addr in alert_email_to.split(",") if addr.strip()]
+    if recipients and send_alert_email(
+        subject, "\n".join(lines), recipients, sendmail_path
+    ):
+        print(f"[{_ts()}] Disk/VD state change alert sent to {', '.join(recipients)}")
+        if cur_disks:
+            state["disk_states"] = cur_disks
+        if cur_vds:
+            state["vd_states"] = cur_vds
         save_alert_state(state)
 
 
