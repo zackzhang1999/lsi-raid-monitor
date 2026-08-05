@@ -583,7 +583,7 @@ function renderPhysicalDisks(st) {
     const key = d.eid + ':' + d.slot;
     tr.innerHTML = `
       <td class="admin-col ${hideSel ? 'col-hidden' : ''}"></td>
-      <td class="num">${esc(d.label || ('E' + d.eid + ':S' + d.slot))}</td>
+      <td class="num">${d.locate ? '<span class="locate-dot" title="定位灯已开启"></span>' : ''}${esc(d.label || ('E' + d.eid + ':S' + d.slot))}</td>
       <td>${esc(d.model || '—')}</td>
       <td class="num">${esc(d.sn || '—')}</td>
       <td class="num">${esc(d.fw_rev || '—')}</td>
@@ -1375,7 +1375,7 @@ async function createUser(ev) {
 function switchView(v) {
   state.view = v;
   $$('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.view === v));
-  ['overview', 'storage', 'users'].forEach(name => {
+  ['overview', 'storage', 'logs', 'users'].forEach(name => {
     $('#view-' + name).classList.toggle('hidden', name !== v);
   });
   if (v === 'storage' && !state.storageLoaded) loadStorage();

@@ -63,6 +63,39 @@ DISK_ACTIONS = {
     "locate_stop": "stop locate",
 }
 
+# ---- 定位灯状态（storcli 无可靠回读接口，由本服务跟踪 locate_start/stop）----
+
+LOCATE_STATE_FILE = BASE_DIR / ".locate_state.json"
+
+
+def _load_locate_state() -> dict:
+    try:
+        if LOCATE_STATE_FILE.exists():
+            data = json.loads(LOCATE_STATE_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {str(k): True for k, v in data.items() if v}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_locate_state(state: dict) -> None:
+    try:
+        BASE_DIR.mkdir(parents=True, exist_ok=True)
+        LOCATE_STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _set_locate(eid: int, slot: int, on: bool) -> None:
+    state = _load_locate_state()
+    key = f"{eid}:{slot}"
+    if on:
+        state[key] = True
+    else:
+        state.pop(key, None)
+    _save_locate_state(state)
+
 app = Flask(
     __name__,
     template_folder=str(PROJECT_ROOT / "web" / "templates"),
@@ -210,6 +243,7 @@ def build_status() -> dict:
     alert_cfg = lsi_alert.load_config()
     temp_warn = int(alert_cfg.get("temp_warn", 45))
     temp_crit = int(alert_cfg.get("temp_crit", 55))
+    locate_state = _load_locate_state()
 
     physical_disks = []
     for (eid, slot), row in sorted(
@@ -238,6 +272,7 @@ def build_status() -> dict:
                 "predictive_failure": _to_int(row.get("predictive_failure"), 0),
                 "smart_alert": row.get("smart_alert", ""),
                 "shield_counter": _to_int(row.get("shield_counter"), 0),
+                "locate": f"{eid}:{slot}" in locate_state,
                 "dev_speed": attr.get("dev_speed", ""),
                 "link_speed": attr.get("link_speed", ""),
                 "reallocated": _to_int(smart.get("reallocated"), 0),
@@ -645,6 +680,10 @@ def api_disk_action():
     )
     label = f"E{eid}:S{slot}"
     if ok:
+        if action == "locate_start":
+            _set_locate(eid, slot, True)
+        elif action == "locate_stop":
+            _set_locate(eid, slot, False)
         lsi_alert.log_event(
             "warning", f"磁盘操作: {label} {action}（{session.get('username', '')}）"
         )

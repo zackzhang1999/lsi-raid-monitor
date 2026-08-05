@@ -49,6 +49,9 @@
         <button class="nav-btn" data-view="storage">
           <span class="glyph">▤</span><span class="label">磁盘管理</span>
         </button>
+        <button class="nav-btn" data-view="logs">
+          <span class="glyph">≡</span><span class="label">日志中心</span>
+        </button>
         <button class="nav-btn hidden" data-view="users" id="nav-users">
           <span class="glyph">⚇</span><span class="label">用户管理</span>
         </button>
@@ -280,49 +283,6 @@
             </div>
           </div>
 
-          <!-- 事件日志 -->
-          <div class="card">
-            <div class="card-head">
-              <div>
-                <div class="eyebrow">Events</div>
-                <strong>事件日志</strong>
-              </div>
-              <div class="chips" id="event-filter">
-                <button class="chip active" data-level="all">全部</button>
-                <button class="chip" data-level="error">错误</button>
-                <button class="chip" data-level="warning">警告</button>
-                <button class="chip" data-level="info">信息</button>
-              </div>
-            </div>
-            <div class="event-list" id="event-list"><div class="loading-line">加载中…</div></div>
-            <div class="pager">
-              <button class="btn sm" id="ev-prev">上一页</button>
-              <span class="page-info" id="ev-page-info">—</span>
-              <button class="btn sm" id="ev-next">下一页</button>
-            </div>
-          </div>
-
-          <!-- 控制器事件 -->
-          <div class="card">
-            <div class="card-head">
-              <div>
-                <div class="eyebrow">Controller events</div>
-                <strong>控制器事件</strong>
-              </div>
-              <div class="chips" id="ctl-lines">
-                <button class="chip active" data-lines="100">100 行</button>
-                <button class="chip" data-lines="200">200 行</button>
-                <button class="chip" data-lines="500">500 行</button>
-              </div>
-            </div>
-            <div class="ctl-toolbar">
-              <button class="btn sm" id="btn-ctl-refresh">刷新</button>
-              <button class="btn sm ghost" id="btn-ctl-copy">复制</button>
-              <span class="tiny" id="ctl-total"></span>
-            </div>
-            <pre class="smart-pre" id="ctl-pre">加载中…</pre>
-          </div>
-
           <!-- 系统信息 -->
           <div class="card" id="card-system">
             <div class="card-head">
@@ -372,6 +332,52 @@
                 <tbody><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
               </table>
             </div>
+          </div>
+        </div>
+
+        <!-- ============ 日志中心 ============ -->
+        <div class="view hidden" id="view-logs">
+          <!-- 事件日志 -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Events</div>
+                <strong>事件日志</strong>
+              </div>
+              <div class="chips" id="event-filter">
+                <button class="chip active" data-level="all">全部</button>
+                <button class="chip" data-level="error">错误</button>
+                <button class="chip" data-level="warning">警告</button>
+                <button class="chip" data-level="info">信息</button>
+              </div>
+            </div>
+            <div class="event-list" id="event-list"><div class="loading-line">加载中…</div></div>
+            <div class="pager">
+              <button class="btn sm" id="ev-prev">上一页</button>
+              <span class="page-info" id="ev-page-info">—</span>
+              <button class="btn sm" id="ev-next">下一页</button>
+            </div>
+          </div>
+
+          <!-- 控制器事件 -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Controller events</div>
+                <strong>控制器事件</strong>
+              </div>
+              <div class="chips" id="ctl-lines">
+                <button class="chip active" data-lines="100">100 行</button>
+                <button class="chip" data-lines="200">200 行</button>
+                <button class="chip" data-lines="500">500 行</button>
+              </div>
+            </div>
+            <div class="ctl-toolbar">
+              <button class="btn sm" id="btn-ctl-refresh">刷新</button>
+              <button class="btn sm ghost" id="btn-ctl-copy">复制</button>
+              <span class="tiny" id="ctl-total"></span>
+            </div>
+            <pre class="smart-pre" id="ctl-pre">加载中…</pre>
           </div>
         </div>
 

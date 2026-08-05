@@ -570,6 +570,22 @@ table.data tr.attr-bad td { color: var(--crit); font-weight: 700; }
 /* ---------- admin 列隐藏 ---------- */
 table.data .admin-col.col-hidden { display: none; }
 
+/* ---------- 定位灯呼吸指示 ---------- */
+.locate-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ok);
+  margin-right: 6px;
+  vertical-align: middle;
+  animation: locate-breathe 1.6s ease-in-out infinite;
+}
+@keyframes locate-breathe {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(52, 168, 83, .55); }
+  50% { opacity: .3; box-shadow: 0 0 0 6px rgba(52, 168, 83, 0); }
+}
+
 /* ---------- 确认输入 ---------- */
 .confirm-input-note { font-size: 12px; }
 .persist-row { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
