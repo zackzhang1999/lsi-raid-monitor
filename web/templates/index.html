@@ -1,615 +1,461 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>LSI RAID 监控</title>
-
-  <!-- Vue 3 -->
-  <script src="/static/vendor/vue.global.js"></script>
-  <!-- Element Plus CSS -->
-  <link rel="stylesheet" href="/static/vendor/element-plus.css">
-  <!-- Element Plus JS -->
-  <script src="/static/vendor/element-plus.full.js"></script>
-  <!-- Element Plus 中文语言包 -->
-  <script src="/static/vendor/element-plus-zh-cn.js"></script>
-
-  <!-- Chart.js -->
-  <script src="/static/vendor/chart.umd.min.js"></script>
-
-  <!-- Element Plus 图标 -->
-  <script src="/static/vendor/element-plus-icons.iife.js"></script>
-
-    <script src="/static/vendor/tailwind.js"></script>
-
-  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  <link rel="stylesheet" href="/static/css/style.css" />
 </head>
-<body class="bg-slate-50 dark:bg-slate-900">
-{% raw %}
-  <div id="app" v-cloak class="min-h-screen">
-    <el-config-provider :locale="locale">
-      <!-- 登录遮罩（启用用户认证时显示） -->
-      <div v-if="authRequired && !loggedIn" class="fixed inset-0 z-[4000] flex items-center justify-center bg-slate-900/60">
-        <el-card class="w-80" shadow="always">
-          <template #header>
-            <div class="card-header"><span>存储管理登录</span></div>
-          </template>
-          <el-input v-model="loginForm.username" placeholder="用户名" class="mb-3" @keyup.enter="doLogin"></el-input>
-          <el-input v-model="loginForm.password" type="password" placeholder="口令" show-password @keyup.enter="doLogin"></el-input>
-          <el-alert v-if="loginError" :title="loginError" type="error" class="mt-3" :closable="false"></el-alert>
-          <el-button type="primary" class="w-full mt-4" :loading="loginLoading" @click="doLogin">登录</el-button>
-        </el-card>
+<body>
+  <div id="toast-root"></div>
+
+  <!-- 登录遮罩 -->
+  <div id="login-overlay" class="overlay hidden">
+    <form id="login-form" class="login-card" autocomplete="off">
+      <div class="brand">
+        <div class="brand-mark">LSI</div>
+        <div class="brand-copy">
+          <h1>RAID 监控</h1>
+          <p>MegaRAID Storage Monitor</p>
+        </div>
       </div>
-      <el-container class="max-w-7xl mx-auto px-4 py-6" :class="{ 'dark-app': isDark }">
-        <!-- Header -->
-        <el-header class="!h-auto !p-0 mb-6">
-          <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-            <div>
-              <h1 class="text-2xl font-bold text-slate-900 dark:text-white flex items-center gap-2">
-                <span class="w-3 h-3 rounded-full bg-indigo-600"></span>
-                LSI RAID 监控
-              </h1>
-              <p class="text-sm text-slate-500 dark:text-slate-400 mt-1">
-                主机：<span class="font-medium text-slate-700 dark:text-slate-200">{{ status.host ? status.host : '—' }}</span>
-                &nbsp;|&nbsp; 最后更新：<span>{{ status.timestamp ? status.timestamp : '—' }}</span>
-              </p>
-            </div>
-            <div class="flex items-center gap-3 flex-wrap">
-              <el-tag :type="statusType" size="large" effect="dark">{{ statusText }}</el-tag>
-              <div class="flex items-center gap-2">
-                <span class="text-sm text-slate-500 dark:text-slate-400">自动采集</span>
-                <el-select v-model="collectionInterval" style="width: 110px" @change="saveCollectionConfig" :loading="collectionConfigSaving" :disabled="!isAdmin">
-                  <el-option :value="5" label="5 分钟"></el-option>
-                  <el-option :value="30" label="30 分钟"></el-option>
-                  <el-option :value="60" label="1 小时"></el-option>
-                </el-select>
-              </div>
-              <el-button type="primary" :icon="Download" @click="exportCsv">导出 CSV</el-button>
-              <el-button v-if="isAdmin" type="success" :icon="RefreshRight" :loading="collecting" @click="collectNow">立即采集</el-button>
-              <el-switch
-                v-model="isDark"
-                active-text="暗色"
-                inactive-text="浅色"
-                inline-prompt
-                :active-icon="Moon"
-                :inactive-icon="Sunny"
-                @change="toggleTheme"
-              ></el-switch>
-              <template v-if="authRequired && loggedIn">
-                <el-tag :type="userRole === 'admin' ? 'danger' : 'info'" effect="plain">{{ username }}（{{ userRole === 'admin' ? '管理员' : '只读' }}）</el-tag>
-                <el-button type="warning" plain @click="doLogout">退出登录</el-button>
-              </template>
-            </div>
-          </div>
-        </el-header>
-
-        <el-main class="!p-0">
-          <el-tabs v-model="activeTab" class="main-tabs">
-            <el-tab-pane label="监控概览" name="overview">
-          <!-- Health Score -->
-          <el-card class="mb-6" shadow="hover">
-            <template #header>
-              <div class="card-header">
-                <span>综合健康评分</span>
-                <el-tag :type="healthType" effect="plain">{{ healthLevelLabel }}</el-tag>
-              </div>
-            </template>
-            <div class="flex flex-col lg:flex-row gap-8 items-center">
-              <div class="flex flex-col items-center">
-                <div class="relative w-36 h-36">
-                  <svg class="w-full h-full transform -rotate-90" viewBox="0 0 100 100">
-                    <circle cx="50" cy="50" r="42" fill="none" stroke="#e2e8f0" stroke-width="10" class="dark:stroke-slate-700"></circle>
-                    <circle cx="50" cy="50" r="42" fill="none" :stroke="healthColor" stroke-width="10" stroke-linecap="round" stroke-dasharray="264" :stroke-dashoffset="healthRingOffset"></circle>
-                  </svg>
-                  <div class="absolute inset-0 flex flex-col items-center justify-center">
-                    <span class="text-3xl font-bold" :style="{ color: healthColor }">{{ healthScore }}</span>
-                  </div>
-                </div>
-              </div>
-              <div class="grid grid-cols-2 sm:grid-cols-3 gap-4 w-full">
-                <div v-for="(item, key) in healthDetails" :key="key" class="bg-slate-50 dark:bg-slate-800 rounded-lg p-3">
-                  <p class="text-xs text-slate-500 dark:text-slate-400 mb-1">{{ item.label }}</p>
-                  <div class="flex items-center gap-2">
-                    <div class="flex-1 h-2 bg-slate-200 dark:bg-slate-600 rounded-full overflow-hidden">
-                      <div class="h-full rounded-full" :style="{ width: item.score + '%', backgroundColor: healthItemColor(item.score) }"></div>
-                    </div>
-                    <span class="text-sm font-bold" :style="{ color: healthItemColor(item.score) }">{{ item.score }}</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </el-card>
-
-          <!-- Alert Config -->
-          <el-card class="mb-6" shadow="hover">
-            <template #header>
-              <div class="card-header">
-                <span>邮件报警配置</span>
-                <el-tag
-                  :type="alertConfig.enabled ? (alertConfig.sendmail_available ? 'success' : 'danger') : 'info'"
-                  effect="plain"
-                >
-                  {{ alertConfig.enabled ? (alertConfig.sendmail_available ? '已启用' : 'sendmail 不可用') : '未启用' }}
-                </el-tag>
-              </div>
-            </template>
-
-            <el-form :model="alertConfigForm" label-width="120px" size="default"
-              class="max-w-2xl"
-            >
-              <el-form-item label="报警收件人">
-                <el-input
-                  v-model="alertConfigForm.alert_email_to"
-                  placeholder="多个邮箱用逗号分隔，留空关闭报警"
-                  :disabled="alertConfig.locked?.alert_email_to"
-                ></el-input>
-                <template v-if="alertConfig.locked?.alert_email_to">
-                  <p class="text-xs text-slate-400 mt-1">已由环境变量 ALERT_EMAIL_TO 锁定，不可在 Web 中修改。</p>
-                </template>
-              </el-form-item>
-
-              <el-form-item label="sendmail 路径">
-                <el-input
-                  v-model="alertConfigForm.sendmail_path"
-                  placeholder="/usr/sbin/sendmail"
-                  :disabled="alertConfig.locked?.sendmail_path"
-                ></el-input>
-                <template v-if="alertConfig.locked?.sendmail_path">
-                  <p class="text-xs text-slate-400 mt-1">已由环境变量 SENDMAIL_PATH 锁定。</p>
-                </template>
-              </el-form-item>
-
-              <el-form-item label="温度阈值">
-                <el-row :gutter="12">
-                  <el-col :span="12">
-                    <el-input-number
-                      v-model="alertConfigForm.temp_warn"
-                      :min="0"
-                      :max="100"
-                      :disabled="alertConfig.locked?.temp_warn"
-                      class="w-full"
-                    ></el-input-number>
-                    <p class="text-xs text-slate-400 mt-1">警告 (°C)</p>
-                  </el-col>
-                  <el-col :span="12">
-                    <el-input-number
-                      v-model="alertConfigForm.temp_crit"
-                      :min="0"
-                      :max="100"
-                      :disabled="alertConfig.locked?.temp_crit"
-                      class="w-full"
-                    ></el-input-number>
-                    <p class="text-xs text-slate-400 mt-1">临界 (°C)</p>
-                  </el-col>
-                </el-row>
-              </el-form-item>
-
-              <el-form-item>
-                <el-button type="primary" :loading="alertSaving" :disabled="!isAdmin" @click="saveAlertConfig">保存配置</el-button>
-                <el-button type="warning" :loading="alertTesting" :disabled="!isAdmin" @click="testAlert">测试报警</el-button>
-              </el-form-item>
-            </el-form>
-
-            <p class="text-xs text-slate-500 dark:text-slate-400 mt-3">
-              配置保存在 <code>$LSI_DATA_DIR/alert_config.json</code>，可被 lsi_collectd.py 每分钟读取。
-              若通过环境变量配置，则环境变量优先级更高且 Web 中不可修改。
-            </p>
-          </el-card>
-
-          <!-- Status Cards -->
-          <el-row :gutter="16" class="mb-6">
-            <el-col :xs="24" :sm="12" :lg="6" class="mb-4">
-              <el-card shadow="hover">
-                <template #header>
-                  <span class="text-xs font-semibold text-slate-500">控制器状态</span>
-                </template>
-                <div class="text-xl font-bold" :class="stateClass(status.controller?.health)">{{ status.controller?.health ? status.controller.health : '—' }}</div>
-                <div class="text-sm text-slate-500 dark:text-slate-400 truncate mt-1">{{ controllerInfo }}</div>
-              </el-card>
-            </el-col>
-            <el-col :xs="24" :sm="12" :lg="6" class="mb-4">
-              <el-card shadow="hover">
-                <template #header>
-                  <span class="text-xs font-semibold text-slate-500">磁盘 / 虚拟盘</span>
-                </template>
-                <div class="text-xl font-bold">{{ status.controller?.num_disks ? status.controller.num_disks : 0 }} / {{ status.controller?.num_vds ? status.controller.num_vds : 0 }}</div>
-                <div class="text-sm text-slate-500 dark:text-slate-400 mt-1">物理 / 虚拟</div>
-              </el-card>
-            </el-col>
-            <el-col :xs="24" :sm="12" :lg="6" class="mb-4">
-              <el-card shadow="hover">
-                <template #header>
-                  <span class="text-xs font-semibold text-slate-500">温度</span>
-                </template>
-                <div class="text-xl font-bold" v-html="tempOverview"></div>
-                <div class="text-sm text-slate-500 dark:text-slate-400 mt-1">平均 / 最高</div>
-              </el-card>
-            </el-col>
-            <el-col :xs="24" :sm="12" :lg="6" class="mb-4">
-              <el-card shadow="hover">
-                <template #header>
-                  <span class="text-xs font-semibold text-slate-500">电池/缓存单元</span>
-                </template>
-                <div class="text-xl font-bold" :class="stateClass(status.controller?.bbu_state)">{{ status.controller?.bbu_state ? status.controller.bbu_state : '—' }}</div>
-                <div class="text-sm text-slate-500 dark:text-slate-400 truncate mt-1">{{ bbuInfo }}</div>
-              </el-card>
-            </el-col>
-          </el-row>
-
-                    <!-- Disk Bay Topology -->
-          <el-card class="mb-6" shadow="hover">
-            <template #header>
-              <div class="card-header">
-                <span>磁盘槽位拓扑</span>
-                <el-tag type="info" size="small">E{{ enclosureId }}</el-tag>
-              </div>
-            </template>
-            <div class="flex flex-wrap gap-3">
-              <el-tooltip
-                v-for="d in physicalDiskMap"
-                :key="d.label"
-                :content="`${d.model || '未知'} | ${d.temperature !== null && d.temperature !== undefined ? d.temperature + '°C' : '—'} | ${d.state || '—'}`"
-                placement="top"
-              >
-                <div
-                  class="disk-slot"
-                  :class="diskSlotClass(d)"
-                  @click="showDiskDetail(d)"
-                >
-                  <div class="text-xs text-slate-500 dark:text-slate-400">{{ d.label }}</div>
-                  <div class="text-lg font-bold my-1" :class="stateClass(d.state)">{{ d.state || '—' }}</div>
-                  <div class="text-xs text-slate-500 dark:text-slate-400">{{ d.temperature !== null && d.temperature !== undefined ? d.temperature + '°C' : '—' }}</div>
-                </div>
-              </el-tooltip>
-            </div>
-          </el-card>
-
-          <!-- Chart -->
-          <el-card class="mb-6" shadow="hover">
-            <template #header>
-              <div class="card-header">
-                <span>磁盘温度趋势</span>
-                <el-radio-group v-model="currentHistoryHours" size="small" @change="onHistoryRangeChange">
-                  <el-radio-button :label="6">6小时</el-radio-button>
-                  <el-radio-button :label="24">24小时</el-radio-button>
-                  <el-radio-button :label="72">3天</el-radio-button>
-                </el-radio-group>
-              </div>
-            </template>
-            <div class="relative h-80 w-full">
-              <canvas id="temp-chart"></canvas>
-            </div>
-          </el-card>
-
-          <!-- Maintenance -->
-          <el-row :gutter="16" class="mb-6">
-            <el-col :xs="24" :md="12" class="mb-4">
-              <el-card shadow="hover" title="巡读">
-                <template #header>
-                  <span>巡读</span>
-                </template>
-                <el-descriptions :column="2" border size="small">
-                  <el-descriptions-item label="模式">{{ status.maintenance?.patrol_read?.mode ? status.maintenance.patrol_read.mode : '—' }}</el-descriptions-item>
-                  <el-descriptions-item label="状态">
-                    <span :class="stateClass(status.maintenance?.patrol_read?.state)">{{ status.maintenance?.patrol_read?.state ? status.maintenance.patrol_read.state : '—' }}</span>
-                  </el-descriptions-item>
-                  <el-descriptions-item label="下次执行">{{ status.maintenance?.patrol_read?.next ? status.maintenance.patrol_read.next : '—' }}</el-descriptions-item>
-                  <el-descriptions-item label="迭代次数">{{ status.maintenance?.patrol_read?.iterations !== undefined ? status.maintenance.patrol_read.iterations : '—' }}</el-descriptions-item>
-                </el-descriptions>
-              </el-card>
-            </el-col>
-            <el-col :xs="24" :md="12" class="mb-4">
-              <el-card shadow="hover" title="一致性检查">
-                <template #header>
-                  <span>一致性检查</span>
-                </template>
-                <el-descriptions :column="2" border size="small">
-                  <el-descriptions-item label="模式">{{ status.maintenance?.consistency_check?.mode ? status.maintenance.consistency_check.mode : '—' }}</el-descriptions-item>
-                  <el-descriptions-item label="状态">
-                    <span :class="stateClass(status.maintenance?.consistency_check?.state)">{{ status.maintenance?.consistency_check?.state ? status.maintenance.consistency_check.state : '—' }}</span>
-                  </el-descriptions-item>
-                  <el-descriptions-item label="下次执行">{{ status.maintenance?.consistency_check?.next ? status.maintenance.consistency_check.next : '—' }}</el-descriptions-item>
-                  <el-descriptions-item label="迭代次数">{{ status.maintenance?.consistency_check?.iterations !== undefined ? status.maintenance.consistency_check.iterations : '—' }}</el-descriptions-item>
-                </el-descriptions>
-              </el-card>
-            </el-col>
-          </el-row>
-
-          <!-- Virtual Disks -->
-          <el-card class="mb-6" shadow="hover">
-            <template #header>
-              <span>虚拟磁盘</span>
-            </template>
-            <el-table :data="status.virtual_disks" empty-text="无虚拟磁盘" size="small" border stripe
-              :header-cell-style="{ background: isDark ? '#334155' : '#f1f5f9', color: isDark ? '#e2e8f0' : '#475569' }"
-            >
-              <el-table-column prop="dg_vd" label="DG/VD" min-width="80"></el-table-column>
-              <el-table-column prop="name" label="名称" min-width="120"></el-table-column>
-              <el-table-column prop="type" label="RAID" min-width="80"></el-table-column>
-              <el-table-column prop="size" label="容量" min-width="100"></el-table-column>
-              <el-table-column label="状态" min-width="80">
-                <template #default="scope">
-                  <span :class="stateClass(scope.row.state)">{{ scope.row.state ? scope.row.state : '—' }}</span>
-                </template>
-              </el-table-column>
-            </el-table>
-          </el-card>
-
-          <!-- Physical Disks -->
-          <el-card class="mb-6" shadow="hover">
-            <template #header>
-              <div class="card-header">
-                <span>物理磁盘</span>
-              </div>
-            </template>
-            
-            <el-alert
-              title="警告：磁盘操作会直接影响 RAID 阵列"
-              type="warning"
-              description="Online / Offline / UGood / JBOD 等操作可能导致数据丢失或阵列降级，请明确了解风险后再执行。"
-              show-icon
-              :closable="false"
-              class="mb-4"
-            ></el-alert>
-
-            <el-table :data="status.physical_disks" empty-text="无物理磁盘" size="small" border stripe
-              :header-cell-style="{ background: isDark ? '#334155' : '#f1f5f9', color: isDark ? '#e2e8f0' : '#475569' }"
-            >
-              <el-table-column prop="label" label="槽位" min-width="70"></el-table-column>
-              <el-table-column prop="model" label="型号" min-width="160" show-overflow-tooltip></el-table-column>
-              <el-table-column prop="sn" label="序列号" min-width="110" show-overflow-tooltip></el-table-column>
-              <el-table-column prop="fw_rev" label="固件" min-width="80"></el-table-column>
-              <el-table-column prop="dg" label="磁盘组" min-width="70"></el-table-column>
-              <el-table-column label="状态" min-width="80">
-                <template #default="scope">
-                  <span :class="stateClass(scope.row.state)">{{ scope.row.state ? scope.row.state : '—' }}</span>
-                </template>
-              </el-table-column>
-              <el-table-column label="温度" min-width="80">
-                <template #default="scope">
-                  <span :class="tempClass(scope.row.temperature)">{{ scope.row.temperature !== null && scope.row.temperature !== undefined ? scope.row.temperature + '°C' : '—' }}</span>
-                </template>
-              </el-table-column>
-              <el-table-column label="STOR" min-width="100">
-                <template #default="scope">
-                  <span v-html="storCounters(scope.row)"></span>
-                </template>
-              </el-table-column>
-              <el-table-column label="SMART" min-width="100">
-                <template #default="scope">
-                  <span v-html="smartCounters(scope.row)"></span>
-                </template>
-              </el-table-column>
-              <el-table-column label="通电时长" min-width="100">
-                <template #default="scope">
-                  <span>{{ pohText(scope.row.power_on_hours) }}</span>
-                </template>
-              </el-table-column>
-              <el-table-column label="告警" min-width="70">
-                <template #default="scope">
-                  <span :class="scope.row.smart_alert === 'Yes' ? 'text-red-700 font-bold' : ''">{{ scope.row.smart_alert === 'Yes' ? '是' : '否' }}</span>
-                </template>
-              </el-table-column>
-              <el-table-column label="操作" min-width="150" fixed="right">
-                <template #default="scope">
-                  <el-button type="primary" link size="small" @click="showDiskDetail(scope.row)">详情</el-button>
-                  <el-select
-                    v-if="isAdmin"
-                    v-model="scope.row._action"
-                    placeholder="选择操作"
-                    size="small"
-                    style="width: 100px"
-                    @change="(val) => onDiskAction(scope.row, val)"
-                  >
-                    <el-option
-                      v-for="op in diskOperations"
-                      :key="op.key"
-                      :label="op.label"
-                      :value="op.key"
-                    ></el-option>
-                  </el-select>
-                </template>
-              </el-table-column>
-            </el-table>
-          </el-card>
-
-          <!-- Events -->
-          <el-card class="mb-6" shadow="hover">
-            <template #header>
-              <div class="card-header">
-                <div class="flex items-center gap-3">
-                  <span>事件日志</span>
-                  <el-radio-group v-model="eventFilter" size="small" @change="onEventFilterChange">
-                    <el-radio-button label="all">全部</el-radio-button>
-                    <el-radio-button label="error">错误</el-radio-button>
-                    <el-radio-button label="warning">警告</el-radio-button>
-                    <el-radio-button label="info">信息</el-radio-button>
-                  </el-radio-group>
-                </div>
-                <el-pagination
-                  v-model:current-page="eventPage"
-                  :page-size="eventPageSize"
-                  :total="eventTotal"
-                  layout="total, prev, pager, next"
-                  size="small"
-                  @change="onEventPageChange"
-                />
-              </div>
-            </template>
-            <el-timeline v-if="events.length > 0">
-              <el-timeline-item
-                v-for="(ev, index) in events"
-                :key="index"
-                :type="ev.level === 'error' ? 'danger' : ev.level"
-                :timestamp="ev.timestamp"
-                placement="top"
-              >
-                <el-tag :type="ev.level === 'error' ? 'danger' : ev.level" size="small" effect="dark" class="mr-2">
-                  {{ levelText(ev.level) }}
-                </el-tag>
-                <span class="dark:text-slate-200">{{ ev.message }}</span>
-              </el-timeline-item>
-            </el-timeline>
-            <el-empty v-else description="暂无事件"></el-empty>
-          </el-card>
-
-          <!-- System -->
-          <el-card shadow="hover">
-            <template #header>
-              <span>系统信息</span>
-            </template>
-            <el-descriptions :column="2" border size="small">
-              <el-descriptions-item label="负载">{{ status.system?.load ? status.system.load : '—' }}</el-descriptions-item>
-              <el-descriptions-item label="内存">{{ status.system?.memory ? status.system.memory : '—' }}</el-descriptions-item>
-            </el-descriptions>
-          </el-card>
-
-          <p class="text-center text-xs text-slate-400 dark:text-slate-500 mt-8">LSI RAID 监控 Web 界面</p>
-            </el-tab-pane>
-            <el-tab-pane label="磁盘管理" name="storage" lazy>
-              <storage-panel></storage-panel>
-            </el-tab-pane>
-            <el-tab-pane v-if="isAdmin" label="用户管理" name="users" lazy>
-              <el-card shadow="hover">
-                <template #header>
-                  <div class="card-header">
-                    <span>用户管理</span>
-                    <el-tag v-if="authRequired" type="success" effect="plain">认证已启用</el-tag>
-                    <el-tag v-else type="info" effect="plain">未启用认证</el-tag>
-                  </div>
-                </template>
-                <el-alert
-                  v-if="!authRequired"
-                  type="warning"
-                  show-icon
-                  :closable="false"
-                  title="当前未启用认证，任何能访问本页面的人都拥有全部权限。创建第一个管理员账号后将启用登录认证，写操作仅管理员可用。"
-                  class="mb-4"
-                ></el-alert>
-                <el-table :data="users" size="small" border stripe v-loading="usersLoading" empty-text="暂无用户">
-                  <el-table-column prop="username" label="用户名" min-width="120"></el-table-column>
-                  <el-table-column label="角色" width="110">
-                    <template #default="scope">
-                      <el-tag :type="scope.row.role === 'admin' ? 'danger' : 'info'" effect="plain">
-                        {{ scope.row.role === 'admin' ? '管理员' : '只读用户' }}
-                      </el-tag>
-                    </template>
-                  </el-table-column>
-                  <el-table-column label="操作" width="170">
-                    <template #default="scope">
-                      <el-button type="primary" link size="small" @click="openResetPassword(scope.row)">重置口令</el-button>
-                      <el-button type="danger" link size="small" @click="confirmDeleteUser(scope.row)">删除</el-button>
-                    </template>
-                  </el-table-column>
-                </el-table>
-
-                <el-divider content-position="left">新建用户</el-divider>
-                <div class="flex items-center gap-2 flex-wrap">
-                  <el-input v-model="newUser.username" placeholder="用户名" style="width: 150px"></el-input>
-                  <el-input v-model="newUser.password" type="password" placeholder="口令" show-password style="width: 180px"></el-input>
-                  <el-select v-model="newUser.role" style="width: 120px">
-                    <el-option value="viewer" label="只读用户"></el-option>
-                    <el-option value="admin" label="管理员"></el-option>
-                  </el-select>
-                  <el-button type="primary" :loading="userSaving" @click="createUser">添加</el-button>
-                </div>
-                <p class="text-xs text-slate-400 mt-2">管理员拥有全部权限（磁盘操作、格式化、用户管理等）；只读用户仅可查看。</p>
-              </el-card>
-            </el-tab-pane>
-          </el-tabs>
-        </el-main>
-      </el-container>
-
-      <!-- Confirm Dialog -->
-      <el-dialog
-        v-model="dialogVisible"
-        title="确认磁盘操作"
-        width="400px"
-        align-center
-      >
-        <div class="text-base">
-          <p class="mb-2">确定要对磁盘 <strong>{{ pendingAction?.label }}</strong> 执行以下操作吗？</p>
-          <el-tag type="warning" effect="dark" size="large">{{ pendingAction?.op?.label }}</el-tag>
-          <p class="text-sm text-slate-500 mt-3">{{ pendingAction?.op?.description }}</p>
-          <p class="text-sm text-red-600 mt-3 font-semibold">注意：此操作可能影响 RAID 阵列，请谨慎操作！</p>
-        </div>
-        <template #footer>
-          <span class="dialog-footer">
-            <el-button @click="dialogVisible = false">取消</el-button>
-            <el-button type="primary" :loading="actionLoading" @click="confirmDiskAction">确认执行</el-button>
-          </span>
-        </template>
-      </el-dialog>
-
-      <!-- 重置口令 Dialog -->
-      <el-dialog v-model="resetDialog.visible" :title="'重置口令 — ' + resetDialog.username" width="400px" align-center>
-        <el-input v-model="resetDialog.password" type="password" placeholder="新口令" show-password @keyup.enter="doResetPassword"></el-input>
-        <template #footer>
-          <el-button @click="resetDialog.visible = false">取消</el-button>
-          <el-button type="primary" :loading="resetDialog.loading" @click="doResetPassword">确认重置</el-button>
-        </template>
-      </el-dialog>
-
-      <!-- Disk Detail Drawer -->
-      <el-drawer
-        v-model="detailDrawerVisible"
-        :title="(selectedDisk?.label || '磁盘') + ' 详情'"
-        size="75%"
-        destroy-on-close
-      >
-        <el-descriptions v-if="selectedDisk" :column="2" border>
-          <el-descriptions-item label="槽位">{{ selectedDisk.label }}</el-descriptions-item>
-          <el-descriptions-item label="型号">{{ selectedDisk.model || '—' }}</el-descriptions-item>
-          <el-descriptions-item label="序列号">{{ selectedDisk.sn || '—' }}</el-descriptions-item>
-          <el-descriptions-item label="固件">{{ selectedDisk.fw_rev || '—' }}</el-descriptions-item>
-          <el-descriptions-item label="磁盘组">{{ selectedDisk.dg !== '' && selectedDisk.dg !== undefined ? selectedDisk.dg : '—' }}</el-descriptions-item>
-          <el-descriptions-item label="状态">
-            <span :class="stateClass(selectedDisk.state)">{{ selectedDisk.state || '—' }}</span>
-          </el-descriptions-item>
-          <el-descriptions-item label="温度">{{ selectedDisk.temperature !== null && selectedDisk.temperature !== undefined ? selectedDisk.temperature + '°C' : '—' }}</el-descriptions-item>
-          <el-descriptions-item label="通电时长">{{ pohText(selectedDisk.power_on_hours) }}</el-descriptions-item>
-          <el-descriptions-item label="链路速度">{{ selectedDisk.dev_speed || '—' }} / {{ selectedDisk.link_speed || '—' }}</el-descriptions-item>
-          <el-descriptions-item label="SMART 摘要">R:{{ selectedDisk.reallocated || 0 }} / P:{{ selectedDisk.pending || 0 }} / U:{{ selectedDisk.uncorrectable || 0 }}</el-descriptions-item>
-          <el-descriptions-item label="错误计数">ME:{{ selectedDisk.media_error || 0 }} / OE:{{ selectedDisk.other_error || 0 }} / PF:{{ selectedDisk.predictive_failure || 0 }}</el-descriptions-item>
-          <el-descriptions-item label="Shield Counter">{{ selectedDisk.shield_counter || 0 }}</el-descriptions-item>
-        </el-descriptions>
-
-        <div class="mt-6">
-          <div class="flex items-center justify-between mb-3">
-            <span class="font-semibold text-slate-700 dark:text-slate-200">完整 SMART 信息</span>
-            <div class="flex items-center gap-2">
-              <el-button
-                v-if="smartOutput"
-                type="info"
-                size="small"
-                plain
-                @click="copySmartOutput"
-              >
-                复制
-              </el-button>
-              <el-button type="primary" size="small" :loading="smartLoading" @click="loadDiskSmart">
-                {{ smartOutput ? '刷新 SMART' : '查看 SMART' }}
-              </el-button>
-            </div>
-          </div>
-          <el-alert
-            v-if="smartError"
-            :title="smartError"
-            type="error"
-            show-icon
-            :closable="false"
-            class="mb-3"
-          ></el-alert>
-          <div v-if="smartOutput" class="smart-output">
-            <pre class="smart-pre">{{ smartOutput }}</pre>
-          </div>
-          <el-empty v-else-if="!smartLoading && !smartError" description="点击上方按钮查看完整 SMART 输出"></el-empty>
-        </div>
-      </el-drawer>
-    </el-config-provider>
+      <div class="field">
+        <label for="login-username">用户名</label>
+        <input class="input" id="login-username" required />
+      </div>
+      <div class="field">
+        <label for="login-password">口令</label>
+        <input class="input" id="login-password" type="password" required />
+      </div>
+      <div class="login-error" id="login-error"></div>
+      <button class="btn primary" id="login-btn" type="submit">登录</button>
+    </form>
   </div>
-{% endraw %}
-  <script src="{{ url_for('static', filename='js/storage.js') }}"></script>
-  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+
+  <div class="app" id="app">
+    <!-- 侧边栏 -->
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <div class="brand-mark">LSI</div>
+        <div class="brand-copy">
+          <h1>RAID 监控</h1>
+          <p>MegaRAID Storage</p>
+        </div>
+      </div>
+      <nav class="nav">
+        <button class="nav-btn active" data-view="overview">
+          <span class="glyph">◫</span><span class="label">监控概览</span>
+        </button>
+        <button class="nav-btn" data-view="storage">
+          <span class="glyph">▤</span><span class="label">磁盘管理</span>
+        </button>
+        <button class="nav-btn hidden" data-view="users" id="nav-users">
+          <span class="glyph">⚇</span><span class="label">用户管理</span>
+        </button>
+      </nav>
+      <div class="sidebar-foot">LSI MegaRAID 存储监控 · 每 60 秒自动刷新</div>
+    </aside>
+    <div class="sidebar-scrim" id="sidebar-scrim"></div>
+
+    <main class="main">
+      <!-- 顶栏 -->
+      <header class="topbar">
+        <div class="topbar-left">
+          <button class="icon-btn" id="btn-sidebar" title="折叠/展开侧边栏">☰</button>
+          <span class="host-name" id="tb-host">—</span>
+          <span class="tb-sep"></span>
+          <span class="badge" id="tb-health">—</span>
+          <span class="tb-updated" id="tb-updated"></span>
+        </div>
+        <div class="topbar-right">
+          <label class="tiny" for="sel-interval">采集间隔</label>
+          <select class="select" id="sel-interval">
+            <option value="1">1 分钟</option>
+            <option value="5">5 分钟</option>
+            <option value="15">15 分钟</option>
+            <option value="30">30 分钟</option>
+            <option value="60">60 分钟</option>
+          </select>
+          <button class="btn" id="btn-export">导出 CSV</button>
+          <button class="btn secondary hidden" id="btn-collect">立即采集</button>
+          <button class="icon-btn" id="btn-theme" title="切换主题">◐</button>
+          <div class="user-chip">
+            <div class="avatar" id="user-avatar">?</div>
+            <span class="tiny" id="user-name"></span>
+            <button class="btn ghost sm hidden" id="btn-logout">退出</button>
+          </div>
+        </div>
+      </header>
+
+      <section class="content">
+        <!-- ============ 监控概览 ============ -->
+        <div class="view" id="view-overview">
+          <div class="grid grid-hero">
+            <!-- 综合健康评分 -->
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <div class="eyebrow">Health score</div>
+                  <strong>综合健康评分</strong>
+                </div>
+                <span class="badge" id="health-badge">—</span>
+              </div>
+              <div class="health-wrap">
+                <div class="ring-box">
+                  <svg width="132" height="132" viewBox="0 0 132 132">
+                    <circle class="ring-track" cx="66" cy="66" r="54" fill="none" stroke-width="10" />
+                    <circle class="ring-val" id="ring-val" cx="66" cy="66" r="54" fill="none"
+                      stroke-width="10" stroke-linecap="round"
+                      stroke-dasharray="339.29" stroke-dashoffset="339.29" stroke="#34a853" />
+                  </svg>
+                  <div class="ring-center">
+                    <div>
+                      <div class="score" id="health-score">—</div>
+                      <div class="score-label">总分 / 100</div>
+                    </div>
+                  </div>
+                </div>
+                <div class="sub-scores" id="sub-scores"></div>
+              </div>
+            </div>
+
+            <!-- 邮件报警配置 -->
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <div class="eyebrow">Alerting</div>
+                  <strong>邮件报警配置</strong>
+                </div>
+                <div class="chips">
+                  <span class="badge" id="alert-enabled-badge">—</span>
+                  <span class="badge" id="sendmail-badge">—</span>
+                </div>
+              </div>
+              <form id="alert-form" class="form-row" autocomplete="off">
+                <div class="field">
+                  <label for="alert-email">收件人邮箱</label>
+                  <input class="input" id="alert-email" type="email" placeholder="ops@example.com" />
+                  <span class="hint hidden" data-lock-hint>已由环境变量锁定</span>
+                </div>
+                <div class="field">
+                  <label for="alert-sendmail">sendmail 路径</label>
+                  <input class="input mono" id="alert-sendmail" placeholder="/usr/sbin/sendmail" />
+                  <span class="hint hidden" data-lock-hint>已由环境变量锁定</span>
+                </div>
+                <div class="field">
+                  <label for="alert-warn">温度警告阈值 (°C)</label>
+                  <input class="input mono" id="alert-warn" type="number" min="1" max="100" />
+                  <span class="hint hidden" data-lock-hint>已由环境变量锁定</span>
+                </div>
+                <div class="field">
+                  <label for="alert-crit">温度临界阈值 (°C)</label>
+                  <input class="input mono" id="alert-crit" type="number" min="1" max="100" />
+                  <span class="hint hidden" data-lock-hint>已由环境变量锁定</span>
+                </div>
+                <div class="hero-actions" style="grid-column: 1 / -1; display:flex; gap: 8px;">
+                  <button class="btn primary" id="btn-alert-save" type="submit">保存配置</button>
+                  <button class="btn" id="btn-alert-test" type="button">发送测试报警</button>
+                </div>
+              </form>
+            </div>
+          </div>
+
+          <!-- 系统资源（实时） / 文件系统 -->
+          <div class="grid grid-2">
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <div class="eyebrow">Realtime</div>
+                  <strong>系统资源</strong>
+                </div>
+                <span class="tiny" id="rt-updated"></span>
+              </div>
+              <div id="realtime-body"><div class="loading-line">加载中…</div></div>
+            </div>
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <div class="eyebrow">Filesystems</div>
+                  <strong>文件系统</strong>
+                </div>
+              </div>
+              <div id="fs-usage-body"><div class="loading-line">加载中…</div></div>
+            </div>
+          </div>
+
+          <!-- 四个状态卡 -->
+          <div class="grid grid-stats" id="stat-cards"></div>
+
+          <!-- 磁盘槽位拓扑 -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Topology</div>
+                <strong>磁盘槽位拓扑</strong>
+              </div>
+              <span class="tiny">点击查看磁盘详情</span>
+            </div>
+            <div class="topo-grid" id="topo-grid"><div class="loading-line">加载中…</div></div>
+          </div>
+
+          <!-- 趋势图：温度 / IO / 文件系统 -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Trends</div>
+                <strong id="chart-title">磁盘温度趋势</strong>
+              </div>
+              <div class="chips">
+                <span id="chart-type" class="chips">
+                  <button class="chip active" data-type="temp">磁盘温度</button>
+                  <button class="chip" data-type="io">IO 吞吐</button>
+                  <button class="chip" data-type="fs">文件系统</button>
+                </span>
+                <span id="chart-range" class="chips">
+                  <button class="chip" data-hours="6">6 小时</button>
+                  <button class="chip active" data-hours="24">24 小时</button>
+                  <button class="chip" data-hours="72">3 天</button>
+                </span>
+              </div>
+            </div>
+            <div class="chart-box">
+              <canvas id="temp-chart"></canvas>
+              <div class="chart-empty hidden" id="chart-empty">暂无数据</div>
+            </div>
+          </div>
+
+          <!-- 巡读 / 一致性检查 -->
+          <div class="grid grid-2" id="maint-cards"></div>
+
+          <!-- 虚拟磁盘 -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Virtual disks</div>
+                <strong>虚拟磁盘</strong>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="data" id="vd-table">
+                <thead><tr>
+                  <th>DG/VD</th><th>名称</th><th>RAID</th><th>容量</th><th>状态</th>
+                  <th>OS 设备</th><th>写缓存</th><th>当前操作</th><th class="admin-col">操作</th>
+                </tr></thead>
+                <tbody><tr><td colspan="9" class="muted">加载中…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 物理磁盘 -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Physical disks</div>
+                <strong>物理磁盘</strong>
+              </div>
+              <div class="chips hidden" id="pd-raid-bar">
+                <span class="tiny" id="raid-sel-count">已选 0 块盘</span>
+                <select class="select" id="raid-level">
+                  <option value="0">RAID 0</option>
+                  <option value="1">RAID 1</option>
+                  <option value="5">RAID 5</option>
+                  <option value="6">RAID 6</option>
+                  <option value="10">RAID 10</option>
+                  <option value="50">RAID 50</option>
+                </select>
+                <input class="input" id="raid-name" placeholder="阵列名称（可选）" maxlength="32" style="width:150px" />
+                <button class="btn sm danger" id="btn-raid-create" disabled>创建阵列</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="data" id="pd-table">
+                <thead><tr>
+                  <th class="admin-col" title="仅未配置（UGood/JBOD）磁盘可勾选">选择</th>
+                  <th>槽位</th><th>型号</th><th>序列号</th><th>固件</th><th>磁盘组</th>
+                  <th>状态</th><th>温度</th><th>ME/OE/PF</th><th>R/P/U</th><th>通电时长</th>
+                  <th>告警</th><th>操作</th>
+                </tr></thead>
+                <tbody><tr><td colspan="13" class="muted">加载中…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 事件日志 -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Events</div>
+                <strong>事件日志</strong>
+              </div>
+              <div class="chips" id="event-filter">
+                <button class="chip active" data-level="all">全部</button>
+                <button class="chip" data-level="error">错误</button>
+                <button class="chip" data-level="warning">警告</button>
+                <button class="chip" data-level="info">信息</button>
+              </div>
+            </div>
+            <div class="event-list" id="event-list"><div class="loading-line">加载中…</div></div>
+            <div class="pager">
+              <button class="btn sm" id="ev-prev">上一页</button>
+              <span class="page-info" id="ev-page-info">—</span>
+              <button class="btn sm" id="ev-next">下一页</button>
+            </div>
+          </div>
+
+          <!-- 控制器事件 -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Controller events</div>
+                <strong>控制器事件</strong>
+              </div>
+              <div class="chips" id="ctl-lines">
+                <button class="chip active" data-lines="100">100 行</button>
+                <button class="chip" data-lines="200">200 行</button>
+                <button class="chip" data-lines="500">500 行</button>
+              </div>
+            </div>
+            <div class="ctl-toolbar">
+              <button class="btn sm" id="btn-ctl-refresh">刷新</button>
+              <button class="btn sm ghost" id="btn-ctl-copy">复制</button>
+              <span class="tiny" id="ctl-total"></span>
+            </div>
+            <pre class="smart-pre" id="ctl-pre">加载中…</pre>
+          </div>
+
+          <!-- 系统信息 -->
+          <div class="card" id="card-system">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">System</div>
+                <strong>系统信息</strong>
+              </div>
+            </div>
+            <dl class="kv" id="system-kv"><dt class="muted">加载中…</dt></dl>
+          </div>
+        </div>
+
+        <!-- ============ 磁盘管理 ============ -->
+        <div class="view hidden" id="view-storage">
+          <!-- 文件系统使用率 -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Filesystem usage</div>
+                <strong>文件系统使用率</strong>
+              </div>
+              <button class="btn sm" id="btn-fs-refresh">刷新</button>
+            </div>
+            <div class="table-wrap">
+              <table class="data" id="fs-table">
+                <thead><tr>
+                  <th>设备</th><th>挂载点</th><th>类型</th><th>容量</th><th>已用</th><th>使用率</th><th>操作</th>
+                </tr></thead>
+                <tbody><tr><td colspan="7" class="muted">加载中…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Block devices</div>
+                <strong>块设备</strong>
+              </div>
+              <button class="btn sm" id="btn-storage-refresh">刷新</button>
+            </div>
+            <div class="table-wrap">
+              <table class="data" id="storage-table">
+                <thead><tr>
+                  <th>名称</th><th>大小</th><th>文件系统</th><th>挂载点</th><th>操作</th>
+                </tr></thead>
+                <tbody><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- ============ 用户管理 ============ -->
+        <div class="view hidden" id="view-users">
+          <div class="banner hidden" id="users-warning">未启用认证，创建第一个管理员后启用</div>
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Accounts</div>
+                <strong>用户列表</strong>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="data" id="users-table">
+                <thead><tr>
+                  <th>用户名</th><th>角色</th><th>操作</th>
+                </tr></thead>
+                <tbody><tr><td colspan="3" class="muted">加载中…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">New account</div>
+                <strong>新建用户</strong>
+              </div>
+            </div>
+            <form id="user-form" class="form-row" autocomplete="off">
+              <div class="field">
+                <label for="nu-username">用户名</label>
+                <input class="input" id="nu-username" required />
+              </div>
+              <div class="field">
+                <label for="nu-password">口令</label>
+                <input class="input" id="nu-password" type="password" required />
+              </div>
+              <div class="field">
+                <label for="nu-role">角色</label>
+                <select class="select" id="nu-role" style="width:100%">
+                  <option value="viewer">只读用户</option>
+                  <option value="admin">管理员</option>
+                </select>
+              </div>
+              <div class="field" style="align-self:end;">
+                <button class="btn primary" id="btn-user-create" type="submit">创建用户</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- 磁盘详情抽屉 -->
+  <div class="drawer-scrim hidden" id="drawer-scrim"></div>
+  <aside class="drawer" id="drawer">
+    <div class="drawer-head">
+      <strong id="drawer-title">磁盘详情</strong>
+      <button class="icon-btn" id="drawer-close">✕</button>
+    </div>
+    <div class="drawer-body">
+      <dl class="kv" id="drawer-kv"></dl>
+      <div>
+        <button class="btn" id="btn-smart">查看 SMART</button>
+        <button class="btn ghost hidden" id="btn-smart-raw">查看原始输出</button>
+        <button class="btn ghost hidden" id="btn-smart-copy">复制</button>
+      </div>
+      <div id="smart-body" class="hidden"></div>
+      <pre class="smart-pre hidden" id="smart-pre"></pre>
+    </div>
+  </aside>
+
+  <!-- 通用确认对话框 -->
+  <div class="modal-scrim hidden" id="modal-scrim">
+    <div class="modal">
+      <h3 id="modal-title">确认</h3>
+      <div class="modal-body" id="modal-body"></div>
+      <div class="modal-actions" id="modal-actions"></div>
+    </div>
+  </div>
+
+  <script src="/static/vendor/chart.umd.min.js"></script>
+  <script src="/static/js/app.js"></script>
 </body>
 </html>

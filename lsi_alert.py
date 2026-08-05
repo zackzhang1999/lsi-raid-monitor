@@ -1,604 +1,354 @@
 #!/usr/bin/env python3
 # ================================================
-# LSI MegaRAID 故障邮件报警模块
-# 调用服务器本地 sendmail 服务发送即时报警邮件
+# LSI MegaRAID 邮件报警模块
+# 被 lsi_collectd.py 每分钟调用，也被 web_server.py 用于读取/保存报警配置
 #
-# 支持环境变量或 JSON 配置文件配置报警参数。
-# 配置文件路径: $LSI_DATA_DIR/alert_config.json
-#
-# 环境变量 (优先级高于配置文件):
-#   ALERT_EMAIL_TO      报警收件人，多个地址用逗号分隔
-#   SENDMAIL_PATH       sendmail 路径 (默认 /usr/sbin/sendmail)
-#   TEMP_WARN           温度警告阈值 (默认 45)
-#   TEMP_CRIT           温度临界阈值 (默认 50)
-#   LSI_DATA_DIR        数据目录 (默认 ./data)
+# 配置文件: $LSI_DATA_DIR/alert_config.json
+# 环境变量（优先级更高，设置后 Web 中对应字段锁定）:
+#   ALERT_EMAIL_TO   报警收件人，多个用逗号分隔
+#   SENDMAIL_PATH    sendmail 路径（默认 /usr/sbin/sendmail）
+#   ALERT_TEMP_WARN  温度警告阈值 °C（默认 45）
+#   ALERT_TEMP_CRIT  温度临界阈值 °C（默认 55）
 # ================================================
 
 from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
-import sys
+import socket
 from datetime import datetime
 from pathlib import Path
 
-from email.header import Header
-from email.mime.text import MIMEText
-
 PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_DIR = Path(os.environ.get("LSI_DATA_DIR", str(PROJECT_ROOT / "data")))
-ALERT_STATE_FILE = BASE_DIR / "alert_state.json"
-ALERT_CONFIG_FILE = BASE_DIR / "alert_config.json"
 
-# 默认值
-DEFAULT_SENDMAIL_PATH = "/usr/sbin/sendmail"
-DEFAULT_TEMP_WARN = 45
-DEFAULT_TEMP_CRIT = 50
+CONFIG_FILE = BASE_DIR / "alert_config.json"
+STATE_FILE = BASE_DIR / ".alert_state.json"
+EVENTS_FILE = BASE_DIR / "events.jsonl"
+
+DEFAULT_CONFIG = {
+    "alert_email_to": "",
+    "sendmail_path": "/usr/sbin/sendmail",
+    "temp_warn": 45,
+    "temp_crit": 55,
+}
+
+# 环境变量 -> 配置字段
+ENV_OVERRIDES = {
+    "alert_email_to": "ALERT_EMAIL_TO",
+    "sendmail_path": "SENDMAIL_PATH",
+    "temp_warn": "ALERT_TEMP_WARN",
+    "temp_crit": "ALERT_TEMP_CRIT",
+}
 
 
 # ---- 配置读写 ----
 
 
-def _env_str(name: str, default: str = "") -> str:
-    return os.environ.get(name, default).strip()
-
-
-def _env_int(name: str, default: int) -> int:
+def load_config() -> dict:
+    cfg = dict(DEFAULT_CONFIG)
     try:
-        return int(os.environ.get(name, str(default)))
-    except (ValueError, TypeError):
-        return default
-
-
-def load_alert_config_file() -> dict:
-    if not ALERT_CONFIG_FILE.exists():
-        return {}
-    try:
-        with open(ALERT_CONFIG_FILE, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-            return cfg if isinstance(cfg, dict) else {}
+        if CONFIG_FILE.exists():
+            with open(CONFIG_FILE, encoding="utf-8") as f:
+                saved = json.load(f)
+            for key in DEFAULT_CONFIG:
+                if key in saved:
+                    cfg[key] = saved[key]
     except Exception as e:
-        print(f"[{_ts()}] alert config load error: {e}", file=sys.stderr)
-        return {}
+        print(f"[alert] config load error: {e}")
+    # 环境变量覆盖
+    for key, env in ENV_OVERRIDES.items():
+        val = os.environ.get(env)
+        if val is not None and val != "":
+            if key in ("temp_warn", "temp_crit"):
+                try:
+                    val = int(val)
+                except ValueError:
+                    continue
+            cfg[key] = val
+    return cfg
 
 
-def save_alert_config(config: dict):
-    """保存报警配置到 JSON 文件。"""
+def save_config(new_cfg: dict):
+    """保存配置到 JSON；被环境变量锁定的字段不写入"""
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    cfg = {}
     try:
-        BASE_DIR.mkdir(parents=True, exist_ok=True)
-        with open(ALERT_CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"[{_ts()}] alert config save error: {e}", file=sys.stderr)
-        raise
+        if CONFIG_FILE.exists():
+            with open(CONFIG_FILE, encoding="utf-8") as f:
+                cfg = json.load(f)
+    except Exception:
+        cfg = {}
+    for key in DEFAULT_CONFIG:
+        if is_locked(key):
+            continue
+        if key in new_cfg:
+            cfg[key] = new_cfg[key]
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 
-def get_alert_config() -> dict:
-    """
-    返回最终生效的报警配置。优先级：环境变量 > 配置文件 > 默认值。
-    """
-    file_cfg = load_alert_config_file()
+def is_locked(key: str) -> bool:
+    env = ENV_OVERRIDES.get(key)
+    return bool(env and os.environ.get(env))
 
-    email_to = _env_str("ALERT_EMAIL_TO", file_cfg.get("alert_email_to", ""))
-    sendmail = _env_str(
-        "SENDMAIL_PATH", file_cfg.get("sendmail_path", DEFAULT_SENDMAIL_PATH)
-    )
-    temp_warn = _env_int("TEMP_WARN", file_cfg.get("temp_warn", DEFAULT_TEMP_WARN))
-    temp_crit = _env_int("TEMP_CRIT", file_cfg.get("temp_crit", DEFAULT_TEMP_CRIT))
 
-    return {
-        "alert_email_to": email_to,
-        "sendmail_path": sendmail,
-        "temp_warn": temp_warn,
-        "temp_crit": temp_crit,
+def locked_fields() -> dict:
+    return {key: is_locked(key) for key in DEFAULT_CONFIG}
+
+
+def sendmail_available(cfg: dict | None = None) -> bool:
+    cfg = cfg or load_config()
+    path = cfg.get("sendmail_path") or ""
+    return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def alert_enabled(cfg: dict | None = None) -> bool:
+    cfg = cfg or load_config()
+    return bool(str(cfg.get("alert_email_to", "")).strip())
+
+
+# ---- 事件日志（Web 事件页面读取同一文件）----
+
+
+def log_event(level: str, message: str):
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "level": level,
+        "message": message,
     }
-
-
-# ---- 状态持久化 ----
-
-
-def load_alert_state() -> dict:
-    if not ALERT_STATE_FILE.exists():
-        return {}
     try:
-        with open(ALERT_STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        with open(EVENTS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as e:
-        print(f"[{_ts()}] alert state load error: {e}", file=sys.stderr)
-        return {}
-
-
-def save_alert_state(state: dict):
-    try:
-        BASE_DIR.mkdir(parents=True, exist_ok=True)
-        with open(ALERT_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False)
-    except Exception as e:
-        print(f"[{_ts()}] alert state save error: {e}", file=sys.stderr)
+        print(f"[alert] event log error: {e}")
 
 
 # ---- 邮件发送 ----
 
 
-def _ts() -> str:
-    return datetime.now().strftime("%H:%M:%S")
+def send_mail(subject: str, body: str, cfg: dict | None = None) -> tuple[bool, str]:
+    cfg = cfg or load_config()
+    recipients = [
+        r.strip() for r in str(cfg.get("alert_email_to", "")).split(",") if r.strip()
+    ]
+    if not recipients:
+        return False, "未配置报警收件人"
+    sendmail = cfg.get("sendmail_path") or "/usr/sbin/sendmail"
+    if not (os.path.isfile(sendmail) and os.access(sendmail, os.X_OK)):
+        return False, f"sendmail 不可用: {sendmail}"
 
-
-def sendmail_available(sendmail_path: str | None = None) -> bool:
-    path = sendmail_path or get_alert_config()["sendmail_path"]
-    return shutil.which(path) is not None
-
-
-def send_alert_email(
-    subject: str, body: str, to_addresses: list[str], sendmail_path: str | None = None
-) -> bool:
-    """使用本地 sendmail 发送 UTF-8 纯文本邮件。"""
-    path = sendmail_path or get_alert_config()["sendmail_path"]
-    if not sendmail_available(path):
-        print(f"[{_ts()}] sendmail not found: {path}", file=sys.stderr)
-        return False
-
-    to_header = ", ".join(to_addresses)
-    # 用标准 MIME 构造邮件：Subject 按 RFC 2047 编码、正文 base64，
-    # 使整封邮件为 7bit ASCII，避免投递时要求 SMTPUTF8 而被中继拒收
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["To"] = to_header
-    msg["Subject"] = Header(subject, "utf-8")
-    message = msg.as_string()
-
-    try:
-        result = subprocess.run(
-            [path, "-t"],
-            input=message,
-            text=True,
-            capture_output=True,
-            timeout=60,
-        )
-        if result.returncode != 0:
-            print(
-                f"[{_ts()}] sendmail failed: {result.stderr.strip()}",
-                file=sys.stderr,
-            )
-            return False
-        return True
-    except Exception as e:
-        print(f"[{_ts()}] sendmail error: {e}", file=sys.stderr)
-        return False
-
-
-# ---- 异常检测 ----
-
-
-def _disk_state_ok(state: str | None) -> bool:
-    return str(state).strip().lower() in (
-        "onln",
-        "online",
-        "hotspare",
-        "ugood",
-        "optimal",
-        "optl",
-        "opt",
+    host = socket.gethostname()
+    msg = (
+        f"From: lsi-raid-monitor@{host}\n"
+        f"To: {', '.join(recipients)}\n"
+        f"Subject: [LSI RAID] {subject}\n"
+        f"Content-Type: text/plain; charset=utf-8\n"
+        f"\n{body}\n"
     )
+    try:
+        proc = subprocess.run(
+            [sendmail, "-t", "-oi"],
+            input=msg.encode("utf-8"),
+            capture_output=True,
+            timeout=30,
+        )
+        if proc.returncode == 0:
+            return True, "发送成功"
+        return False, proc.stderr.decode("utf-8", "ignore").strip() or "sendmail 失败"
+    except Exception as e:
+        return False, str(e)
 
 
-def _controller_state_ok(state: str | None) -> bool:
-    return str(state).strip().lower() in ("optimal", "optl", "opt")
+def _alert(subject: str, body: str, level: str = "error"):
+    """记录事件并按配置发送邮件"""
+    log_event(level, f"{subject} — {body.splitlines()[0] if body else ''}")
+    cfg = load_config()
+    if not alert_enabled(cfg):
+        return
+    ok, err = send_mail(subject, body, cfg)
+    if not ok:
+        log_event("warning", f"报警邮件发送失败: {err}")
 
 
-def detect_issues(
-    disks: list[dict], controller: dict | None, cfg: dict | None = None
-) -> tuple[list[str], set[str]]:
-    """
-    返回 (问题描述列表, 当前激活的告警标识集合)。
-    告警标识用于状态去重，避免同一故障每分钟重复发邮件。
-    """
-    cfg = cfg or get_alert_config()
-    temp_warn = cfg.get("temp_warn", DEFAULT_TEMP_WARN)
-    temp_crit = cfg.get("temp_crit", DEFAULT_TEMP_CRIT)
+# ---- 状态快照（去重：只在状态变化时报警）----
 
-    issues: list[str] = []
-    active_alerts: set[str] = set()
 
-    # 控制器健康
-    ctrl_health = controller.get("health", "N/A") if controller else "N/A"
-    if not _controller_state_ok(ctrl_health):
-        issues.append(f"控制器健康状态异常: {ctrl_health}")
-        active_alerts.add("controller")
+def _load_state() -> dict:
+    try:
+        if STATE_FILE.exists():
+            with open(STATE_FILE, encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
 
-    for d in disks:
-        eid = d.get("eid", "?")
-        slot = d.get("slot", "?")
-        label = f"E{eid}:S{slot}"
 
-        # 磁盘状态
-        state = str(d.get("state", "")).strip()
-        if state and not _disk_state_ok(state):
-            issues.append(f"物理磁盘 {label} 状态异常: {state}")
-            active_alerts.add(f"disk:{eid}:{slot}")
+def _save_state(state: dict):
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False)
+    os.replace(tmp, STATE_FILE)
 
-        # 温度
+
+# ---- 采集器调用的检查入口 ----
+
+
+def check_and_alert(disks: list[dict], ctrl: dict | None):
+    """每分钟调用：温度阈值 / SMART 告警 / 预测性故障 / 控制器与 BBU 健康"""
+    cfg = load_config()
+    temp_warn = int(cfg.get("temp_warn", 45))
+    temp_crit = int(cfg.get("temp_crit", 55))
+    state = _load_state()
+    flagged = state.setdefault("flagged", {})
+
+    def flag_once(key: str, subject: str, body: str, level: str = "error"):
+        if not flagged.get(key):
+            flagged[key] = True
+            _alert(subject, body, level)
+
+    def unflag(key: str):
+        flagged.pop(key, None)
+
+    for d in disks or []:
+        label = f"E{d.get('eid')}:S{d.get('slot')}"
         temp = d.get("temperature")
         if isinstance(temp, int):
             if temp >= temp_crit:
-                issues.append(f"物理磁盘 {label} 温度达到临界值: {temp}°C")
-                active_alerts.add(f"temp_crit:{eid}:{slot}")
+                flag_once(
+                    f"temp_crit_{label}",
+                    f"磁盘 {label} 温度临界 {temp}°C",
+                    f"磁盘 {label} ({d.get('model', '')}) 温度 {temp}°C，超过临界阈值 {temp_crit}°C。",
+                )
             elif temp >= temp_warn:
-                issues.append(f"物理磁盘 {label} 温度超过警告阈值: {temp}°C")
-                active_alerts.add(f"temp_warn:{eid}:{slot}")
+                flag_once(
+                    f"temp_warn_{label}",
+                    f"磁盘 {label} 温度偏高 {temp}°C",
+                    f"磁盘 {label} ({d.get('model', '')}) 温度 {temp}°C，超过警告阈值 {temp_warn}°C。",
+                    "warning",
+                )
+                unflag(f"temp_crit_{label}")
+            else:
+                unflag(f"temp_warn_{label}")
+                unflag(f"temp_crit_{label}")
 
-        # SMART 告警
-        if str(d.get("smart_alert", "No")).strip().lower() == "yes":
-            issues.append(f"物理磁盘 {label} SMART 告警被标记")
-            active_alerts.add(f"smart:{eid}:{slot}")
-
-        # 错误计数器
-        me = d.get("media_error", 0) or 0
-        oe = d.get("other_error", 0) or 0
-        pf = d.get("predictive_failure", 0) or 0
-        if me > 0 or oe > 0 or pf > 0:
-            issues.append(
-                f"物理磁盘 {label} 错误计数异常: "
-                f"MediaError={me}, OtherError={oe}, PredictiveFailure={pf}"
+        if str(d.get("smart_alert", "")).strip() == "Yes":
+            flag_once(
+                f"smart_{label}",
+                f"磁盘 {label} SMART 告警",
+                f"磁盘 {label} ({d.get('model', '')}) SMART alert flagged by drive。",
             )
-            active_alerts.add(f"errors:{eid}:{slot}")
+        else:
+            unflag(f"smart_{label}")
 
-    return issues, active_alerts
+        try:
+            pf = int(d.get("predictive_failure") or 0)
+        except (ValueError, TypeError):
+            pf = 0
+        if pf > 0:
+            flag_once(
+                f"pf_{label}",
+                f"磁盘 {label} 预测性故障计数 {pf}",
+                f"磁盘 {label} ({d.get('model', '')}) Predictive Failure Count = {pf}。",
+            )
+        else:
+            unflag(f"pf_{label}")
 
+    if ctrl:
+        health = str(ctrl.get("health", "")).strip()
+        if health and health not in ("Optimal", "N/A"):
+            flag_once(
+                "ctrl_health",
+                f"控制器健康异常: {health}",
+                f"控制器 {ctrl.get('model', '')} 健康状态为 {health}。",
+            )
+        else:
+            unflag("ctrl_health")
 
-def _build_alert_body(
-    timestamp: str,
-    controller: dict | None,
-    disks: list[dict],
-    issues: list[str],
-    cfg: dict | None = None,
-) -> str:
-    cfg = cfg or get_alert_config()
-    host = os.uname().nodename
-    lines = [
-        f"LSI RAID 故障报警 — {host}",
-        f"时间: {timestamp}",
-        "",
-        "检测到以下异常:",
-    ]
-    for issue in issues:
-        lines.append(f"  - {issue}")
+        bbu = str(ctrl.get("bbu_state", "")).strip()
+        if bbu and bbu not in ("Optimal", "Opt", "OK"):
+            flag_once(
+                "bbu_state",
+                f"BBU/缓存单元异常: {bbu}",
+                f"BBU {ctrl.get('bbu_model', '')} 状态为 {bbu}。",
+            )
+        else:
+            unflag("bbu_state")
 
-    lines.append("")
-    lines.append(
-        f"控制器健康: {controller.get('health', 'N/A') if controller else 'N/A'}"
-    )
-    if controller:
-        lines.append(f"控制器型号: {controller.get('model', '—')}")
-        lines.append(f"固件版本: {controller.get('fw_version', '—')}")
-
-    lines.append("")
-    lines.append("物理磁盘状态:")
-    for d in disks:
-        eid = d.get("eid", "?")
-        slot = d.get("slot", "?")
-        temp = d.get("temperature", "—")
-        temp_str = f"{temp}°C" if isinstance(temp, int) else str(temp)
-        lines.append(
-            f"  E{eid}:S{slot} | {d.get('model', '—')} | "
-            f"状态: {d.get('state', '—')} | 温度: {temp_str} | "
-            f"ME={d.get('media_error', 0)} OE={d.get('other_error', 0)} "
-            f"PF={d.get('predictive_failure', 0)} SMART={d.get('smart_alert', 'No')}"
-        )
-
-    lines.append("")
-    lines.append(" thresholds:")
-    lines.append(
-        f"  温度警告: {cfg.get('temp_warn', DEFAULT_TEMP_WARN)}°C, "
-        f"温度临界: {cfg.get('temp_crit', DEFAULT_TEMP_CRIT)}°C"
-    )
-    lines.append("")
-    lines.append("本邮件由 lsi-raid-monitor 自动发送。")
-    return "\n".join(lines)
-
-
-# ---- 主入口 ----
-
-
-def check_and_alert(disks: list[dict], controller: dict | None):
-    """
-    检查当前磁盘/控制器状态，若存在新的异常则立即发送报警邮件。
-    同一异常在恢复前不会重复发送。
-    """
-    cfg = get_alert_config()
-    alert_email_to = cfg.get("alert_email_to", "")
-    sendmail_path = cfg.get("sendmail_path", DEFAULT_SENDMAIL_PATH)
-
-    if not alert_email_to:
-        return
-
-    if not sendmail_available(sendmail_path):
-        print(
-            f"[{_ts()}] ALERT_EMAIL_TO is set but sendmail not found: {sendmail_path}",
-            file=sys.stderr,
-        )
-        return
-
-    issues, active_alerts = detect_issues(disks, controller, cfg)
-
-    state = load_alert_state()
-    prev_alerts: set[str] = set(state.get("active_alerts", []))
-
-    # 只有当存在异常且异常集合发生变化（新增异常）时才发送邮件
-    if not active_alerts:
-        save_alert_state(
-            {"active_alerts": [], "last_check": datetime.now().isoformat()}
-        )
-        return
-
-    if active_alerts == prev_alerts:
-        # 异常集合没有变化，不重复发邮件；只更新时间戳
-        save_alert_state(
-            {
-                "active_alerts": sorted(active_alerts),
-                "last_check": datetime.now().isoformat(),
-            }
-        )
-        return
-
-    # 有新增异常，发送邮件
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    host = os.uname().nodename
-    subject = f"[LSI RAID ALERT] {host} 检测到 {len(issues)} 项异常"
-    body = _build_alert_body(timestamp, controller, disks, issues, cfg)
-
-    recipients = [addr.strip() for addr in alert_email_to.split(",") if addr.strip()]
-    if recipients and send_alert_email(subject, body, recipients, sendmail_path):
-        print(f"[{_ts()}] Alert email sent to {', '.join(recipients)}")
-
-    save_alert_state(
-        {
-            "active_alerts": sorted(active_alerts),
-            "last_check": datetime.now().isoformat(),
-        }
-    )
-
-
-# ---- SMART 关键属性变化监控 ----
-
-# (采集字段名, SMART 属性 ID, 属性说明)
-SMART_WATCH_ATTRS = [
-    ("reallocated", 5, "Reallocated Sector Count 重映射扇区数"),
-    ("reported_uncorrectable", 187, "Reported Uncorrectable Errors 不可恢复错误"),
-    ("command_timeout", 188, "Command Timeout 命令超时"),
-    ("pending", 197, "Current Pending Sector Count 待映射扇区数"),
-    ("uncorrectable", 198, "Offline Uncorrectable 离线不可校正扇区数"),
-]
-
-
-def detect_smart_attr_changes(
-    smart_rows: list[dict], prev_values: dict
-) -> tuple[list[str], dict]:
-    """
-    对比上次采集值，返回 (变化描述列表, 本次基线 dict)。
-    首次见到的磁盘只建立基线，不告警。
-    """
-    changes: list[str] = []
-    current: dict = {}
-    for row in smart_rows:
-        did = row.get("did")
-        # collect_smart 失败时以 {"did": did, "reallocated": -1} 占位，跳过
-        if did is None or row.get("reallocated") == -1:
-            continue
-        key = str(did)
-        cur = {}
-        for field, aid, _name in SMART_WATCH_ATTRS:
-            value = row.get(field)
-            if isinstance(value, int) and not isinstance(value, bool):
-                cur[str(aid)] = value
-        current[key] = cur
-        old = prev_values.get(key)
-        if not isinstance(old, dict):
-            continue
-        for _field, aid, name in SMART_WATCH_ATTRS:
-            aid_key = str(aid)
-            if aid_key in cur and aid_key in old and cur[aid_key] != old[aid_key]:
-                changes.append(
-                    f"DID {did} SMART 属性 {aid} ({name}): "
-                    f"{old[aid_key]} → {cur[aid_key]}"
-                )
-    return changes, current
-
-
-def check_smart_attr_changes(smart_rows: list[dict]):
-    """
-    SMART 关键属性 (5/187/188/197/198) 数值一旦变化即发送邮件告警。
-    基线存于 alert_state.json 的 smart_attr_values；发送失败时不更新基线，
-    下次采集会重新检测，避免告警丢失。
-    """
-    cfg = get_alert_config()
-    alert_email_to = cfg.get("alert_email_to", "")
-    if not alert_email_to:
-        return
-
-    state = load_alert_state()
-    prev_values = state.get("smart_attr_values") or {}
-    changes, current = detect_smart_attr_changes(smart_rows, prev_values)
-
-    if not changes:
-        state["smart_attr_values"] = current
-        save_alert_state(state)
-        return
-
-    sendmail_path = cfg.get("sendmail_path", DEFAULT_SENDMAIL_PATH)
-    if not sendmail_available(sendmail_path):
-        print(
-            f"[{_ts()}] SMART 属性变化但 sendmail 不可用: {sendmail_path}",
-            file=sys.stderr,
-        )
-        return
-
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    host = os.uname().nodename
-    subject = f"[LSI RAID ALERT] {host} 检测到 {len(changes)} 项 SMART 属性变化"
-    lines = [
-        f"LSI RAID SMART 属性变化告警 — {host}",
-        f"时间: {timestamp}",
-        "",
-        "以下 SMART 关键属性数值发生变化（可能预示磁盘劣化）:",
-    ]
-    lines += [f"  - {c}" for c in changes]
-    lines += [
-        "",
-        "监控属性: 5 (重映射扇区), 187 (不可恢复错误), 188 (命令超时),",
-        "          197 (待映射扇区), 198 (离线不可校正)",
-        "",
-        "本邮件由 lsi-raid-monitor 自动发送。",
-    ]
-
-    recipients = [addr.strip() for addr in alert_email_to.split(",") if addr.strip()]
-    if recipients and send_alert_email(subject, "\n".join(lines), recipients, sendmail_path):
-        print(f"[{_ts()}] SMART attr change alert sent to {', '.join(recipients)}")
-        state["smart_attr_values"] = current
-        save_alert_state(state)
-
-
-# ---- 磁盘 / VD 状态变化监控 ----
-
-
-def detect_state_changes(
-    disks: list[dict],
-    vds: list[dict],
-    prev_disk_states: dict | None,
-    prev_vd_states: dict | None,
-) -> tuple[list[str], dict, dict]:
-    """
-    对比上次采集快照，返回 (变化描述列表, 当前磁盘快照, 当前VD快照)。
-    首次采集（prev 为 None）只建立基线，不告警。
-    本次采集为空的一侧（storcli 失败）不参与对比，也不覆盖基线。
-    """
-    cur_disks: dict = {}
-    for d in disks or []:
-        eid, slot = d.get("eid"), d.get("slot")
-        if eid is None or slot is None:
-            continue
-        cur_disks[f"E{eid}:S{slot}"] = str(d.get("state", "")).strip() or "Unknown"
-
-    cur_vds: dict = {}
-    for v in vds or []:
-        key = str(v.get("dg_vd", "")).strip()
-        if key:
-            cur_vds[key] = str(v.get("state", "")).strip() or "Unknown"
-
-    changes: list[str] = []
-
-    if prev_disk_states is not None and cur_disks:
-        for label, st in cur_disks.items():
-            if label not in prev_disk_states:
-                changes.append(f"新增物理磁盘 {label}，当前状态: {st}")
-            elif prev_disk_states[label] != st:
-                changes.append(
-                    f"物理磁盘 {label} 状态变化: {prev_disk_states[label]} → {st}"
-                )
-        for label, st in prev_disk_states.items():
-            if label not in cur_disks:
-                changes.append(f"物理磁盘 {label} 已移除（此前状态: {st}）")
-
-    if prev_vd_states is not None and cur_vds:
-        for key, st in cur_vds.items():
-            if key not in prev_vd_states:
-                changes.append(f"新增虚拟磁盘 VD {key}，当前状态: {st}")
-            elif prev_vd_states[key] != st:
-                changes.append(
-                    f"虚拟磁盘 VD {key} 状态变化: {prev_vd_states[key]} → {st}"
-                )
-        for key, st in prev_vd_states.items():
-            if key not in cur_vds:
-                changes.append(f"虚拟磁盘 VD {key} 已移除（此前状态: {st}）")
-
-    return changes, cur_disks, cur_vds
+    _save_state(state)
 
 
 def check_state_changes(disks: list[dict], vds: list[dict]):
-    """
-    磁盘状态变化（Onln→Failed 等迁移、增删盘）与 VD 变化邮件告警。
-    基线存于 alert_state.json 的 disk_states / vd_states；首次采集只建立
-    基线不告警；发送失败时不更新基线，下次采集重新检测，避免告警丢失。
-    """
-    cfg = get_alert_config()
-    alert_email_to = cfg.get("alert_email_to", "")
-    if not alert_email_to:
-        return
+    """每分钟调用：磁盘 / VD 状态变化告警"""
+    state = _load_state()
+    prev_disks = state.get("disk_states", {})
+    prev_vds = state.get("vd_states", {})
 
-    state = load_alert_state()
-    prev_disks = state.get("disk_states")
-    prev_vds = state.get("vd_states")
-    changes, cur_disks, cur_vds = detect_state_changes(
-        disks, vds, prev_disks, prev_vds
-    )
+    cur_disks = {}
+    for d in disks or []:
+        label = f"E{d.get('eid')}:S{d.get('slot')}"
+        st = str(d.get("state", "")).strip()
+        if st and st != "N/A":
+            cur_disks[label] = st
+    for label, st in cur_disks.items():
+        old = prev_disks.get(label)
+        if old is not None and old != st:
+            _alert(
+                f"磁盘 {label} 状态变化: {old} → {st}",
+                f"磁盘 {label} 状态由 {old} 变为 {st}。",
+                "error" if st not in ("Onln", "UGood", "JBOD") else "warning",
+            )
 
-    if not changes:
-        # 无变化：更新基线（采集为空的一侧保留旧基线）
-        if cur_disks:
-            state["disk_states"] = cur_disks
-        if cur_vds:
-            state["vd_states"] = cur_vds
-        save_alert_state(state)
-        return
+    cur_vds = {}
+    for v in vds or []:
+        key = str(v.get("dg_vd", ""))
+        st = str(v.get("state", "")).strip()
+        if key and st:
+            cur_vds[key] = st
+    for key, st in cur_vds.items():
+        old = prev_vds.get(key)
+        if old is not None and old != st:
+            _alert(
+                f"虚拟磁盘 {key} 状态变化: {old} → {st}",
+                f"虚拟磁盘 {key} 状态由 {old} 变为 {st}。",
+                "error" if st not in ("Optl", "Optimal") else "warning",
+            )
 
-    sendmail_path = cfg.get("sendmail_path", DEFAULT_SENDMAIL_PATH)
-    if not sendmail_available(sendmail_path):
-        print(
-            f"[{_ts()}] 磁盘/VD 状态变化但 sendmail 不可用: {sendmail_path}",
-            file=sys.stderr,
-        )
-        return
+    state["disk_states"] = cur_disks
+    state["vd_states"] = cur_vds
+    _save_state(state)
 
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    host = os.uname().nodename
-    subject = f"[LSI RAID ALERT] {host} 检测到 {len(changes)} 项磁盘/VD 状态变化"
-    lines = [
-        f"LSI RAID 磁盘/VD 状态变化告警 — {host}",
-        f"时间: {timestamp}",
-        "",
-        "检测到以下磁盘 / 虚拟磁盘（VD）变化:",
+
+def check_smart_attr_changes(smart_data: list[dict]):
+    """SMART 采集后调用：关键属性 (5/187/188/197/198 等) 增长告警"""
+    state = _load_state()
+    prev = state.get("smart_attrs", {})
+    cur = {}
+    watch = [
+        "reallocated",
+        "pending",
+        "uncorrectable",
+        "reported_uncorrectable",
+        "command_timeout",
     ]
-    lines += [f"  - {c}" for c in changes]
-    lines += [
-        "",
-        "当前物理磁盘状态:",
-    ]
-    for label in sorted(cur_disks):
-        lines.append(f"  {label} | 状态: {cur_disks[label]}")
-    if cur_vds:
-        lines += ["", "当前虚拟磁盘（VD）状态:"]
-        for key in sorted(cur_vds):
-            lines.append(f"  VD {key} | 状态: {cur_vds[key]}")
-    lines += [
-        "",
-        "本邮件由 lsi-raid-monitor 自动发送。",
-    ]
-
-    recipients = [addr.strip() for addr in alert_email_to.split(",") if addr.strip()]
-    if recipients and send_alert_email(
-        subject, "\n".join(lines), recipients, sendmail_path
-    ):
-        print(f"[{_ts()}] Disk/VD state change alert sent to {', '.join(recipients)}")
-        if cur_disks:
-            state["disk_states"] = cur_disks
-        if cur_vds:
-            state["vd_states"] = cur_vds
-        save_alert_state(state)
-
-
-if __name__ == "__main__":
-    # 简单自测：读取环境变量并尝试发送一封测试邮件
-    cfg = get_alert_config()
-    test_to = cfg.get("alert_email_to", "")
-    if not test_to:
-        print("Usage: ALERT_EMAIL_TO=you@example.com python3 lsi_alert.py")
-        sys.exit(1)
-    host = os.uname().nodename
-    ok = send_alert_email(
-        f"[LSI RAID ALERT TEST] {host}",
-        f"这是一封来自 {host} 的 LSI RAID Monitor 报警邮件测试。\n\n"
-        "如果收到此邮件，说明本地 sendmail 配置正确。",
-        [addr.strip() for addr in test_to.split(",") if addr.strip()],
-    )
-    sys.exit(0 if ok else 1)
+    for s in smart_data or []:
+        did = str(s.get("did", ""))
+        if not did:
+            continue
+        cur[did] = {k: int(s.get(k) or 0) for k in watch}
+        old = prev.get(did)
+        if old:
+            grown = [k for k in watch if cur[did][k] > int(old.get(k) or 0)]
+            if grown:
+                detail = ", ".join(
+                    f"{k}: {old.get(k, 0)} → {cur[did][k]}" for k in grown
+                )
+                _alert(
+                    f"磁盘 DID={did} SMART 关键属性增长",
+                    f"磁盘 DID={did} SMART 属性变化：{detail}。",
+                )
+    state["smart_attrs"] = cur
+    _save_state(state)

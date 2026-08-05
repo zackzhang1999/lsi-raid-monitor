@@ -89,18 +89,19 @@ def collect_disks() -> list[dict]:
 
         # 第二遍：处理详细条目
         for key, detail in resp.items():
-            m = re.match(r"Drive /c\d+/e(\d+)/s(\d+)", key)
+            m = re.match(r"Drive /c(\d+)/e(\d+)/s(\d+)", key)
             if not m:
                 continue
             if not isinstance(detail, dict):
                 continue
 
-            eid = int(m.group(1))
-            slot = int(m.group(2))
-            summary_key = f"Drive /c0/e{eid}/s{slot}"
+            ctrl = m.group(1)
+            eid = int(m.group(2))
+            slot = int(m.group(3))
+            summary_key = f"Drive /c{ctrl}/e{eid}/s{slot}"
             summary = summaries.get(summary_key, {})
 
-            state_key = f"Drive /c0/e{eid}/s{slot} State"
+            state_key = f"Drive /c{ctrl}/e{eid}/s{slot} State"
             state = detail.get(state_key, {})
 
             temp = parse_temperature(state.get("Drive Temperature", ""))
@@ -258,12 +259,13 @@ def collect_disk_attributes() -> list[dict]:
                     summaries[key] = val[0]
 
         for key, detail in resp.items():
-            m = re.match(r"Drive /c\d+/e(\d+)/s(\d+)", key)
+            m = re.match(r"Drive /c(\d+)/e(\d+)/s(\d+)", key)
             if not m or not isinstance(detail, dict):
                 continue
-            eid = int(m.group(1))
-            slot = int(m.group(2))
-            summary_key = f"Drive /c0/e{eid}/s{slot}"
+            ctrl = m.group(1)
+            eid = int(m.group(2))
+            slot = int(m.group(3))
+            summary_key = f"Drive /c{ctrl}/e{eid}/s{slot}"
             summary = summaries.get(summary_key, {})
 
             sn = ""
@@ -424,6 +426,86 @@ def collect_system_info() -> dict:
     return info
 
 
+# ---- IO 性能计数（原始计数器，速率由读取方按相邻样本差值计算）----
+
+_DISK_NAME_RE = re.compile(r"^(sd[a-z]+|nvme\d+n\d+|vd[a-z]+|xvd[a-z]+|hd[a-z]+)$")
+
+
+def collect_io() -> list[dict]:
+    rows = []
+    try:
+        with open("/proc/diskstats") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 14:
+                    continue
+                name = parts[2]
+                if not _DISK_NAME_RE.match(name):
+                    continue
+                try:
+                    rows.append(
+                        {
+                            "name": name,
+                            "reads": int(parts[3]),
+                            "sectors_read": int(parts[5]),
+                            "ms_read": int(parts[6]),
+                            "writes": int(parts[7]),
+                            "sectors_written": int(parts[9]),
+                            "ms_write": int(parts[10]),
+                            "ios_in_progress": int(parts[11]),
+                        }
+                    )
+                except ValueError:
+                    continue
+    except Exception as e:
+        print(f"[{datetime.now():%H:%M:%S}] io collect error: {e}", file=sys.stderr)
+    return rows
+
+
+# ---- 文件系统用量 ----
+
+
+def collect_fs() -> list[dict]:
+    rows = []
+    seen = set()
+    try:
+        with open("/proc/mounts") as f:
+            mounts = [line.split() for line in f if line.strip()]
+    except Exception as e:
+        print(f"[{datetime.now():%H:%M:%S}] fs collect error: {e}", file=sys.stderr)
+        return rows
+
+    for parts in mounts:
+        if len(parts) < 3:
+            continue
+        device, mountpoint, fstype = parts[0], parts[1], parts[2]
+        if not device.startswith("/dev/"):
+            continue
+        if mountpoint in seen:
+            continue
+        seen.add(mountpoint)
+        try:
+            st = os.statvfs(mountpoint)
+        except OSError:
+            continue
+        total_kb = st.f_blocks * st.f_frsize // 1024
+        avail_kb = st.f_bavail * st.f_frsize // 1024
+        used_kb = total_kb - st.f_bfree * st.f_frsize // 1024
+        use_pct = round(used_kb / total_kb * 100, 1) if total_kb else 0.0
+        rows.append(
+            {
+                "device": device,
+                "mountpoint": mountpoint,
+                "fstype": fstype,
+                "size_kb": total_kb,
+                "used_kb": used_kb,
+                "avail_kb": avail_kb,
+                "use_percent": use_pct,
+            }
+        )
+    return rows
+
+
 # ---- 巡读 / 一致性检查 ----
 
 
@@ -512,8 +594,29 @@ def write_csv_once(
 # ---- 主入口 ----
 
 
+def _should_run(now: datetime) -> bool:
+    """按 Web 端配置的采集间隔决定是否执行本次采集。
+
+    cron 仍每分钟触发；data/collection_config.json 中的
+    interval_minutes ∈ {1,5,15,30,60} 决定实际采集频率。
+    """
+    cfg_file = BASE_DIR / "collection_config.json"
+    try:
+        if cfg_file.exists():
+            with open(cfg_file, encoding="utf-8") as f:
+                interval = int(json.load(f).get("interval_minutes", 1))
+            if interval in (5, 15, 30, 60):
+                return now.minute % interval == 0
+    except Exception:
+        pass
+    return True
+
+
 def main():
     now = datetime.now()
+    # --force（Web“立即采集”）绕过间隔门控
+    if "--force" not in sys.argv and not _should_run(now):
+        return
     timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
     date_dir = BASE_DIR / now.strftime("%Y-%m-%d")
     minute = now.minute
@@ -596,6 +699,27 @@ def main():
         "mem_total_kb",
         "mem_avail_kb",
     ]
+    io_fields = [
+        "timestamp",
+        "name",
+        "reads",
+        "sectors_read",
+        "ms_read",
+        "writes",
+        "sectors_written",
+        "ms_write",
+        "ios_in_progress",
+    ]
+    fs_fields = [
+        "timestamp",
+        "device",
+        "mountpoint",
+        "fstype",
+        "size_kb",
+        "used_kb",
+        "avail_kb",
+        "use_percent",
+    ]
 
     # 磁盘（每分钟追加）
     disks = collect_disks()
@@ -626,6 +750,20 @@ def main():
     sys_info = collect_system_info()
     sys_info["timestamp"] = timestamp
     write_csv(date_dir, "system.csv", sys_fields, [sys_info])
+
+    # IO 性能计数（每分钟追加原始计数器）
+    io_rows = collect_io()
+    if io_rows:
+        for r in io_rows:
+            r["timestamp"] = timestamp
+        write_csv(date_dir, "io.csv", io_fields, io_rows)
+
+    # 文件系统用量（每分钟追加）
+    fs_rows = collect_fs()
+    if fs_rows:
+        for r in fs_rows:
+            r["timestamp"] = timestamp
+        write_csv(date_dir, "fs.csv", fs_fields, fs_rows)
 
     # VD（CSV 当天首次采集写入；状态变化告警每分钟检测）
     vds = collect_vds()
