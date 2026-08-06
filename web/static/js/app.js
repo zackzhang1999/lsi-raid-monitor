@@ -372,9 +372,9 @@ function renderStatCards(st) {
       sub: '物理磁盘 / 虚拟磁盘',
     },
     {
-      label: '磁盘温度',
-      value: avgT != null ? `${avgT.toFixed(1)}°C` : '—',
-      sub: maxT != null ? `最高 ${maxT}°C（${esc(maxDisk)}）` : '无温度数据',
+      label: '阵列卡温度',
+      value: c.roc_temp != null ? `${Number(c.roc_temp)}°C` : '—',
+      sub: avgT != null ? `磁盘均温 ${avgT.toFixed(1)}°C · 最高 ${maxT}°C（${esc(maxDisk)}）` : '无磁盘温度数据',
     },
     {
       label: 'BBU 状态',

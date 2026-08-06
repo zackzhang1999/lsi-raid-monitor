@@ -22,6 +22,7 @@ UI 基于 google-design 设计体系（DM Sans / JetBrains Mono，浅色主色 `
 
 ```
 lsi_collectd.py     数据采集器（Web 内置线程每分钟触发，也可用 cron）
+install.sh          一键安装脚本（安装到 /opt 并注册 systemd 服务）
 lsi_alert.py        邮件报警与事件日志模块
 web_server.py       Flask Web 后端（API + 页面）
 user_mgr.py         用户管理（PBKDF2）
@@ -34,7 +35,22 @@ run.sh              生产模式启动脚本
 
 ## 部署
 
-依赖：Python ≥ 3.9、`storcli64`、`smartmontools`、`sendmail`（可选，用于邮件报警）。
+依赖：Python ≥ 3.9、systemd、`storcli64`、`smartmontools`、`sendmail`（可选，用于邮件报警）。
+
+**一键安装（推荐）**：安装到 `/opt/lsi-raid-monitor` 并注册 systemd 服务（重复执行即为升级，保留 `data/` 数据）：
+
+```bash
+sudo bash install.sh
+```
+
+安装完成后：
+
+```bash
+systemctl status lsi-raid-web     # 查看状态
+journalctl -u lsi-raid-web -f     # 查看日志
+```
+
+**手动部署**：
 
 ```bash
 pip3 install -r requirements.txt

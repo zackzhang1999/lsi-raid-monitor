@@ -328,6 +328,7 @@ def build_status() -> dict:
         "health": ctrl_row.get("health", ""),
         "num_disks": _to_int(ctrl_row.get("num_disks"), len(physical_disks)),
         "num_vds": _to_int(ctrl_row.get("num_vds"), len(vd_rows)),
+        "roc_temp": _to_int(ctrl_row.get("roc_temp")),
         "bbu_model": ctrl_row.get("bbu_model", ""),
         "bbu_state": ctrl_row.get("bbu_state", ""),
         "bbu_temperature": _to_int(ctrl_row.get("bbu_temperature")),

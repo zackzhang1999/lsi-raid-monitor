@@ -170,19 +170,25 @@ def _find_temperature(obj, depth: int = 0) -> int | None:
 
 
 def collect_controller() -> dict | None:
-    data = run_storcli(f"{CONTROLLER} show J")
+    data = run_storcli(f"{CONTROLLER} show all J")
     if not is_success(data):
         return None
 
     try:
         resp = data["Controllers"][0].get("Response Data", {})
 
-        model = resp.get("Product Name", "").strip()
-        fw_version = resp.get("FW Version", "").strip()
+        # show all 输出中型号/固件在 Basics/Version 子表
+        model = resp.get("Basics", {}).get("Model", "").strip()
+        fw_version = resp.get("Version", {}).get("Firmware Version", "").strip()
 
         vd_list = resp.get("VD LIST", [])
         num_vds = resp.get("Virtual Drives", len(vd_list))
         num_disks = resp.get("Physical Drives", len(resp.get("PD LIST", [])))
+
+        # 阵列卡（ROC）温度
+        hwcfg = resp.get("HwCfg", {})
+        roc_temp = _to_int(hwcfg.get("ROC temperature(Degree Celsius)", "")) \
+            if hwcfg.get("ROC temperature(Degree Celsius)") not in (None, "") else ""
 
         health = "Optimal"
         vd_states = []
@@ -208,6 +214,7 @@ def collect_controller() -> dict | None:
             "health": health,
             "num_vds": num_vds,
             "num_disks": num_disks,
+            "roc_temp": roc_temp,
             "bbu_model": bbu_model,
             "bbu_state": bbu_state,
             "bbu_temperature": bbu_temp_val if bbu_temp_val is not None else "",
@@ -568,10 +575,32 @@ def collect_consistency_check() -> dict | None:
 # ---- CSV 写入 ----
 
 
+def _migrate_csv_header(filepath: Path, fieldnames: list[str]):
+    """采集字段增加时，把已有 CSV 重写为新表头（旧列数据保留，新列留空）"""
+    try:
+        with open(filepath, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        with open(filepath, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+    except Exception as e:
+        print(f"[{datetime.now():%H:%M:%S}] csv header migrate error: {e}", file=sys.stderr)
+
+
 def write_csv(dir_path: Path, filename: str, fieldnames: list[str], rows: list[dict]):
     dir_path.mkdir(parents=True, exist_ok=True)
     filepath = dir_path / filename
     file_exists = filepath.exists() and filepath.stat().st_size > 0
+    if file_exists:
+        try:
+            with open(filepath, encoding="utf-8") as f:
+                header = f.readline().strip().split(",")
+            if header and header != fieldnames:
+                _migrate_csv_header(filepath, fieldnames)
+        except Exception:
+            pass
     with open(filepath, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         if not file_exists:
@@ -684,6 +713,7 @@ def _run_collection(now: datetime):
         "health",
         "num_vds",
         "num_disks",
+        "roc_temp",
         "bbu_model",
         "bbu_state",
         "bbu_temperature",
