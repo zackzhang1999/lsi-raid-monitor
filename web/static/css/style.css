@@ -577,7 +577,7 @@ table.data .admin-col.col-hidden { display: none; }
   height: 8px;
   border-radius: 50%;
   background: var(--ok);
-  margin-right: 6px;
+  margin-left: 6px;
   vertical-align: middle;
   animation: locate-breathe 1.6s ease-in-out infinite;
 }

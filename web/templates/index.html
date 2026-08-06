@@ -333,6 +333,54 @@
               </table>
             </div>
           </div>
+
+          <!-- NFS 共享 -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">NFS exports</div>
+                <strong>NFS 共享</strong>
+              </div>
+              <button class="btn sm" id="btn-nfs-refresh">刷新</button>
+            </div>
+            <div class="banner hidden" id="nfs-unavailable">未检测到 exportfs，请先安装 NFS 服务（nfs-utils / nfs-kernel-server）</div>
+            <div class="table-wrap">
+              <table class="data" id="nfs-table">
+                <thead><tr>
+                  <th>共享路径</th><th>客户端</th><th>选项</th><th class="admin-col">操作</th>
+                </tr></thead>
+                <tbody><tr><td colspan="4" class="muted">加载中…</td></tr></tbody>
+              </table>
+            </div>
+            <form id="nfs-form" class="form-row hidden" autocomplete="off" style="margin-top:12px">
+              <div class="field">
+                <label for="nfs-path">共享路径</label>
+                <input class="input mono" id="nfs-path" placeholder="/mnt/data" required />
+              </div>
+              <div class="field">
+                <label for="nfs-host">客户端</label>
+                <input class="input mono" id="nfs-host" placeholder="* 或 192.168.1.0/24" value="*" />
+              </div>
+              <div class="field">
+                <label for="nfs-perm">权限</label>
+                <select class="select" id="nfs-perm" style="width:100%">
+                  <option value="rw">读写 (rw)</option>
+                  <option value="ro">只读 (ro)</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>附加选项</label>
+                <span class="persist-row">
+                  <label><input type="checkbox" id="nfs-opt-async" /> async</label>
+                  <label><input type="checkbox" id="nfs-opt-nrs" /> no_root_squash</label>
+                  <label><input type="checkbox" id="nfs-opt-allsquash" /> all_squash</label>
+                </span>
+              </div>
+              <div class="field" style="align-self:end;">
+                <button class="btn primary" id="btn-nfs-add" type="submit">添加共享</button>
+              </div>
+            </form>
+          </div>
         </div>
 
         <!-- ============ 日志中心 ============ -->

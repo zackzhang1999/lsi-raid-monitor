@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import subprocess
@@ -593,6 +594,28 @@ def write_csv_once(
 
 # ---- 主入口 ----
 
+LOCK_FILE = BASE_DIR / ".collectd.lock"
+MARKER_FILE = BASE_DIR / ".last_collect"
+
+
+def _acquire_lock():
+    """非阻塞排他锁：cron 与 Web 内置采集线程同时触发时只允许一个运行"""
+    try:
+        BASE_DIR.mkdir(parents=True, exist_ok=True)
+        fd = open(LOCK_FILE, "w", encoding="utf-8")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except OSError:
+        return None
+
+
+def _already_collected(minute_key: str) -> bool:
+    """同一分钟只采集一次（cron 与内置线程可能都会触发）"""
+    try:
+        return MARKER_FILE.read_text(encoding="utf-8").strip() == minute_key
+    except Exception:
+        return False
+
 
 def _should_run(now: datetime) -> bool:
     """按 Web 端配置的采集间隔决定是否执行本次采集。
@@ -614,9 +637,24 @@ def _should_run(now: datetime) -> bool:
 
 def main():
     now = datetime.now()
-    # --force（Web“立即采集”）绕过间隔门控
-    if "--force" not in sys.argv and not _should_run(now):
+    force = "--force" in sys.argv
+    # --force（Web“立即采集”）绕过间隔门控与分钟去重
+    if not force and not _should_run(now):
         return
+    lock_fd = _acquire_lock()
+    if lock_fd is None:
+        return  # 另一个实例（cron 或内置线程）正在采集
+    try:
+        minute_key = now.strftime("%Y-%m-%d %H:%M")
+        if not force and _already_collected(minute_key):
+            return
+        _run_collection(now)
+        MARKER_FILE.write_text(minute_key, encoding="utf-8")
+    finally:
+        lock_fd.close()
+
+
+def _run_collection(now: datetime):
     timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
     date_dir = BASE_DIR / now.strftime("%Y-%m-%d")
     minute = now.minute

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 
 ALLOWED_FS = ("ext4", "xfs")
@@ -190,3 +191,169 @@ def format_device(device: str, fs_type: str) -> tuple[bool, str]:
     if rc != 0:
         return False, serr.strip() or "mkfs 失败"
     return True, f"已格式化为 {fs_type}"
+
+
+# ================================================
+# NFS 共享管理（/etc/exports）
+# 安全约束:
+#   - 仅允许白名单内的挂载选项
+#   - 系统关键目录不可共享
+#   - 每次修改前备份 /etc/exports，修改后 exportfs -ra 生效
+# ================================================
+
+EXPORTS_FILE = "/etc/exports"
+EXPORTS_BACKUP = "/etc/exports.lsi-monitor.bak"
+
+NFS_ALLOWED_OPTS = (
+    "rw", "ro", "sync", "async",
+    "root_squash", "no_root_squash", "all_squash", "no_all_squash",
+    "subtree_check", "no_subtree_check", "secure", "insecure", "no_wdelay",
+)
+# 这些目录本身或其子路径禁止共享
+NFS_BLOCKED_SUBTREES = (
+    "/etc", "/boot", "/proc", "/sys", "/dev", "/run",
+    "/usr", "/bin", "/sbin", "/lib", "/lib64", "/root",
+)
+NFS_HOST_RE = re.compile(r"^(\*|[A-Za-z0-9_.*:@/-]{1,128})$")
+
+
+def nfs_available() -> bool:
+    return shutil.which("exportfs") is not None
+
+
+def _parse_exports_line(line: str) -> dict | None:
+    tokens = line.split()
+    if not tokens:
+        return None
+    clients = []
+    for tok in tokens[1:]:
+        m = re.fullmatch(r"([^\s(]+)(?:\(([^\s)]*)\))?", tok)
+        if not m:
+            continue
+        clients.append({"host": m.group(1), "options": m.group(2) or ""})
+    return {"path": tokens[0], "clients": clients}
+
+
+def list_exports() -> list[dict]:
+    rows = []
+    try:
+        with open(EXPORTS_FILE, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parsed = _parse_exports_line(line)
+                if parsed:
+                    rows.append(parsed)
+    except FileNotFoundError:
+        pass
+    return rows
+
+
+def _check_export_path(path: str) -> tuple[bool, str]:
+    if not re.fullmatch(r"/[A-Za-z0-9/_.-]+", path or ""):
+        return False, "非法共享路径"
+    norm = os.path.normpath(path)
+    if norm == "/" or norm in NFS_BLOCKED_SUBTREES or any(
+        norm.startswith(b + "/") for b in NFS_BLOCKED_SUBTREES
+    ):
+        return False, f"系统目录 {norm} 不可共享"
+    if not os.path.isdir(norm):
+        return False, f"目录不存在: {norm}"
+    return True, norm
+
+
+def _backup_exports() -> None:
+    try:
+        if os.path.exists(EXPORTS_FILE):
+            shutil.copyfile(EXPORTS_FILE, EXPORTS_BACKUP)
+    except Exception:
+        pass
+
+
+def _exportfs_reload() -> tuple[bool, str]:
+    if not nfs_available():
+        return False, "未安装 exportfs（nfs-utils / nfs-kernel-server）"
+    rc, _, serr = _run(["exportfs", "-ra"], timeout=30)
+    if rc != 0:
+        return False, serr.strip() or "exportfs -ra 失败"
+    return True, ""
+
+
+def add_export(path: str, host: str, options: list[str]) -> tuple[bool, str]:
+    ok, res = _check_export_path(path)
+    if not ok:
+        return False, res
+    path = res
+    host = (host or "").strip() or "*"
+    if not NFS_HOST_RE.fullmatch(host):
+        return False, "非法客户端（支持 *、主机名、IP、CIDR、@网组）"
+    opts = []
+    for o in options or []:
+        if o not in NFS_ALLOWED_OPTS:
+            return False, f"不支持的挂载选项: {o}"
+        if o not in opts:
+            opts.append(o)
+    if "rw" not in opts and "ro" not in opts:
+        opts.insert(0, "rw")
+
+    for row in list_exports():
+        if row["path"] == path and any(c["host"] == host for c in row["clients"]):
+            return False, f"{path} 对 {host} 的共享已存在"
+
+    _backup_exports()
+    line = f"{path} {host}({','.join(opts)})\n"
+    try:
+        with open(EXPORTS_FILE, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception as e:
+        return False, f"写入 {EXPORTS_FILE} 失败: {e}"
+    ok, msg = _exportfs_reload()
+    if not ok:
+        return False, f"已写入 {EXPORTS_FILE}，但重新加载失败: {msg}"
+    return True, f"已共享 {path} 给 {host}"
+
+
+def remove_export(path: str, host: str) -> tuple[bool, str]:
+    try:
+        with open(EXPORTS_FILE, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return False, f"{EXPORTS_FILE} 不存在"
+    except Exception as e:
+        return False, f"读取 {EXPORTS_FILE} 失败: {e}"
+
+    new_lines = []
+    removed = False
+    for raw in lines:
+        stripped = raw.strip()
+        if removed or not stripped or stripped.startswith("#"):
+            new_lines.append(raw)
+            continue
+        parsed = _parse_exports_line(stripped)
+        if not parsed or parsed["path"] != path or not any(
+            c["host"] == host for c in parsed["clients"]
+        ):
+            new_lines.append(raw)
+            continue
+        # 找到目标行：移除指定客户端，若还有其他客户端则保留该行
+        kept = [
+            tok for tok in stripped.split()[1:]
+            if not tok.startswith(host + "(") and tok != host
+        ]
+        if kept:
+            new_lines.append(f"{path} {' '.join(kept)}")
+        removed = True
+
+    if not removed:
+        return False, f"未找到 {path} 对 {host} 的共享"
+    _backup_exports()
+    try:
+        with open(EXPORTS_FILE, "w", encoding="utf-8") as f:
+            f.write("\n".join(new_lines) + "\n")
+    except Exception as e:
+        return False, f"写入 {EXPORTS_FILE} 失败: {e}"
+    ok, msg = _exportfs_reload()
+    if not ok:
+        return False, f"已修改 {EXPORTS_FILE}，但重新加载失败: {msg}"
+    return True, f"已移除 {path} 对 {host} 的共享"

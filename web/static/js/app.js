@@ -96,6 +96,7 @@ const state = {
   ctlLines: 100,
   storageLoaded: false,
   usersLoaded: false,
+  nfsLoaded: false,
   refreshTimer: null,
   realtimeTimer: null,
   raidSel: new Set(), // 勾选用于创建阵列的磁盘，键为 "eid:slot"
@@ -265,7 +266,17 @@ function renderTopbar(st) {
   const h = st.health || 'unknown';
   $('#tb-health').className = 'badge ' + (h === 'unknown' ? '' : h);
   $('#tb-health').textContent = HEALTH_TEXT[h] || h;
-  $('#tb-updated').textContent = st.timestamp ? ('更新于 ' + fmtDateTime(st.timestamp)) : '';
+  const up = $('#tb-updated');
+  if (st.timestamp) {
+    const d = toDate(st.timestamp);
+    const intervalMin = Number($('#sel-interval').value) || 1;
+    const stale = d && (Date.now() - d.getTime()) > (intervalMin * 2 + 1) * 60000;
+    up.textContent = '更新于 ' + fmtDateTime(st.timestamp) + (stale ? '（数据过期，采集中断）' : '');
+    up.style.color = stale ? 'var(--crit)' : '';
+  } else {
+    up.textContent = '';
+    up.style.color = '';
+  }
 }
 
 /* ---------- 综合健康评分 ---------- */
@@ -583,7 +594,7 @@ function renderPhysicalDisks(st) {
     const key = d.eid + ':' + d.slot;
     tr.innerHTML = `
       <td class="admin-col ${hideSel ? 'col-hidden' : ''}"></td>
-      <td class="num">${d.locate ? '<span class="locate-dot" title="定位灯已开启"></span>' : ''}${esc(d.label || ('E' + d.eid + ':S' + d.slot))}</td>
+      <td class="num">${esc(d.label || ('E' + d.eid + ':S' + d.slot))}${d.locate ? '<span class="locate-dot" title="定位灯已开启"></span>' : ''}</td>
       <td>${esc(d.model || '—')}</td>
       <td class="num">${esc(d.sn || '—')}</td>
       <td class="num">${esc(d.fw_rev || '—')}</td>
@@ -1380,6 +1391,7 @@ function switchView(v) {
   });
   if (v === 'storage' && !state.storageLoaded) loadStorage();
   if (v === 'storage' && !state.fsUsage) loadFsUsage();
+  if (v === 'storage' && !state.nfsLoaded) loadNfs();
   if (v === 'users' && !state.usersLoaded) loadUsers();
   $('#sidebar').classList.remove('open');
   $('#sidebar-scrim').classList.remove('show');
@@ -1502,6 +1514,8 @@ function bindUI() {
   // 存储 / 用户
   $('#btn-storage-refresh').addEventListener('click', () => { loadStorage(); loadFsUsage(); });
   $('#btn-fs-refresh').addEventListener('click', loadFsUsage);
+  $('#btn-nfs-refresh').addEventListener('click', loadNfs);
+  $('#nfs-form').addEventListener('submit', (ev) => { ev.preventDefault(); addNfs(); });
   $('#user-form').addEventListener('submit', createUser);
 
   // 页面重新可见时立即刷新实时数据
@@ -1670,6 +1684,77 @@ function fstabAction(action, fs) {
       const r = await api('/api/storage/fstab', { method: 'POST', body });
       if (r && r.ok === false) throw new Error(r.error || '操作失败');
       toast(isAdd ? '已写入 /etc/fstab' : '已从 /etc/fstab 移除', 'ok');
+    });
+}
+
+/* ---------- NFS 共享管理 ---------- */
+async function loadNfs() {
+  const tb = $('#nfs-table tbody');
+  tb.innerHTML = '<tr><td colspan="4" class="muted">加载中…</td></tr>';
+  let data;
+  try { data = await api('/api/nfs/exports'); }
+  catch (e) { tb.innerHTML = `<tr><td colspan="4" class="muted">加载失败：${esc(e.message)}</td></tr>`; return; }
+  state.nfsLoaded = true;
+  $('#nfs-unavailable').classList.toggle('hidden', !!data.available);
+  $('#nfs-form').classList.toggle('hidden', !state.isAdmin || !data.available);
+  $$('#nfs-table .admin-col').forEach(el => el.classList.toggle('col-hidden', !state.isAdmin));
+
+  const rows = [];
+  (data.exports || []).forEach(ex => {
+    (ex.clients || []).forEach(c => rows.push({ path: ex.path, host: c.host, options: c.options }));
+  });
+  if (!rows.length) { tb.innerHTML = '<tr><td colspan="4" class="muted">暂无 NFS 共享</td></tr>'; return; }
+  tb.innerHTML = '';
+  rows.forEach(r => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="num">${esc(r.path)}</td>
+      <td class="num">${esc(r.host)}</td>
+      <td class="num">${esc(r.options || '—')}</td>
+      <td class="ops admin-col ${state.isAdmin ? '' : 'col-hidden'}"></td>`;
+    if (state.isAdmin) {
+      const ops = tr.querySelector('.ops');
+      const del = document.createElement('button');
+      del.className = 'btn sm danger';
+      del.textContent = '删除';
+      del.addEventListener('click', () => removeNfs(r));
+      ops.appendChild(del);
+    }
+    tb.appendChild(tr);
+  });
+}
+
+function removeNfs(r) {
+  confirmModal('删除 NFS 共享',
+    `<p>将从 /etc/exports 移除以下共享并立即生效：</p>
+     <p><strong class="mono">${esc(r.path)}</strong> → <strong class="mono">${esc(r.host)}</strong>（${esc(r.options || '默认')}）</p>
+     <p class="warn-text">正在使用该共享的客户端将立即无法访问，请确认后再执行。</p>`,
+    '确认删除', true, async () => {
+      const resp = await api('/api/nfs/exports/delete', { method: 'POST', body: { path: r.path, host: r.host } });
+      if (resp && resp.ok === false) throw new Error(resp.error || '删除失败');
+      toast('NFS 共享已删除', 'ok');
+      await loadNfs();
+    });
+}
+
+function addNfs() {
+  const path = $('#nfs-path').value.trim();
+  const host = $('#nfs-host').value.trim() || '*';
+  const options = [$('#nfs-perm').value];
+  if ($('#nfs-opt-async').checked) options.push('async');
+  if ($('#nfs-opt-nrs').checked) options.push('no_root_squash');
+  if ($('#nfs-opt-allsquash').checked) options.push('all_squash');
+  if (!path) { toast('请填写共享路径', 'error'); return; }
+  confirmModal('添加 NFS 共享',
+    `<p>将写入 /etc/exports 并立即生效：</p>
+     <p><strong class="mono">${esc(path)}</strong> → <strong class="mono">${esc(host)}</strong>（${esc(options.join(','))}）</p>
+     <p class="warn-text">客户端将能够以${$('#nfs-perm').value === 'rw' ? '读写' : '只读'}方式访问该目录，请确认路径和客户端范围正确。</p>`,
+    '确认添加', false, async () => {
+      const resp = await api('/api/nfs/exports', { method: 'POST', body: { path, host, options } });
+      if (resp && resp.ok === false) throw new Error(resp.error || '添加失败');
+      toast('NFS 共享已添加', 'ok');
+      $('#nfs-path').value = '';
+      await loadNfs();
     });
 }
 

@@ -2,6 +2,7 @@
 data/
 *.log
 *.log.*
+web_server.out
 charts/
 __pycache__/
 *.pyc

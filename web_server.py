@@ -21,6 +21,7 @@ import secrets
 import socket
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 from functools import wraps
@@ -132,6 +133,47 @@ app.config.update(
 )
 
 
+# ---- 内置采集线程 ----
+# 每分钟触发 lsi_collectd.py（脚本内部按采集间隔门控，并用文件锁 + 分钟
+# 标记去重，与外部 cron 并存时不会重复采集），使项目拷到新机器后无需
+# 配置 cron 即可自动采集。设 LSI_DISABLE_COLLECTOR=1 可关闭。
+
+_status_cache: dict = {"ts": 0.0, "data": None}
+
+
+def _collect_once(extra_args: list[str] | None = None) -> None:
+    try:
+        subprocess.run(
+            [sys.executable, str(COLLECTD)] + (extra_args or []),
+            capture_output=True,
+            timeout=110,
+        )
+        _status_cache.update(ts=0.0)
+    except Exception:
+        pass
+
+
+def _collector_loop() -> None:
+    # 首次部署/重启时若当天还没有数据，立即补一次采集，避免展示陈旧数据
+    today_dir = BASE_DIR / datetime.now().strftime("%Y-%m-%d")
+    if not (today_dir / "disks.csv").exists():
+        _collect_once(["--force"])
+    while True:
+        now = datetime.now()
+        time.sleep(61 - now.second - now.microsecond / 1e6)  # 对齐下一分钟
+        _collect_once()
+
+
+def _start_embedded_collector() -> None:
+    if os.environ.get("LSI_DISABLE_COLLECTOR") == "1":
+        return
+    t = threading.Thread(target=_collector_loop, daemon=True, name="lsi-collector")
+    t.start()
+
+
+_start_embedded_collector()
+
+
 @app.after_request
 def security_headers(resp):
     resp.headers["X-Content-Type-Options"] = "nosniff"
@@ -207,9 +249,6 @@ def _to_int(val, default=None):
         return int(val)
     except (ValueError, TypeError):
         return default
-
-
-_status_cache: dict = {"ts": 0.0, "data": None}
 
 
 def build_status() -> dict:
@@ -774,6 +813,54 @@ def api_storage_format():
     lsi_alert.log_event(
         "warning" if ok else "error",
         f"存储格式化 {device} 为 {fs_type}: {msg}（{session.get('username', '')}）",
+    )
+    return (jsonify(ok=True), 200) if ok else (jsonify(ok=False, error=msg), 500)
+
+
+# ---- NFS 共享管理 API ----
+
+
+@app.get("/api/nfs/exports")
+@login_required
+def api_nfs_list():
+    try:
+        return jsonify(
+            available=storage_mgr.nfs_available(),
+            exports=storage_mgr.list_exports(),
+        )
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@app.post("/api/nfs/exports")
+@admin_required
+def api_nfs_add():
+    data = request.get_json(silent=True) or {}
+    path = str(data.get("path", "")).strip()
+    host = str(data.get("host", "")).strip() or "*"
+    options = data.get("options")
+    if not isinstance(options, list):
+        options = []
+    ok, msg = storage_mgr.add_export(path, host, [str(o) for o in options])
+    lsi_alert.log_event(
+        "warning" if ok else "error",
+        f"NFS 添加共享 {path} → {host}: {msg}（{session.get('username', '')}）",
+    )
+    return (jsonify(ok=True), 200) if ok else (jsonify(ok=False, error=msg), 500)
+
+
+@app.post("/api/nfs/exports/delete")
+@admin_required
+def api_nfs_remove():
+    data = request.get_json(silent=True) or {}
+    path = str(data.get("path", "")).strip()
+    host = str(data.get("host", "")).strip()
+    if not path or not host:
+        return jsonify(ok=False, error="参数非法"), 400
+    ok, msg = storage_mgr.remove_export(path, host)
+    lsi_alert.log_event(
+        "warning" if ok else "error",
+        f"NFS 移除共享 {path} → {host}: {msg}（{session.get('username', '')}）",
     )
     return (jsonify(ok=True), 200) if ok else (jsonify(ok=False, error=msg), 500)
 

@@ -21,7 +21,7 @@ UI 基于 google-design 设计体系（DM Sans / JetBrains Mono，浅色主色 `
 ## 目录结构
 
 ```
-lsi_collectd.py     数据采集器（cron 每分钟触发）
+lsi_collectd.py     数据采集器（Web 内置线程每分钟触发，也可用 cron）
 lsi_alert.py        邮件报警与事件日志模块
 web_server.py       Flask Web 后端（API + 页面）
 user_mgr.py         用户管理（PBKDF2）
@@ -40,19 +40,7 @@ run.sh              生产模式启动脚本
 pip3 install -r requirements.txt
 ```
 
-1. **采集器 cron**（每分钟触发，实际频率由 Web 端采集间隔控制）：
-
-   ```cron
-   * * * * * cd /opt/lsi-raid-monitor && /usr/bin/python3 lsi_collectd.py >> /var/log/lsi_collectd.log 2>&1
-   ```
-
-   采集器需要 `sudo storcli64` 与 `sudo smartctl` 权限，建议在 sudoers 中配置免密：
-
-   ```
-   monitor ALL=(root) NOPASSWD: /usr/local/bin/storcli64, /usr/sbin/smartctl
-   ```
-
-2. **Web 服务**：
+1. **Web 服务**（内置采集线程，启动后自动每分钟采集，无需 cron）：
 
    ```bash
    ./run.sh                     # 前台生产模式（waitress）
@@ -61,7 +49,21 @@ pip3 install -r requirements.txt
    sudo systemctl enable --now lsi-raid-web
    ```
 
-3. 浏览器访问 `http://<host>:5200`，在“用户管理”页创建第一个管理员账号后即启用登录认证。
+   采集需要 `sudo storcli64` 与 `sudo smartctl` 权限，建议在 sudoers 中配置免密：
+
+   ```
+   monitor ALL=(root) NOPASSWD: /usr/local/bin/storcli64, /usr/sbin/smartctl
+   ```
+
+   如仍希望使用外部 cron 触发采集（与内置线程并存不会重复采集，采集器内置文件锁与分钟级去重）：
+
+   ```cron
+   * * * * * cd /opt/lsi-raid-monitor && /usr/bin/python3 lsi_collectd.py >> /var/log/lsi_collectd.log 2>&1
+   ```
+
+   > 注意：把项目拷贝到新机器部署时，`data/` 里是旧机器的历史数据。Web 启动时会检测当天无数据则立即补采一次；顶栏"更新于"超过采集间隔 2 倍未刷新会显示"数据过期"警告。
+
+2. 浏览器访问 `http://<host>:5200`，在“用户管理”页创建第一个管理员账号后即启用登录认证。
 
 ## 环境变量
 
@@ -72,6 +74,7 @@ pip3 install -r requirements.txt
 | `STORCLI_PATH` | 项目内 `storcli64` 或 `/usr/local/bin/storcli64` | storcli 路径 |
 | `LSI_CONTROLLER` | `/c0` | 控制器 |
 | `SMARTCTL_PATH` | `/usr/sbin/smartctl` | smartctl 路径 |
+| `LSI_DISABLE_COLLECTOR` | — | 设为 `1` 关闭 Web 内置采集线程（仅用外部 cron 时） |
 | `ALERT_EMAIL_TO` | — | 报警收件人（设置后 Web 中锁定） |
 | `SENDMAIL_PATH` | `/usr/sbin/sendmail` | sendmail 路径（设置后锁定） |
 | `ALERT_TEMP_WARN` / `ALERT_TEMP_CRIT` | `45` / `55` | 温度阈值 °C（设置后锁定） |
