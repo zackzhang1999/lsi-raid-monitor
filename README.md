@@ -19,6 +19,9 @@ UI 基于 google-design 设计体系（DM Sans / JetBrains Mono，浅色主色 `
 - **采集控制**：Web 调整采集间隔（1/5/15/30/60 分钟）、手动立即采集（绕过间隔门控）、CSV 导出
 
 <img width="3840" height="1907" alt="0c8d851e-f343-4a88-aaaf-15b403e50de5" src="https://github.com/user-attachments/assets/1b41ec9a-9876-487a-92e3-f718a5e01647" />
+<img width="3840" height="1907" alt="4e488084-b163-4b02-aa79-d2f062cf1e3f" src="https://github.com/user-attachments/assets/39d8d582-741b-4514-8f89-5e7853c2283e" />
+
+
 
 
 
