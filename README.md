@@ -1,3 +1,9 @@
+本系统依赖lsi的官方管理工具storcli64,请先把storcli64可执行文件放到 /usr/local/bin 目录下
+wget http://amax.xyz:10001/share/select?code=WQZ8R -O "storcli64"
+chmod +x storcli64 
+cp storcli64  /usr/local/bin/
+
+
 # LSI RAID 监控（LSI MegaRAID Monitor）
 
 面向 LSI/Broadcom MegaRAID 控制器的存储监控平台：分钟级采集磁盘温度、状态、错误计数、SMART 关键属性，Web 仪表盘实时展示，异常自动邮件报警。
