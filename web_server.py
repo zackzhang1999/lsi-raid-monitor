@@ -97,6 +97,30 @@ def _set_locate(eid: int, slot: int, on: bool) -> None:
         state.pop(key, None)
     _save_locate_state(state)
 
+
+# ---- 文件系统分区隐藏（按挂载点记录，全局生效）----
+
+FS_HIDDEN_FILE = BASE_DIR / ".fs_hidden.json"
+
+
+def _load_fs_hidden() -> set:
+    try:
+        if FS_HIDDEN_FILE.exists():
+            data = json.loads(FS_HIDDEN_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return {str(m) for m in data}
+    except Exception:
+        pass
+    return set()
+
+
+def _save_fs_hidden(hidden: set) -> None:
+    try:
+        BASE_DIR.mkdir(parents=True, exist_ok=True)
+        FS_HIDDEN_FILE.write_text(json.dumps(sorted(hidden)), encoding="utf-8")
+    except Exception:
+        pass
+
 app = Flask(
     __name__,
     template_folder=str(PROJECT_ROOT / "web" / "templates"),
@@ -251,6 +275,85 @@ def _to_int(val, default=None):
         return default
 
 
+# ---- 磁盘故障预测 ----
+# 基于控制器计数器（PF/SMART 告警/介质错误）、SMART 关键属性
+# （重映射/待定/无法纠正扇区）及其跨天历史趋势的规则化评估。
+# 输出 level: ok / info / warn / crit，并附带判定原因，便于提前更换磁盘。
+
+_PREDICT_LEVELS = {"ok": 0, "info": 1, "warn": 2, "crit": 3}
+
+
+def _smart_history() -> dict:
+    """按 did 汇总各日期目录中的 SMART 快照（每天一份），用于趋势判断"""
+    hist: dict[str, list] = {}
+    for date_dir in _date_dirs():
+        for row in _read_csv(date_dir / "smart.csv"):
+            did = str(row.get("did", ""))
+            if did:
+                hist.setdefault(did, []).append((date_dir.name, row))
+    return hist
+
+
+def _predict_disk(row: dict, hist_rows: list, temp_warn: int, temp_crit: int) -> dict:
+    reasons = []
+    level = "ok"
+
+    def bump(lv: str, text: str):
+        nonlocal level
+        if _PREDICT_LEVELS[lv] > _PREDICT_LEVELS[level]:
+            level = lv
+        reasons.append({"level": lv, "text": text})
+
+    latest = hist_rows[-1][1] if hist_rows else {}
+    realloc = _to_int(latest.get("reallocated"), 0)
+    pending = _to_int(latest.get("pending"), 0)
+    uncor = max(
+        _to_int(latest.get("uncorrectable"), 0),
+        _to_int(latest.get("reported_uncorrectable"), 0),
+    )
+    cmd_timeout = _to_int(latest.get("command_timeout"), 0)
+    poh = _to_int(latest.get("power_on_hours"), 0)
+
+    if _to_int(row.get("predictive_failure"), 0) > 0 or str(row.get("smart_alert")) == "Yes":
+        bump("crit", "控制器已报告预测性故障（PF/SMART 告警），请尽快备份并更换磁盘")
+    if pending > 0:
+        bump("crit", f"存在 {pending} 个待定扇区（Current_Pending_Sector），介质故障前兆")
+    if realloc >= 50:
+        bump("crit", f"重映射扇区已达 {realloc} 个，介质劣化严重")
+    elif realloc > 0:
+        bump("warn", f"存在 {realloc} 个重映射扇区（Reallocated_Sector）")
+    if uncor > 0:
+        bump("warn", f"无法纠正错误累计 {uncor} 个")
+    if cmd_timeout > 0:
+        bump("info", f"命令超时累计 {cmd_timeout} 次")
+    media_error = _to_int(row.get("media_error"), 0)
+    if media_error > 0:
+        bump("warn", f"控制器介质错误计数 {media_error}")
+    temp = _to_int(row.get("temperature"))
+    if temp is not None:
+        if temp >= temp_crit:
+            bump("warn", f"温度 {temp}°C 已达严重阈值，高温加速磁盘老化")
+        elif temp >= temp_warn:
+            bump("info", f"温度 {temp}°C 超过告警阈值")
+    if poh >= 43800:
+        bump("info", f"通电时长 {poh} 小时（超过 5 年），注意老化风险")
+
+    # 趋势：与最早一份快照对比，关键计数器增长即升级
+    if len(hist_rows) >= 2:
+        first_day, first = hist_rows[0]
+        last_day = hist_rows[-1][0]
+        for field, name, lv in (
+            ("pending", "待定扇区", "crit"),
+            ("reallocated", "重映射扇区", "warn"),
+            ("uncorrectable", "无法纠正错误", "warn"),
+        ):
+            delta = _to_int(latest.get(field), 0) - _to_int(first.get(field), 0)
+            if delta > 0:
+                bump(lv, f"{name}在 {first_day} ~ {last_day} 期间新增 {delta} 个，呈增长趋势")
+
+    return {"level": level, "reasons": reasons}
+
+
 def build_status() -> dict:
     now = time.time()
     if _status_cache["data"] is not None and now - _status_cache["ts"] < 15:
@@ -283,6 +386,7 @@ def build_status() -> dict:
     temp_warn = int(alert_cfg.get("temp_warn", 45))
     temp_crit = int(alert_cfg.get("temp_crit", 55))
     locate_state = _load_locate_state()
+    smart_hist = _smart_history()
 
     physical_disks = []
     for (eid, slot), row in sorted(
@@ -318,6 +422,12 @@ def build_status() -> dict:
                 "pending": _to_int(smart.get("pending"), 0),
                 "uncorrectable": _to_int(smart.get("uncorrectable"), 0),
                 "power_on_hours": _to_int(smart.get("power_on_hours"), 0),
+                "prediction": _predict_disk(
+                    row,
+                    smart_hist.get(str(row.get("did", "")), []),
+                    temp_warn,
+                    temp_crit,
+                ),
             }
         )
 
@@ -1060,7 +1170,27 @@ def _fs_usage() -> list[dict]:
 @app.get("/api/storage/usage")
 @login_required
 def api_storage_usage():
-    return jsonify(filesystems=_fs_usage())
+    hidden = _load_fs_hidden()
+    rows = _fs_usage()
+    for r in rows:
+        r["hidden"] = r["mountpoint"] in hidden
+    return jsonify(filesystems=rows)
+
+
+@app.post("/api/storage/visibility")
+@admin_required
+def api_storage_visibility():
+    data = request.get_json(silent=True) or {}
+    mountpoint = str(data.get("mountpoint", "")).strip()
+    if not re.fullmatch(r"/[A-Za-z0-9/_.-]+", mountpoint or ""):
+        return jsonify(ok=False, error="非法挂载点"), 400
+    hidden = _load_fs_hidden()
+    if data.get("hidden"):
+        hidden.add(mountpoint)
+    else:
+        hidden.discard(mountpoint)
+    _save_fs_hidden(hidden)
+    return jsonify(ok=True, hidden=sorted(hidden))
 
 
 @app.get("/api/fs_history")
@@ -1070,6 +1200,7 @@ def api_fs_history():
     if hours not in (6, 24, 72):
         hours = 24
     since = datetime.now() - timedelta(hours=hours)
+    hidden = _load_fs_hidden()
     series: dict[str, list] = {}
     for date_dir in _date_dirs():
         try:
@@ -1078,6 +1209,8 @@ def api_fs_history():
         except ValueError:
             continue
         for row in _read_csv(date_dir / "fs.csv"):
+            if row.get("mountpoint") in hidden:
+                continue
             try:
                 ts = datetime.strptime(row.get("timestamp", ""), "%Y-%m-%d %H:%M:%S")
             except ValueError:

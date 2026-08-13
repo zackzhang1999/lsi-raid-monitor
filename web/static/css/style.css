@@ -524,6 +524,7 @@ table.data tr.row-disabled { opacity: .5; }
 .meter > i.lv-warn { background: var(--warn); }
 .meter > i.lv-crit { background: var(--crit); }
 .meter-val { font-family: var(--font-mono); font-size: 11px; text-align: right; color: var(--muted-foreground); white-space: nowrap; }
+.fs-meter-line { display: flex; align-items: center; gap: calc(var(--spacing) * 2); }
 
 .rt-kv { display: flex; gap: calc(var(--spacing) * 6); margin-top: calc(var(--spacing) * 3); flex-wrap: wrap; }
 .rt-kv .item .v { font-family: var(--font-mono); font-size: 14px; font-weight: 700; }

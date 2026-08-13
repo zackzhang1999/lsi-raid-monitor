@@ -93,6 +93,7 @@ const state = {
   tempCrit: 55,
   vds: [],
   fsUsage: null,
+  showHiddenFs: false,
   ctlLines: 100,
   storageLoaded: false,
   usersLoaded: false,
@@ -118,6 +119,15 @@ function stateBadge(s) {
   const tone = stateTone(s);
   const cls = tone === 'unknown' ? '' : tone;
   return `<span class="badge ${cls}">${esc(s || '—')}</span>`;
+}
+const PREDICT_TEXT = { ok: '正常', info: '关注', warn: '警告', crit: '高危' };
+function predictReasons(p) {
+  const reasons = (p && Array.isArray(p.reasons)) ? p.reasons : [];
+  return reasons.length ? reasons.map(r => r.text) : ['各项关键指标正常，未发现故障前兆'];
+}
+function predictBadge(p) {
+  const lv = (p && p.level) || 'ok';
+  return `<span class="badge ${lv}" title="${esc(predictReasons(p).join('\n'))}">${PREDICT_TEXT[lv] || esc(lv)}</span>`;
 }
 function tempTone(t) {
   if (t == null || isNaN(t)) return '';
@@ -579,7 +589,7 @@ function renderPhysicalDisks(st) {
   Array.from(state.raidSel).forEach(k => { if (!eligibleKeys.has(k)) state.raidSel.delete(k); });
 
   if (!disks.length) {
-    tb.innerHTML = '<tr><td colspan="13" class="muted">无物理磁盘</td></tr>';
+    tb.innerHTML = '<tr><td colspan="14" class="muted">无物理磁盘</td></tr>';
     updateRaidBar();
     return;
   }
@@ -605,6 +615,7 @@ function renderPhysicalDisks(st) {
       <td class="num">${num0(d.reallocated)}/${num0(d.pending)}/${num0(d.uncorrectable)}</td>
       <td class="num">${fmtHours(d.power_on_hours)}</td>
       <td>${alerts.join(' ') || '<span class="tiny">—</span>'}</td>
+      <td>${predictBadge(d.prediction)}</td>
       <td class="ops"></td>`;
     if (state.isAdmin) {
       const selCell = tr.querySelector('.admin-col');
@@ -1050,6 +1061,7 @@ function openDrawer(d) {
     ['设备速率', d.dev_speed],
     ['链路速率', d.link_speed],
     ['SMART 摘要', `重映射 ${num0(d.reallocated)} · 待定 ${num0(d.pending)} · 无法纠正 ${num0(d.uncorrectable)}${String(d.smart_alert) === 'Yes' ? ' · 告警!' : ''}`],
+    ['故障预测', `${PREDICT_TEXT[(d.prediction && d.prediction.level) || 'ok']} — ${predictReasons(d.prediction).join('；')}`],
     ['错误计数', `ME ${num0(d.media_error)} · OE ${num0(d.other_error)} · PF ${num0(d.predictive_failure)}`],
     ['Shield Counter', d.shield_counter != null ? d.shield_counter : '—'],
   ];
@@ -1514,6 +1526,10 @@ function bindUI() {
   // 存储 / 用户
   $('#btn-storage-refresh').addEventListener('click', () => { loadStorage(); loadFsUsage(); });
   $('#btn-fs-refresh').addEventListener('click', loadFsUsage);
+  $('#fs-show-hidden').addEventListener('change', (ev) => {
+    state.showHiddenFs = ev.target.checked;
+    renderFsTable();
+  });
   $('#btn-nfs-refresh').addEventListener('click', loadNfs);
   $('#nfs-form').addEventListener('submit', (ev) => { ev.preventDefault(); addNfs(); });
   $('#user-form').addEventListener('submit', createUser);
@@ -1619,27 +1635,44 @@ async function loadFsUsage() {
 }
 
 function renderFsCard() {
-  const list = state.fsUsage || [];
+  const list = (state.fsUsage || []).filter(fs => !fs.hidden);
   const body = $('#fs-usage-body');
   if (!list.length) { body.innerHTML = '<div class="loading-line">暂无文件系统数据</div>'; return; }
-  body.innerHTML = '<div class="meter-rows">' + list.map(fs => {
+  const wrap = document.createElement('div');
+  wrap.className = 'meter-rows';
+  list.forEach(fs => {
     const pct = Number(fs.use_percent) || 0;
     const label = `${fs.mountpoint || fs.device}`;
     const val = `${pct}% · 可用 ${fmtBytes(fs.avail)}`;
-    return `<div title="${esc(fs.device)} · ${esc(fs.fstype)} · 共 ${fmtBytes(fs.size)}">
+    const line = document.createElement('div');
+    line.className = 'fs-meter-line';
+    line.innerHTML = `<div title="${esc(fs.device)} · ${esc(fs.fstype)} · 共 ${fmtBytes(fs.size)}" style="flex:1;min-width:0">
       ${meterHtml(label, pct, val, fsUseClass(pct))}</div>`;
-  }).join('') + '</div>';
+    if (state.isAdmin) {
+      const btn = document.createElement('button');
+      btn.className = 'btn sm';
+      btn.textContent = '隐藏';
+      btn.title = '在展示中隐藏该分区（可在存储页“显示已隐藏”中恢复）';
+      btn.addEventListener('click', () => fsVisibilityAction(fs));
+      line.appendChild(btn);
+    }
+    wrap.appendChild(line);
+  });
+  body.innerHTML = '';
+  body.appendChild(wrap);
 }
 
 function renderFsTable() {
   const tb = $('#fs-table tbody');
-  const list = state.fsUsage;
-  if (!list) return;
+  const all = state.fsUsage;
+  if (!all) return;
+  const list = all.filter(fs => state.showHiddenFs || !fs.hidden);
   if (!list.length) { tb.innerHTML = '<tr><td colspan="7" class="muted">暂无文件系统数据</td></tr>'; return; }
   tb.innerHTML = '';
   list.forEach(fs => {
     const pct = Number(fs.use_percent) || 0;
     const tr = document.createElement('tr');
+    if (fs.hidden) tr.style.opacity = '0.45';
     tr.innerHTML = `
       <td class="num">${esc(fs.device || '—')}</td>
       <td class="num">${esc(fs.mountpoint || '—')}</td>
@@ -1664,11 +1697,33 @@ function renderFsTable() {
       rm.textContent = '从 fstab 移除';
       rm.addEventListener('click', () => fstabAction('remove', fs));
       ops.appendChild(rm);
+      const vis = document.createElement('button');
+      vis.className = 'btn sm';
+      vis.style.marginLeft = '6px';
+      vis.textContent = fs.hidden ? '恢复显示' : '隐藏';
+      vis.addEventListener('click', () => fsVisibilityAction(fs));
+      ops.appendChild(vis);
     } else {
       ops.innerHTML = '<span class="tiny">—</span>';
     }
     tb.appendChild(tr);
   });
+}
+
+async function fsVisibilityAction(fs) {
+  const hide = !fs.hidden;
+  try {
+    const r = await api('/api/storage/visibility', {
+      method: 'POST',
+      body: { mountpoint: fs.mountpoint, hidden: hide },
+    });
+    if (r && r.ok === false) throw new Error(r.error || '操作失败');
+    toast(hide ? `已隐藏 ${fs.mountpoint}` : `已恢复显示 ${fs.mountpoint}`, 'ok');
+    await loadFsUsage();
+    if (state.chartType === 'fs') loadHistory();
+  } catch (e) {
+    toast(e.message, 'error');
+  }
 }
 
 function fstabAction(action, fs) {

@@ -677,13 +677,13 @@ def main():
         minute_key = now.strftime("%Y-%m-%d %H:%M")
         if not force and _already_collected(minute_key):
             return
-        _run_collection(now)
+        _run_collection(now, force)
         MARKER_FILE.write_text(minute_key, encoding="utf-8")
     finally:
         lock_fd.close()
 
 
-def _run_collection(now: datetime):
+def _run_collection(now: datetime, force: bool = False):
     timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
     date_dir = BASE_DIR / now.strftime("%Y-%m-%d")
     minute = now.minute
@@ -851,8 +851,10 @@ def _run_collection(now: datetime):
                 a["timestamp"] = timestamp
             write_csv_once(date_dir, "attributes.csv", attr_fields, attrs)
 
-    # SMART（每 15 分钟采集一次）
-    if minute % 15 == 0 and disks:
+    # SMART（每 15 分钟采集一次；--force 或当天 smart.csv 缺失时立即补采，
+    # 避免服务重启/跨天后页面上通电时长等 SMART 字段长时间为 0）
+    smart_file_missing = not (date_dir / "smart.csv").exists()
+    if disks and (force or minute % 15 == 0 or smart_file_missing):
         dids = sorted(
             set(
                 int(d["did"]) for d in disks if d.get("did") not in (None, "")

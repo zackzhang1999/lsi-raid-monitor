@@ -276,9 +276,9 @@
                   <th class="admin-col" title="仅未配置（UGood/JBOD）磁盘可勾选">选择</th>
                   <th>槽位</th><th>型号</th><th>序列号</th><th>固件</th><th>磁盘组</th>
                   <th>状态</th><th>温度</th><th>ME/OE/PF</th><th>R/P/U</th><th>通电时长</th>
-                  <th>告警</th><th>操作</th>
+                  <th>告警</th><th title="基于 SMART 与控制器计数器的规则化故障预测">预测</th><th>操作</th>
                 </tr></thead>
-                <tbody><tr><td colspan="13" class="muted">加载中…</td></tr></tbody>
+                <tbody><tr><td colspan="14" class="muted">加载中…</td></tr></tbody>
               </table>
             </div>
           </div>
@@ -304,7 +304,12 @@
                 <div class="eyebrow">Filesystem usage</div>
                 <strong>文件系统使用率</strong>
               </div>
-              <button class="btn sm" id="btn-fs-refresh">刷新</button>
+              <div style="display:flex;align-items:center;gap:10px">
+                <label class="tiny" style="display:flex;align-items:center;gap:4px;cursor:pointer">
+                  <input type="checkbox" id="fs-show-hidden"> 显示已隐藏
+                </label>
+                <button class="btn sm" id="btn-fs-refresh">刷新</button>
+              </div>
             </div>
             <div class="table-wrap">
               <table class="data" id="fs-table">
