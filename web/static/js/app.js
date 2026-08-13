@@ -92,6 +92,7 @@ const state = {
   tempWarn: 45,
   tempCrit: 55,
   vds: [],
+  vdExpanded: new Set(), // 已展开成员磁盘的 VD（键为 vd 编号字符串）
   fsUsage: null,
   showHiddenFs: false,
   ctlLines: 100,
@@ -255,6 +256,7 @@ async function loadAll() {
   await Promise.allSettled([
     loadStatus(), loadAlertConfig(), loadCollectionConfig(), loadHistory(),
     loadEvents(), loadRealtime(), loadFsUsage(), loadVdDetail(), loadCtlEvents(),
+    loadAlarm(), loadJbod(),
   ]);
 }
 
@@ -360,6 +362,67 @@ function renderHealth(st) {
       <span class="bar"><i style="width:${s.score}%;background:${scoreColor(s.score)}"></i></span>
       <span class="pct">${s.score}</span>
     </div>`).join('');
+}
+
+/* ---------- 阵列卡报警（蜂鸣器）开关 ---------- */
+const ALARM_STATE_MAP = [
+  ['SILENC', ['临时关闭', 'warn']],
+  ['OFF', ['永久关闭', 'crit']],
+  ['ON', ['打开', 'ok']],
+];
+
+async function loadAlarm() {
+  const badge = $('#alarm-badge');
+  let data;
+  try { data = await api('/api/controller_alarm'); }
+  catch (e) { badge.textContent = '—'; return; }
+  const raw = String(data.alarm || '').toUpperCase();
+  const hit = ALARM_STATE_MAP.find(([k]) => raw.includes(k));
+  badge.className = 'badge ' + (hit ? hit[1][1] : '');
+  badge.textContent = hit ? hit[1][0] : (raw || '未知');
+  $('#alarm-actions').classList.toggle('hidden', !state.isAdmin);
+}
+
+function alarmAction(mode) {
+  const desc = {
+    on: '打开阵列卡蜂鸣器报警，出现异常事件时会鸣叫。',
+    silence: '临时关闭当前报警鸣叫；出现新的异常事件时会再次鸣叫（重启后也会恢复）。',
+    off: '永久关闭阵列卡蜂鸣器报警，出现异常事件也不再鸣叫，直到重新打开。',
+  }[mode];
+  const label = { on: '打开', silence: '临时关闭', off: '永久关闭' }[mode];
+  confirmModal(`阵列卡报警${label}`, `<p>${esc(desc)}</p>`, label, mode === 'off', async () => {
+    const r = await api('/api/controller_alarm', { method: 'POST', body: { mode } });
+    if (r && r.ok === false) throw new Error(r.error || '操作失败');
+    toast(`阵列卡报警已${label}`, 'ok');
+    await loadAlarm();
+  });
+}
+
+/* ---------- JBOD 模式开关 ---------- */
+async function loadJbod() {
+  const badge = $('#jbod-badge');
+  let data;
+  try { data = await api('/api/controller_jbod'); }
+  catch (e) { badge.textContent = '—'; return; }
+  const raw = String(data.jbod || '').toUpperCase();
+  const on = raw === 'ON';
+  badge.className = 'badge ' + (raw ? (on ? 'ok' : '') : '');
+  badge.textContent = raw ? (on ? '已打开' : '已关闭') : '未知';
+  $('#jbod-actions').classList.toggle('hidden', !state.isAdmin);
+}
+
+function jbodAction(mode) {
+  const on = mode === 'on';
+  const desc = on
+    ? '打开 JBOD 模式后，新插入的未配置磁盘将直接作为 JBOD 盘暴露给操作系统，可被系统直接识别使用。'
+    : '关闭 JBOD 模式后，新插入的未配置磁盘将保持 UGood 状态，不再自动暴露给操作系统，需配置 RAID 后才能使用。已在线的 JBOD 盘不受此开关影响。';
+  const label = on ? '打开' : '关闭';
+  confirmModal(`JBOD 模式${label}`, `<p>${esc(desc)}</p>`, label, !on, async () => {
+    const r = await api('/api/controller_jbod', { method: 'POST', body: { mode } });
+    if (r && r.ok === false) throw new Error(r.error || '操作失败');
+    toast(`JBOD 模式已${label}`, 'ok');
+    await loadJbod();
+  });
 }
 
 /* ---------- 四个状态卡 ---------- */
@@ -513,9 +576,14 @@ function renderVirtualDisks() {
   if (!vds.length) { tb.innerHTML = '<tr><td colspan="9" class="muted">无虚拟磁盘</td></tr>'; return; }
   tb.innerHTML = '';
   vds.forEach(v => {
+    const key = String(v.vd);
+    const expanded = state.vdExpanded.has(key);
+    const disks = Array.isArray(v.disks) ? v.disks : [];
     const tr = document.createElement('tr');
+    tr.className = 'vd-row';
+    tr.title = expanded ? '点击收起成员磁盘' : '点击展开成员磁盘';
     tr.innerHTML = `
-      <td class="num">${esc(v.dg_vd || '—')}</td>
+      <td class="num"><span class="vd-caret">${expanded ? '▾' : '▸'}</span>${esc(v.dg_vd || '—')} <span class="tiny">(${disks.length} 盘)</span></td>
       <td>${esc(v.name || '—')}</td>
       <td>${esc(v.type || '—')}</td>
       <td class="num">${esc(v.size || '—')}</td>
@@ -524,8 +592,14 @@ function renderVirtualDisks() {
       <td class="num">${esc(v.write_cache || '—')}</td>
       <td class="num">${esc(v.current_operation || 'None')}</td>
       <td class="ops admin-col ${hideOps ? 'col-hidden' : ''}"></td>`;
+    tr.addEventListener('click', () => {
+      if (state.vdExpanded.has(key)) state.vdExpanded.delete(key);
+      else state.vdExpanded.add(key);
+      renderVirtualDisks();
+    });
     if (state.isAdmin) {
       const ops = tr.querySelector('.ops');
+      ops.addEventListener('click', ev => ev.stopPropagation());
       const sel = document.createElement('select');
       sel.className = 'select';
       sel.innerHTML = `
@@ -542,6 +616,26 @@ function renderVirtualDisks() {
       ops.appendChild(sel);
     }
     tb.appendChild(tr);
+    if (expanded) {
+      const dr = document.createElement('tr');
+      dr.className = 'vd-disks-row';
+      const rowsHtml = disks.map(p => `
+        <tr>
+          <td class="num">${esc(p.slot || '—')}</td>
+          <td class="num">${esc(p.did !== '' && p.did != null ? String(p.did) : '—')}</td>
+          <td>${stateBadge(p.state)}</td>
+          <td class="num">${esc(p.size || '—')}</td>
+          <td class="num">${esc(p.intf || '—')} / ${esc(p.med || '—')}</td>
+          <td>${esc(p.model || '—')}</td>
+        </tr>`).join('');
+      dr.innerHTML = `<td colspan="9"><div class="vd-sub">
+        <div class="tiny" style="margin-bottom:4px">成员磁盘（${disks.length}）</div>
+        <table class="data">
+          <thead><tr><th>槽位</th><th>DID</th><th>状态</th><th>容量</th><th>接口/介质</th><th>型号</th></tr></thead>
+          <tbody>${rowsHtml || '<tr><td colspan="6" class="muted">无成员磁盘数据</td></tr>'}</tbody>
+        </table></div></td>`;
+      tb.appendChild(dr);
+    }
   });
 }
 
@@ -966,6 +1060,12 @@ async function loadAlertConfig() {
     const hint = input.closest('.field').querySelector('[data-lock-hint]');
     if (hint) hint.classList.toggle('hidden', !locked);
   });
+
+  const policies = (cfg.config && cfg.config.policies) || {};
+  document.querySelectorAll('#alert-policies [data-policy]').forEach(cb => {
+    cb.checked = policies[cb.dataset.policy] !== false;
+    cb.disabled = !state.isAdmin;
+  });
 }
 
 async function saveAlertConfig(ev) {
@@ -978,6 +1078,10 @@ async function saveAlertConfig(ev) {
       sendmail_path: $('#alert-sendmail').value.trim(),
       temp_warn: Number($('#alert-warn').value),
       temp_crit: Number($('#alert-crit').value),
+      policies: Object.fromEntries(
+        Array.from(document.querySelectorAll('#alert-policies [data-policy]'))
+          .map(cb => [cb.dataset.policy, cb.checked])
+      ),
     };
     await api('/api/alert_config', { method: 'POST', body });
     state.tempWarn = body.temp_warn;
@@ -1187,7 +1291,7 @@ function appendDeviceRows(tb, dev, depth) {
       ${depth > 0 ? '└' : ''} ${esc(dev.name || dev.path || '—')}
       ${dev.raid_member ? '<span class="raid-tag">RAID 成员</span>' : ''}
     </span></td>
-    <td class="num">${esc(dev.size || '—')}</td>
+    <td class="num">${fmtGB(dev.size)}</td>
     <td class="num">${esc(fsText || '—')}</td>
     <td class="num">${esc((dev.mountpoints || []).join(', ') || '—')}</td>
     <td class="ops"></td>`;
@@ -1269,6 +1373,7 @@ function umountDevice(dev) {
 }
 
 function formatDevice(dev) {
+  const name = dev.name || '';
   const wrap = document.createElement('div');
   wrap.innerHTML = `
     <p>将设备 <strong class="mono">${esc(dev.path || dev.name)}</strong> 格式化为：</p>
@@ -1277,7 +1382,9 @@ function formatDevice(dev) {
         <option value="ext4">ext4</option>
         <option value="xfs">xfs</option>
       </select></div>
-    <p class="warn-text">警告：格式化将清除该设备上的全部数据，且不可恢复。请确认设备选择无误。</p>`;
+    <p class="warn-text">警告：格式化将清除该设备上的全部数据，且不可恢复。请确认设备选择无误。</p>
+    <div class="field"><label class="confirm-input-note">请输入设备名 <strong class="mono">${esc(name)}</strong> 以确认操作</label>
+      <input class="input mono" id="fmt-confirm" placeholder="${esc(name)}" autocomplete="off" /></div>`;
   showModal({
     title: '格式化设备', body: wrap,
     actions: [
@@ -1285,6 +1392,8 @@ function formatDevice(dev) {
       {
         label: '确认格式化', cls: 'danger',
         handler: async (btn) => {
+          const confirmName = wrap.querySelector('#fmt-confirm').value.trim();
+          if (confirmName !== name) { toast('请输入正确的设备名以确认', 'error'); return; }
           const fs = wrap.querySelector('#fmt-fs').value;
           btnLoading(btn, true);
           try {
@@ -1526,6 +1635,10 @@ function bindUI() {
   // 存储 / 用户
   $('#btn-storage-refresh').addEventListener('click', () => { loadStorage(); loadFsUsage(); });
   $('#btn-fs-refresh').addEventListener('click', loadFsUsage);
+  $$('#alarm-actions [data-alarm]').forEach(b =>
+    b.addEventListener('click', () => alarmAction(b.dataset.alarm)));
+  $$('#jbod-actions [data-jbod]').forEach(b =>
+    b.addEventListener('click', () => jbodAction(b.dataset.jbod)));
   $('#fs-show-hidden').addEventListener('change', (ev) => {
     state.showHiddenFs = ev.target.checked;
     renderFsTable();
@@ -1567,6 +1680,12 @@ function fmtBytes(n) {
   if (v >= 1048576) return (v / 1048576).toFixed(1) + 'M';
   if (v >= 1024) return (v / 1024).toFixed(1) + 'K';
   return v + 'B';
+}
+// 块设备容量统一按 GB（10^9）展示
+function fmtGB(b) {
+  const n = Number(b);
+  if (b == null || isNaN(n) || n <= 0) return '—';
+  return (n / 1e9).toFixed(1) + ' GB';
 }
 function meterHtml(label, pct, valText, cls) {
   const p = Math.max(0, Math.min(100, pct == null || isNaN(pct) ? 0 : pct));
@@ -1667,10 +1786,11 @@ function renderFsTable() {
   const all = state.fsUsage;
   if (!all) return;
   const list = all.filter(fs => state.showHiddenFs || !fs.hidden);
-  if (!list.length) { tb.innerHTML = '<tr><td colspan="7" class="muted">暂无文件系统数据</td></tr>'; return; }
+  if (!list.length) { tb.innerHTML = '<tr><td colspan="8" class="muted">暂无文件系统数据</td></tr>'; return; }
   tb.innerHTML = '';
   list.forEach(fs => {
     const pct = Number(fs.use_percent) || 0;
+    const ipct = Number(fs.inode_use_percent) || 0;
     const tr = document.createElement('tr');
     if (fs.hidden) tr.style.opacity = '0.45';
     tr.innerHTML = `
@@ -1682,6 +1802,10 @@ function renderFsTable() {
       <td><span class="use-cell">
         <span class="meter"><i class="${fsUseClass(pct)}" style="width:${Math.min(100, pct)}%"></i></span>
         <span class="meter-val">${pct}%</span>
+      </span></td>
+      <td><span class="use-cell" title="Inode 已用 ${num0(fs.inode_used)} / 共 ${num0(fs.inode_total)}">
+        <span class="meter"><i class="${fsUseClass(ipct)}" style="width:${Math.min(100, ipct)}%"></i></span>
+        <span class="meter-val">${ipct}%</span>
       </span></td>
       <td class="ops"></td>`;
     const ops = tr.querySelector('.ops');
@@ -1728,18 +1852,43 @@ async function fsVisibilityAction(fs) {
 
 function fstabAction(action, fs) {
   const isAdd = action === 'add';
-  const body = isAdd
-    ? { action: 'add', device: fs.device, mountpoint: fs.mountpoint, fstype: fs.fstype }
-    : { action: 'remove', mountpoint: fs.mountpoint };
-  const desc = isAdd
-    ? `将 ${fs.device}（${fs.fstype}）的挂载点 ${fs.mountpoint} 写入 /etc/fstab，系统重启后将自动挂载。`
-    : `从 /etc/fstab 移除挂载点 ${fs.mountpoint} 的条目，重启后将不再自动挂载（不影响当前已挂载状态）。`;
-  confirmModal(isAdd ? '写入 fstab' : '从 fstab 移除', `<p>${esc(desc)}</p>`,
-    isAdd ? '写入' : '移除', !isAdd, async () => {
-      const r = await api('/api/storage/fstab', { method: 'POST', body });
-      if (r && r.ok === false) throw new Error(r.error || '操作失败');
-      toast(isAdd ? '已写入 /etc/fstab' : '已从 /etc/fstab 移除', 'ok');
-    });
+  if (isAdd) {
+    confirmModal('写入 fstab',
+      `<p>将 ${esc(fs.device)}（${esc(fs.fstype)}）的挂载点 ${esc(fs.mountpoint)} 写入 /etc/fstab，系统重启后将自动挂载。</p>`,
+      '写入', false, async () => {
+        const r = await api('/api/storage/fstab', { method: 'POST', body: { action: 'add', device: fs.device, mountpoint: fs.mountpoint, fstype: fs.fstype } });
+        if (r && r.ok === false) throw new Error(r.error || '操作失败');
+        toast('已写入 /etc/fstab', 'ok');
+      });
+    return;
+  }
+  // 移除：输入挂载点文字二次确认
+  const wrap = document.createElement('div');
+  wrap.innerHTML = `
+    <p>从 /etc/fstab 移除挂载点 <strong class="mono">${esc(fs.mountpoint)}</strong> 的条目，重启后将不再自动挂载（不影响当前已挂载状态）。</p>
+    <div class="field"><label class="confirm-input-note">请输入挂载点 <strong class="mono">${esc(fs.mountpoint)}</strong> 以确认操作</label>
+      <input class="input mono" id="fstab-confirm" placeholder="${esc(fs.mountpoint)}" autocomplete="off" /></div>`;
+  showModal({
+    title: '从 fstab 移除', body: wrap,
+    actions: [
+      { label: '取消', handler: closeModal },
+      {
+        label: '移除', cls: 'danger',
+        handler: async (btn) => {
+          const v = wrap.querySelector('#fstab-confirm').value.trim();
+          if (v !== fs.mountpoint) { toast('请输入正确的挂载点以确认', 'error'); return; }
+          btnLoading(btn, true);
+          try {
+            const r = await api('/api/storage/fstab', { method: 'POST', body: { action: 'remove', mountpoint: fs.mountpoint } });
+            if (r && r.ok === false) throw new Error(r.error || '操作失败');
+            toast('已从 /etc/fstab 移除', 'ok');
+            closeModal();
+          } catch (e) { toast(e.message, 'error'); }
+          finally { btnLoading(btn, false); }
+        }
+      }
+    ]
+  });
 }
 
 /* ---------- NFS 共享管理 ---------- */

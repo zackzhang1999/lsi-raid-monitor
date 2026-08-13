@@ -670,6 +670,7 @@ def api_alert_config_get():
             "sendmail_path": cfg.get("sendmail_path", ""),
             "temp_warn": int(cfg.get("temp_warn", 45)),
             "temp_crit": int(cfg.get("temp_crit", 55)),
+            "policies": lsi_alert.effective_policies(cfg),
         },
     )
 
@@ -689,6 +690,13 @@ def api_alert_config_save():
             if val is None or not (0 <= val <= 100):
                 return jsonify(ok=False, error=f"{key} 必须是 0-100 的整数"), 400
             cfg[key] = val
+    if "policies" in data:
+        pol_in = data["policies"]
+        if not isinstance(pol_in, dict):
+            return jsonify(ok=False, error="policies 必须是对象"), 400
+        cfg["policies"] = {
+            k: bool(pol_in.get(k, True)) for k in lsi_alert.DEFAULT_POLICIES
+        }
     merged = lsi_alert.load_config()
     merged.update(cfg)
     if int(merged.get("temp_warn", 45)) > int(merged.get("temp_crit", 55)):
@@ -1162,6 +1170,13 @@ def _fs_usage() -> list[dict]:
                 "used": used,
                 "avail": avail,
                 "use_percent": round(used / total * 100, 1) if total else 0.0,
+                "inode_total": st.f_files,
+                "inode_used": st.f_files - st.f_ffree,
+                "inode_use_percent": round(
+                    (st.f_files - st.f_ffree) / st.f_files * 100, 1
+                )
+                if st.f_files
+                else 0.0,
             }
         )
     return rows
@@ -1388,6 +1403,7 @@ def api_vd_detail():
             summary = val[0] if isinstance(val[0], dict) else {}
             vd_num = int(m.group(1))
             props = resp.get(f"VD{vd_num} Properties") or {}
+            pds = resp.get(f"PDs for VD {vd_num}") or []
             vds.append(
                 {
                     "vd": vd_num,
@@ -1401,6 +1417,19 @@ def api_vd_detail():
                     "current_operation": props.get("Active Operations", "None"),
                     "os_device": props.get("OS Drive Name", ""),
                     "write_cache": props.get("Write Cache(initial setting)", ""),
+                    "disks": [
+                        {
+                            "slot": p.get("EID:Slt", ""),
+                            "did": p.get("DID", ""),
+                            "state": p.get("State", ""),
+                            "size": p.get("Size", ""),
+                            "intf": p.get("Intf", ""),
+                            "med": p.get("Med", ""),
+                            "model": p.get("Model", ""),
+                        }
+                        for p in pds
+                        if isinstance(p, dict)
+                    ],
                 }
             )
         return jsonify(vds=sorted(vds, key=lambda v: v["vd"]))
@@ -1447,6 +1476,97 @@ def _run_storcli_text(args: str, timeout: int = 60) -> tuple[bool, str]:
         return False, "storcli 执行超时"
     except Exception as e:
         return False, str(e)
+
+
+# ---- 阵列卡报警（蜂鸣器）开关 ----
+
+_alarm_cache: dict = {"ts": 0.0, "state": None}
+
+ALARM_MODES = {"on": "打开", "silence": "临时关闭", "off": "永久关闭"}
+
+
+def _read_ctrl_prop(prop: str) -> str | None:
+    """读取控制器布尔属性（alarm / jbod 等），返回 ON/OFF 等大写值"""
+    cmd = f"sudo {STORCLI} {CONTROLLER} show {prop} J"
+    try:
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+        output = proc.stdout.strip()
+        json_start = output.find("{")
+        if json_start == -1:
+            return None
+        data = json.loads(output[json_start:])
+        props = data["Controllers"][0]["Response Data"]["Controller Properties"]
+        for p in props:
+            if str(p.get("Ctrl_Prop", "")).strip().lower() == prop.lower():
+                return str(p.get("Value", "")).strip().upper()
+    except Exception:
+        pass
+    return None
+
+
+@app.get("/api/controller_alarm")
+@login_required
+def api_controller_alarm_get():
+    now = time.time()
+    if _alarm_cache["state"] is not None and now - _alarm_cache["ts"] < 60:
+        state = _alarm_cache["state"]
+    else:
+        state = _read_ctrl_prop("alarm")
+        _alarm_cache.update(ts=now, state=state)
+    return jsonify(ok=state is not None, alarm=state)
+
+
+@app.post("/api/controller_alarm")
+@admin_required
+def api_controller_alarm_set():
+    data = request.get_json(silent=True) or {}
+    mode = str(data.get("mode", "")).strip().lower()
+    if mode not in ALARM_MODES:
+        return jsonify(ok=False, error="非法模式"), 400
+    ok, msg = _run_storcli_text(f"{CONTROLLER} set alarm={mode}", timeout=30)
+    if ok and "Status = Success" in msg:
+        lsi_alert.log_event(
+            "warning", f"阵列卡报警已{ALARM_MODES[mode]}（{session.get('username', '')}）"
+        )
+        _alarm_cache.update(ts=0.0, state=None)
+        return jsonify(ok=True)
+    return jsonify(ok=False, error="storcli 执行失败" if ok else msg), 500
+
+
+# ---- JBOD 模式开关 ----
+
+_jbod_cache: dict = {"ts": 0.0, "state": None}
+
+JBOD_MODES = {"on": "打开", "off": "关闭"}
+
+
+@app.get("/api/controller_jbod")
+@login_required
+def api_controller_jbod_get():
+    now = time.time()
+    if _jbod_cache["state"] is not None and now - _jbod_cache["ts"] < 60:
+        state = _jbod_cache["state"]
+    else:
+        state = _read_ctrl_prop("jbod")
+        _jbod_cache.update(ts=now, state=state)
+    return jsonify(ok=state is not None, jbod=state)
+
+
+@app.post("/api/controller_jbod")
+@admin_required
+def api_controller_jbod_set():
+    data = request.get_json(silent=True) or {}
+    mode = str(data.get("mode", "")).strip().lower()
+    if mode not in JBOD_MODES:
+        return jsonify(ok=False, error="非法模式"), 400
+    ok, msg = _run_storcli_text(f"{CONTROLLER} set jbod={mode}", timeout=30)
+    if ok and "Status = Success" in msg:
+        lsi_alert.log_event(
+            "warning", f"JBOD 模式已{JBOD_MODES[mode]}（{session.get('username', '')}）"
+        )
+        _jbod_cache.update(ts=0.0, state=None)
+        return jsonify(ok=True)
+    return jsonify(ok=False, error="storcli 执行失败" if ok else msg), 500
 
 
 # ---- 创建磁盘阵列 ----

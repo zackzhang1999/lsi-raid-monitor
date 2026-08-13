@@ -120,6 +120,23 @@
                 </div>
                 <div class="sub-scores" id="sub-scores"></div>
               </div>
+              <div class="alarm-row">
+                <span class="tiny">阵列卡报警</span>
+                <span class="badge" id="alarm-badge">—</span>
+                <span class="alarm-actions" id="alarm-actions">
+                  <button class="btn sm" data-alarm="on">打开</button>
+                  <button class="btn sm" data-alarm="silence">临时关闭</button>
+                  <button class="btn sm danger" data-alarm="off">永久关闭</button>
+                </span>
+              </div>
+              <div class="alarm-row">
+                <span class="tiny">JBOD 模式</span>
+                <span class="badge" id="jbod-badge">—</span>
+                <span class="alarm-actions" id="jbod-actions">
+                  <button class="btn sm" data-jbod="on">打开</button>
+                  <button class="btn sm danger" data-jbod="off">关闭</button>
+                </span>
+              </div>
             </div>
 
             <!-- 邮件报警配置 -->
@@ -155,6 +172,20 @@
                   <input class="input mono" id="alert-crit" type="number" min="1" max="100" />
                   <span class="hint hidden" data-lock-hint>已由环境变量锁定</span>
                 </div>
+                <div class="field" style="grid-column: 1 / -1;">
+                  <label>报警策略（勾选需要发送邮件的情况）</label>
+                  <div class="policy-grid" id="alert-policies">
+                    <label class="policy-item"><input type="checkbox" data-policy="temp_warn"> 磁盘温度超警告阈值</label>
+                    <label class="policy-item"><input type="checkbox" data-policy="temp_crit"> 磁盘温度超临界阈值</label>
+                    <label class="policy-item"><input type="checkbox" data-policy="smart_alert"> 磁盘 SMART 告警</label>
+                    <label class="policy-item"><input type="checkbox" data-policy="predictive_failure"> 预测性故障（PF）计数</label>
+                    <label class="policy-item"><input type="checkbox" data-policy="ctrl_health"> 控制器健康异常</label>
+                    <label class="policy-item"><input type="checkbox" data-policy="bbu_state"> BBU/缓存单元异常</label>
+                    <label class="policy-item"><input type="checkbox" data-policy="disk_state_change"> 磁盘状态变化</label>
+                    <label class="policy-item"><input type="checkbox" data-policy="vd_state_change"> 虚拟磁盘状态变化</label>
+                    <label class="policy-item"><input type="checkbox" data-policy="smart_attr_growth"> SMART 关键属性增长</label>
+                  </div>
+                </div>
                 <div class="hero-actions" style="grid-column: 1 / -1; display:flex; gap: 8px;">
                   <button class="btn primary" id="btn-alert-save" type="submit">保存配置</button>
                   <button class="btn" id="btn-alert-test" type="button">发送测试报警</button>
@@ -163,8 +194,8 @@
             </div>
           </div>
 
-          <!-- 系统资源（实时） / 文件系统 -->
-          <div class="grid grid-2">
+          <!-- 系统资源（实时） / 文件系统（与上方健康评分/报警配置同栅格对齐） -->
+          <div class="grid grid-hero">
             <div class="card">
               <div class="card-head">
                 <div>
@@ -314,9 +345,9 @@
             <div class="table-wrap">
               <table class="data" id="fs-table">
                 <thead><tr>
-                  <th>设备</th><th>挂载点</th><th>类型</th><th>容量</th><th>已用</th><th>使用率</th><th>操作</th>
+                  <th>设备</th><th>挂载点</th><th>类型</th><th>容量</th><th>已用</th><th>使用率</th><th>Inode 使用率</th><th>操作</th>
                 </tr></thead>
-                <tbody><tr><td colspan="7" class="muted">加载中…</td></tr></tbody>
+                <tbody><tr><td colspan="8" class="muted">加载中…</td></tr></tbody>
               </table>
             </div>
           </div>

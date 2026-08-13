@@ -32,6 +32,20 @@ DEFAULT_CONFIG = {
     "sendmail_path": "/usr/sbin/sendmail",
     "temp_warn": 45,
     "temp_crit": 55,
+    "policies": {},
+}
+
+# 报警策略开关：哪些情况发送邮件（Web 端可配置，默认全开）
+DEFAULT_POLICIES = {
+    "temp_warn": True,          # 磁盘温度超过警告阈值
+    "temp_crit": True,          # 磁盘温度超过临界阈值
+    "smart_alert": True,        # 磁盘 SMART 告警
+    "predictive_failure": True,  # 预测性故障（PF）计数 > 0
+    "ctrl_health": True,        # 控制器健康异常
+    "bbu_state": True,          # BBU/缓存单元异常
+    "disk_state_change": True,  # 磁盘状态变化
+    "vd_state_change": True,    # 虚拟磁盘状态变化
+    "smart_attr_growth": True,  # SMART 关键属性增长
 }
 
 # 环境变量 -> 配置字段
@@ -94,6 +108,22 @@ def is_locked(key: str) -> bool:
     return bool(env and os.environ.get(env))
 
 
+def effective_policies(cfg: dict | None = None) -> dict:
+    """合并默认策略与已保存配置，未知键忽略、缺失键默认开启"""
+    cfg = cfg or load_config()
+    pol = dict(DEFAULT_POLICIES)
+    saved = cfg.get("policies")
+    if isinstance(saved, dict):
+        for k in DEFAULT_POLICIES:
+            if k in saved:
+                pol[k] = bool(saved[k])
+    return pol
+
+
+def policy_enabled(cfg: dict, name: str) -> bool:
+    return effective_policies(cfg).get(name, True)
+
+
 def locked_fields() -> dict:
     return {key: is_locked(key) for key in DEFAULT_CONFIG}
 
@@ -141,13 +171,17 @@ def send_mail(subject: str, body: str, cfg: dict | None = None) -> tuple[bool, s
         return False, f"sendmail 不可用: {sendmail}"
 
     host = socket.gethostname()
-    msg = (
-        f"From: lsi-raid-monitor@{host}\n"
-        f"To: {', '.join(recipients)}\n"
-        f"Subject: [LSI RAID] {subject}\n"
-        f"Content-Type: text/plain; charset=utf-8\n"
-        f"\n{body}\n"
-    )
+    # 用 EmailMessage 构建标准 MIME 邮件：主题按 RFC 2047 编码、正文自动
+    # Content-Transfer-Encoding，避免原始 UTF-8 头部触发 SMTPUTF8 要求而被
+    # 对端邮件服务器退信（dsn 5.6.7）
+    from email.message import EmailMessage
+
+    m = EmailMessage()
+    m["From"] = f"lsi-raid-monitor@{host}"
+    m["To"] = ", ".join(recipients)
+    m["Subject"] = f"[LSI RAID] {subject}"
+    m.set_content(body)
+    msg = m.as_string()
     try:
         proc = subprocess.run(
             [sendmail, "-t", "-oi"],
@@ -216,14 +250,19 @@ def check_and_alert(disks: list[dict], ctrl: dict | None):
     for d in disks or []:
         label = f"E{d.get('eid')}:S{d.get('slot')}"
         temp = d.get("temperature")
+        # 策略关闭时清除残留标记，重新启用后可按当前状态重新报警
+        if not policy_enabled(cfg, "temp_crit"):
+            unflag(f"temp_crit_{label}")
+        if not policy_enabled(cfg, "temp_warn"):
+            unflag(f"temp_warn_{label}")
         if isinstance(temp, int):
-            if temp >= temp_crit:
+            if temp >= temp_crit and policy_enabled(cfg, "temp_crit"):
                 flag_once(
                     f"temp_crit_{label}",
                     f"磁盘 {label} 温度临界 {temp}°C",
                     f"磁盘 {label} ({d.get('model', '')}) 温度 {temp}°C，超过临界阈值 {temp_crit}°C。",
                 )
-            elif temp >= temp_warn:
+            elif temp >= temp_warn and policy_enabled(cfg, "temp_warn"):
                 flag_once(
                     f"temp_warn_{label}",
                     f"磁盘 {label} 温度偏高 {temp}°C",
@@ -235,7 +274,9 @@ def check_and_alert(disks: list[dict], ctrl: dict | None):
                 unflag(f"temp_warn_{label}")
                 unflag(f"temp_crit_{label}")
 
-        if str(d.get("smart_alert", "")).strip() == "Yes":
+        if not policy_enabled(cfg, "smart_alert"):
+            unflag(f"smart_{label}")
+        elif str(d.get("smart_alert", "")).strip() == "Yes":
             flag_once(
                 f"smart_{label}",
                 f"磁盘 {label} SMART 告警",
@@ -244,22 +285,27 @@ def check_and_alert(disks: list[dict], ctrl: dict | None):
         else:
             unflag(f"smart_{label}")
 
-        try:
-            pf = int(d.get("predictive_failure") or 0)
-        except (ValueError, TypeError):
-            pf = 0
-        if pf > 0:
-            flag_once(
-                f"pf_{label}",
-                f"磁盘 {label} 预测性故障计数 {pf}",
-                f"磁盘 {label} ({d.get('model', '')}) Predictive Failure Count = {pf}。",
-            )
-        else:
+        if not policy_enabled(cfg, "predictive_failure"):
             unflag(f"pf_{label}")
+        else:
+            try:
+                pf = int(d.get("predictive_failure") or 0)
+            except (ValueError, TypeError):
+                pf = 0
+            if pf > 0:
+                flag_once(
+                    f"pf_{label}",
+                    f"磁盘 {label} 预测性故障计数 {pf}",
+                    f"磁盘 {label} ({d.get('model', '')}) Predictive Failure Count = {pf}。",
+                )
+            else:
+                unflag(f"pf_{label}")
 
     if ctrl:
         health = str(ctrl.get("health", "")).strip()
-        if health and health not in ("Optimal", "N/A"):
+        if not policy_enabled(cfg, "ctrl_health"):
+            unflag("ctrl_health")
+        elif health and health not in ("Optimal", "N/A"):
             flag_once(
                 "ctrl_health",
                 f"控制器健康异常: {health}",
@@ -269,7 +315,9 @@ def check_and_alert(disks: list[dict], ctrl: dict | None):
             unflag("ctrl_health")
 
         bbu = str(ctrl.get("bbu_state", "")).strip()
-        if bbu and bbu not in ("Optimal", "Opt", "OK"):
+        if not policy_enabled(cfg, "bbu_state"):
+            unflag("bbu_state")
+        elif bbu and bbu not in ("Optimal", "Opt", "OK"):
             flag_once(
                 "bbu_state",
                 f"BBU/缓存单元异常: {bbu}",
@@ -283,6 +331,9 @@ def check_and_alert(disks: list[dict], ctrl: dict | None):
 
 def check_state_changes(disks: list[dict], vds: list[dict]):
     """每分钟调用：磁盘 / VD 状态变化告警"""
+    cfg = load_config()
+    disk_policy = policy_enabled(cfg, "disk_state_change")
+    vd_policy = policy_enabled(cfg, "vd_state_change")
     state = _load_state()
     prev_disks = state.get("disk_states", {})
     prev_vds = state.get("vd_states", {})
@@ -295,7 +346,7 @@ def check_state_changes(disks: list[dict], vds: list[dict]):
             cur_disks[label] = st
     for label, st in cur_disks.items():
         old = prev_disks.get(label)
-        if old is not None and old != st:
+        if disk_policy and old is not None and old != st:
             _alert(
                 f"磁盘 {label} 状态变化: {old} → {st}",
                 f"磁盘 {label} 状态由 {old} 变为 {st}。",
@@ -310,7 +361,7 @@ def check_state_changes(disks: list[dict], vds: list[dict]):
             cur_vds[key] = st
     for key, st in cur_vds.items():
         old = prev_vds.get(key)
-        if old is not None and old != st:
+        if vd_policy and old is not None and old != st:
             _alert(
                 f"虚拟磁盘 {key} 状态变化: {old} → {st}",
                 f"虚拟磁盘 {key} 状态由 {old} 变为 {st}。",
@@ -324,6 +375,7 @@ def check_state_changes(disks: list[dict], vds: list[dict]):
 
 def check_smart_attr_changes(smart_data: list[dict]):
     """SMART 采集后调用：关键属性 (5/187/188/197/198 等) 增长告警"""
+    growth_policy = policy_enabled(load_config(), "smart_attr_growth")
     state = _load_state()
     prev = state.get("smart_attrs", {})
     cur = {}
@@ -342,7 +394,8 @@ def check_smart_attr_changes(smart_data: list[dict]):
         old = prev.get(did)
         if old:
             grown = [k for k in watch if cur[did][k] > int(old.get(k) or 0)]
-            if grown:
+            # 策略关闭时仍更新快照，避免重新启用后补报历史增长
+            if grown and growth_policy:
                 detail = ", ".join(
                     f"{k}: {old.get(k, 0)} → {cur[did][k]}" for k in grown
                 )
