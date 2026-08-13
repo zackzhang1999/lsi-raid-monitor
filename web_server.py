@@ -1569,6 +1569,42 @@ def api_controller_jbod_set():
     return jsonify(ok=False, error="storcli 执行失败" if ok else msg), 500
 
 
+# ---- 日志打包下载 ----
+
+
+@app.get("/api/logs/download")
+@login_required
+def api_logs_download():
+    """收集控制器 alilog、控制器事件与平台事件日志，打包 zip 下载"""
+    import io
+    import zipfile
+
+    files = {}
+    ok, out = _run_storcli_text(f"{CONTROLLER} show alilog", timeout=180)
+    files["alilog.txt"] = out if ok else f"alilog 获取失败: {out}"
+    ok, out = _run_storcli_text(f"{CONTROLLER} show events", timeout=90)
+    files["controller_events.txt"] = out if ok else f"控制器事件获取失败: {out}"
+    try:
+        files["app_events.jsonl"] = (
+            lsi_alert.EVENTS_FILE.read_text(encoding="utf-8")
+            if lsi_alert.EVENTS_FILE.exists()
+            else ""
+        )
+    except Exception as e:
+        files["app_events.jsonl"] = f"事件日志读取失败: {e}"
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, content in files.items():
+            z.writestr(name, content)
+    buf.seek(0)
+    fname = f"lsi-logs-{datetime.now():%Y%m%d-%H%M%S}.zip"
+    lsi_alert.log_event("info", f"日志包已下载（{session.get('username', '')}）")
+    return send_file(
+        buf, mimetype="application/zip", as_attachment=True, download_name=fname
+    )
+
+
 # ---- 创建磁盘阵列 ----
 
 # RAID 级别 -> (最少盘数, 额外约束)

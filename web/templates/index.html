@@ -421,6 +421,20 @@
 
         <!-- ============ 日志中心 ============ -->
         <div class="view hidden" id="view-logs">
+          <!-- 日志下载 -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Download</div>
+                <strong>日志下载</strong>
+              </div>
+              <button class="btn sm" id="btn-log-download">收集并下载</button>
+            </div>
+            <div class="tiny" style="color: var(--muted-foreground);">
+              自动收集控制器 alilog、控制器事件与平台事件日志，打包为 zip 下载（收集约需数十秒）。
+            </div>
+          </div>
+
           <!-- 事件日志 -->
           <div class="card">
             <div class="card-head">

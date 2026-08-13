@@ -1605,6 +1605,7 @@ function bindUI() {
     loadCtlEvents();
   }));
   $('#btn-ctl-refresh').addEventListener('click', loadCtlEvents);
+  $('#btn-log-download').addEventListener('click', downloadLogs);
   $('#btn-ctl-copy').addEventListener('click', async () => {
     try {
       await navigator.clipboard.writeText($('#ctl-pre').textContent);
@@ -1960,6 +1961,35 @@ function addNfs() {
       $('#nfs-path').value = '';
       await loadNfs();
     });
+}
+
+/* ---------- 日志打包下载 ---------- */
+async function downloadLogs() {
+  const btn = $('#btn-log-download');
+  btnLoading(btn, true);
+  try {
+    const res = await fetch('/api/logs/download', { credentials: 'same-origin' });
+    if (!res.ok) {
+      let msg = '下载失败 (' + res.status + ')';
+      try { const d = await res.json(); if (d && d.error) msg = d.error; } catch (e) { /* 非 JSON */ }
+      throw new Error(msg);
+    }
+    const blob = await res.blob();
+    const cd = res.headers.get('Content-Disposition') || '';
+    const m = cd.match(/filename="?([^";]+)"?/);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = m ? m[1] : 'lsi-logs.zip';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    toast('日志包已下载', 'ok');
+  } catch (e) {
+    toast(e.message, 'error');
+  } finally {
+    btnLoading(btn, false);
+  }
 }
 
 /* ---------- 控制器事件 ---------- */
