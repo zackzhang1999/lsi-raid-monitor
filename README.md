@@ -25,8 +25,10 @@ UI 基于 google-design 设计体系（DM Sans / JetBrains Mono，浅色主色 `
 - **用户体系**：管理员 / 只读用户两种角色，PBKDF2 加盐哈希存储，创建第一个管理员后自动启用登录认证
 - **采集控制**：Web 调整采集间隔（1/5/15/30/60 分钟）、手动立即采集（绕过间隔门控）、CSV 导出
 
-<img width="3840" height="1907" alt="0c8d851e-f343-4a88-aaaf-15b403e50de5" src="https://github.com/user-attachments/assets/1b41ec9a-9876-487a-92e3-f718a5e01647" />
-<img width="3840" height="1907" alt="4e488084-b163-4b02-aa79-d2f062cf1e3f" src="https://github.com/user-attachments/assets/39d8d582-741b-4514-8f89-5e7853c2283e" />
+<img width="3813" height="1899" alt="001" src="https://github.com/user-attachments/assets/68d031eb-41d7-471b-90de-355d99f2ca3c" />
+<img width="3819" height="1824" alt="002" src="https://github.com/user-attachments/assets/1f48f036-62d2-4651-9cdb-343a31b6366e" />
+
+
 
 
 
