@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LSI RAID 监控</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+  <div id="toast-root"></div>
+
+  <!-- 登录遮罩 -->
+  <div id="login-overlay" class="overlay hidden">
+    <form id="login-form" class="login-card" autocomplete="off">
+      <div class="brand">
+        <div class="brand-mark">LSI</div>
+        <div class="brand-copy">
+          <h1>RAID 监控</h1>
+          <p>MegaRAID Storage Monitor</p>
+        </div>
+      </div>
+      <div class="field">
+        <label for="login-username">用户名</label>
+        <input class="input" id="login-username" required />
+      </div>
+      <div class="field">
+        <label for="login-password">口令</label>
+        <input class="input" id="login-password" type="password" required />
+      </div>
+      <div class="login-error" id="login-error"></div>
+      <button class="btn primary" id="login-btn" type="submit">登录</button>
+    </form>
+  </div>
+
+  <div class="app" id="app">
+    <!-- 侧边栏 -->
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <div class="brand-mark">LSI</div>
+        <div class="brand-copy">
+          <h1>RAID 监控</h1>
+          <p>MegaRAID Storage</p>
+        </div>
+      </div>
+      <nav class="nav">
+        <button class="nav-btn active" data-view="overview">
+          <span class="glyph">◫</span><span class="label">监控概览</span>
+        </button>
+        <button class="nav-btn" data-view="storage">
+          <span class="glyph">▤</span><span class="label">磁盘管理</span>
+        </button>
+        <button class="nav-btn" data-view="logs">
+          <span class="glyph">≡</span><span class="label">日志中心</span>
+        </button>
+        <button class="nav-btn hidden" data-view="users" id="nav-users">
+          <span class="glyph">⚇</span><span class="label">用户管理</span>
+        </button>
+      </nav>
+      <div class="sidebar-foot">LSI MegaRAID 存储监控 · 每 60 秒自动刷新</div>
+    </aside>
+    <div class="sidebar-scrim" id="sidebar-scrim"></div>
+
+    <main class="main">
+      <!-- 顶栏 -->
+      <header class="topbar">
+        <div class="topbar-left">
+          <button class="icon-btn" id="btn-sidebar" title="折叠/展开侧边栏">☰</button>
+          <span class="host-name" id="tb-host">—</span>
+          <span class="tb-sep"></span>
+          <span class="badge" id="tb-health">—</span>
+          <span class="tb-updated" id="tb-updated"></span>
+        </div>
+        <div class="topbar-right">
+          <label class="tiny" for="sel-interval">采集间隔</label>
+          <select class="select" id="sel-interval">
+            <option value="1">1 分钟</option>
+            <option value="5">5 分钟</option>
+            <option value="15">15 分钟</option>
+            <option value="30">30 分钟</option>
+            <option value="60">60 分钟</option>
+          </select>
+          <button class="btn" id="btn-export">导出 CSV</button>
+          <button class="btn secondary hidden" id="btn-collect">立即采集</button>
+          <button class="icon-btn" id="btn-theme" title="切换主题">◐</button>
+          <div class="user-chip">
+            <div class="avatar" id="user-avatar">?</div>
+            <span class="tiny" id="user-name"></span>
+            <button class="btn ghost sm hidden" id="btn-logout">退出</button>
+          </div>
+        </div>
+      </header>
+
+      <section class="content">
+        <!-- ============ 监控概览 ============ -->
+        <div class="view" id="view-overview">
+          <div class="grid grid-hero">
+            <!-- 综合健康评分 -->
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <div class="eyebrow">Health score</div>
+                  <strong>综合健康评分</strong>
+                </div>
+                <span class="badge" id="health-badge">—</span>
+              </div>
+              <div class="health-wrap">
+                <div class="ring-box">
+                  <svg width="132" height="132" viewBox="0 0 132 132">
+                    <circle class="ring-track" cx="66" cy="66" r="54" fill="none" stroke-width="10" />
+                    <circle class="ring-val" id="ring-val" cx="66" cy="66" r="54" fill="none"
+                      stroke-width="10" stroke-linecap="round"
+                      stroke-dasharray="339.29" stroke-dashoffset="339.29" stroke="#34a853" />
+                  </svg>
+                  <div class="ring-center">
+                    <div>
+                      <div class="score" id="health-score">—</div>
+                      <div class="score-label">总分 / 100</div>
+                    </div>
+                  </div>
+                </div>
+                <div class="sub-scores" id="sub-scores"></div>
+              </div>
+              <div class="alarm-row">
+                <span class="tiny">阵列卡报警</span>
+                <span class="badge" id="alarm-badge">—</span>
+                <span class="alarm-actions" id="alarm-actions">
+                  <button class="btn sm" data-alarm="on">打开</button>
+                  <button class="btn sm" data-alarm="silence">临时关闭</button>
+                  <button class="btn sm danger" data-alarm="off">永久关闭</button>
+                </span>
+              </div>
+              <div class="alarm-row">
+                <span class="tiny">JBOD 模式</span>
+                <span class="badge" id="jbod-badge">—</span>
+                <span class="alarm-actions" id="jbod-actions">
+                  <button class="btn sm" data-jbod="on">打开</button>
+                  <button class="btn sm danger" data-jbod="off">关闭</button>
+                </span>
+              </div>
+            </div>
+
+            <!-- 邮件报警配置 -->
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <div class="eyebrow">Alerting</div>
+                  <strong>邮件报警配置</strong>
+                </div>
+                <div class="chips">
+                  <span class="badge" id="alert-enabled-badge">—</span>
+                  <span class="badge" id="sendmail-badge">—</span>
+                </div>
+              </div>
+              <form id="alert-form" class="form-row" autocomplete="off">
+                <div class="field">
+                  <label for="alert-email">收件人邮箱</label>
+                  <input class="input" id="alert-email" type="email" placeholder="ops@example.com" />
+                  <span class="hint hidden" data-lock-hint>已由环境变量锁定</span>
+                </div>
+                <div class="field">
+                  <label for="alert-sendmail">sendmail 路径</label>
+                  <input class="input mono" id="alert-sendmail" placeholder="/usr/sbin/sendmail" />
+                  <span class="hint hidden" data-lock-hint>已由环境变量锁定</span>
+                </div>
+                <div class="field">
+                  <label for="alert-warn">温度警告阈值 (°C)</label>
+                  <input class="input mono" id="alert-warn" type="number" min="1" max="100" />
+                  <span class="hint hidden" data-lock-hint>已由环境变量锁定</span>
+                </div>
+                <div class="field">
+                  <label for="alert-crit">温度临界阈值 (°C)</label>
+                  <input class="input mono" id="alert-crit" type="number" min="1" max="100" />
+                  <span class="hint hidden" data-lock-hint>已由环境变量锁定</span>
+                </div>
+                <div class="field" style="grid-column: 1 / -1;">
+                  <label>报警策略（勾选需要发送邮件的情况）</label>
+                  <div class="policy-grid" id="alert-policies">
+                    <label class="policy-item"><input type="checkbox" data-policy="temp_warn"> 磁盘温度超警告阈值</label>
+                    <label class="policy-item"><input type="checkbox" data-policy="temp_crit"> 磁盘温度超临界阈值</label>
+                    <label class="policy-item"><input type="checkbox" data-policy="smart_alert"> 磁盘 SMART 告警</label>
+                    <label class="policy-item"><input type="checkbox" data-policy="predictive_failure"> 预测性故障（PF）计数</label>
+                    <label class="policy-item"><input type="checkbox" data-policy="ctrl_health"> 控制器健康异常</label>
+                    <label class="policy-item"><input type="checkbox" data-policy="bbu_state"> BBU/缓存单元异常</label>
+                    <label class="policy-item"><input type="checkbox" data-policy="disk_state_change"> 磁盘状态变化</label>
+                    <label class="policy-item"><input type="checkbox" data-policy="vd_state_change"> 虚拟磁盘状态变化</label>
+                    <label class="policy-item"><input type="checkbox" data-policy="smart_attr_growth"> SMART 关键属性增长</label>
+                  </div>
+                </div>
+                <div class="hero-actions" style="grid-column: 1 / -1; display:flex; gap: 8px;">
+                  <button class="btn primary" id="btn-alert-save" type="submit">保存配置</button>
+                  <button class="btn" id="btn-alert-test" type="button">发送测试报警</button>
+                </div>
+              </form>
+            </div>
+          </div>
+
+          <!-- 系统资源（实时） / 文件系统（与上方健康评分/报警配置同栅格对齐） -->
+          <div class="grid grid-hero">
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <div class="eyebrow">Realtime</div>
+                  <strong>系统资源</strong>
+                </div>
+                <span class="tiny" id="rt-updated"></span>
+              </div>
+              <div id="realtime-body"><div class="loading-line">加载中…</div></div>
+            </div>
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <div class="eyebrow">Filesystems</div>
+                  <strong>文件系统</strong>
+                </div>
+              </div>
+              <div id="fs-usage-body"><div class="loading-line">加载中…</div></div>
+            </div>
+          </div>
+
+          <!-- 四个状态卡 -->
+          <div class="grid grid-stats" id="stat-cards"></div>
+
+          <!-- 磁盘槽位拓扑 -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Topology</div>
+                <strong>磁盘槽位拓扑</strong>
+              </div>
+              <span class="tiny">点击查看磁盘详情</span>
+            </div>
+            <div class="topo-grid" id="topo-grid"><div class="loading-line">加载中…</div></div>
+          </div>
+
+          <!-- 趋势图：温度 / IO / 文件系统 -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Trends</div>
+                <strong id="chart-title">磁盘温度趋势</strong>
+              </div>
+              <div class="chips">
+                <span id="chart-type" class="chips">
+                  <button class="chip active" data-type="temp">磁盘温度</button>
+                  <button class="chip" data-type="io">IO 吞吐</button>
+                  <button class="chip" data-type="fs">文件系统</button>
+                </span>
+                <span id="chart-range" class="chips">
+                  <button class="chip" data-hours="6">6 小时</button>
+                  <button class="chip active" data-hours="24">24 小时</button>
+                  <button class="chip" data-hours="72">3 天</button>
+                </span>
+              </div>
+            </div>
+            <div class="chart-box">
+              <canvas id="temp-chart"></canvas>
+              <div class="chart-empty hidden" id="chart-empty">暂无数据</div>
+            </div>
+          </div>
+
+          <!-- 巡读 / 一致性检查 -->
+          <div class="grid grid-2" id="maint-cards"></div>
+
+          <!-- 虚拟磁盘 -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Virtual disks</div>
+                <strong>虚拟磁盘</strong>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="data" id="vd-table">
+                <thead><tr>
+                  <th>DG/VD</th><th>名称</th><th>RAID</th><th>容量</th><th>状态</th>
+                  <th>OS 设备</th><th>写缓存</th><th>当前操作</th><th class="admin-col">操作</th>
+                </tr></thead>
+                <tbody><tr><td colspan="9" class="muted">加载中…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 物理磁盘 -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Physical disks</div>
+                <strong>物理磁盘</strong>
+              </div>
+              <div class="chips hidden" id="pd-raid-bar">
+                <span class="tiny" id="raid-sel-count">已选 0 块盘</span>
+                <select class="select" id="raid-level">
+                  <option value="0">RAID 0</option>
+                  <option value="1">RAID 1</option>
+                  <option value="5">RAID 5</option>
+                  <option value="6">RAID 6</option>
+                  <option value="10">RAID 10</option>
+                  <option value="50">RAID 50</option>
+                </select>
+                <input class="input" id="raid-name" placeholder="阵列名称（可选）" maxlength="32" style="width:150px" />
+                <button class="btn sm danger" id="btn-raid-create" disabled>创建阵列</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="data" id="pd-table">
+                <thead><tr>
+                  <th class="admin-col" title="仅未配置（UGood/JBOD）磁盘可勾选">选择</th>
+                  <th>槽位</th><th>型号</th><th>序列号</th><th>固件</th><th>磁盘组</th>
+                  <th>状态</th><th>温度</th><th>ME/OE/PF</th><th>R/P/U</th><th>通电时长</th>
+                  <th>告警</th><th title="基于 SMART 与控制器计数器的规则化故障预测">预测</th><th>操作</th>
+                </tr></thead>
+                <tbody><tr><td colspan="14" class="muted">加载中…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 系统信息 -->
+          <div class="card" id="card-system">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">System</div>
+                <strong>系统信息</strong>
+              </div>
+            </div>
+            <dl class="kv" id="system-kv"><dt class="muted">加载中…</dt></dl>
+          </div>
+        </div>
+
+        <!-- ============ 磁盘管理 ============ -->
+        <div class="view hidden" id="view-storage">
+          <!-- 文件系统使用率 -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Filesystem usage</div>
+                <strong>文件系统使用率</strong>
+              </div>
+              <div style="display:flex;align-items:center;gap:10px">
+                <label class="tiny" style="display:flex;align-items:center;gap:4px;cursor:pointer">
+                  <input type="checkbox" id="fs-show-hidden"> 显示已隐藏
+                </label>
+                <button class="btn sm" id="btn-fs-refresh">刷新</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="data" id="fs-table">
+                <thead><tr>
+                  <th>设备</th><th>挂载点</th><th>类型</th><th>容量</th><th>已用</th><th>使用率</th><th>Inode 使用率</th><th>操作</th>
+                </tr></thead>
+                <tbody><tr><td colspan="8" class="muted">加载中…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Block devices</div>
+                <strong>块设备</strong>
+              </div>
+              <button class="btn sm" id="btn-storage-refresh">刷新</button>
+            </div>
+            <div class="table-wrap">
+              <table class="data" id="storage-table">
+                <thead><tr>
+                  <th>名称</th><th>大小</th><th>文件系统</th><th>挂载点</th><th>操作</th>
+                </tr></thead>
+                <tbody><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- NFS 共享 -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">NFS exports</div>
+                <strong>NFS 共享</strong>
+              </div>
+              <button class="btn sm" id="btn-nfs-refresh">刷新</button>
+            </div>
+            <div class="banner hidden" id="nfs-unavailable">未检测到 exportfs，请先安装 NFS 服务（nfs-utils / nfs-kernel-server）</div>
+            <div class="table-wrap">
+              <table class="data" id="nfs-table">
+                <thead><tr>
+                  <th>共享路径</th><th>客户端</th><th>选项</th><th class="admin-col">操作</th>
+                </tr></thead>
+                <tbody><tr><td colspan="4" class="muted">加载中…</td></tr></tbody>
+              </table>
+            </div>
+            <form id="nfs-form" class="form-row hidden" autocomplete="off" style="margin-top:12px">
+              <div class="field">
+                <label for="nfs-path">共享路径</label>
+                <input class="input mono" id="nfs-path" placeholder="/mnt/data" required />
+              </div>
+              <div class="field">
+                <label for="nfs-host">客户端</label>
+                <input class="input mono" id="nfs-host" placeholder="* 或 192.168.1.0/24" value="*" />
+              </div>
+              <div class="field">
+                <label for="nfs-perm">权限</label>
+                <select class="select" id="nfs-perm" style="width:100%">
+                  <option value="rw">读写 (rw)</option>
+                  <option value="ro">只读 (ro)</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>附加选项</label>
+                <span class="persist-row">
+                  <label><input type="checkbox" id="nfs-opt-async" /> async</label>
+                  <label><input type="checkbox" id="nfs-opt-nrs" /> no_root_squash</label>
+                  <label><input type="checkbox" id="nfs-opt-allsquash" /> all_squash</label>
+                </span>
+              </div>
+              <div class="field" style="align-self:end;">
+                <button class="btn primary" id="btn-nfs-add" type="submit">添加共享</button>
+              </div>
+            </form>
+          </div>
+        </div>
+
+        <!-- ============ 日志中心 ============ -->
+        <div class="view hidden" id="view-logs">
+          <!-- 日志下载 -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Download</div>
+                <strong>日志下载</strong>
+              </div>
+              <button class="btn sm" id="btn-log-download">收集并下载</button>
+            </div>
+            <div class="tiny" style="color: var(--muted-foreground);">
+              自动收集控制器 alilog、控制器事件与平台事件日志，打包为 zip 下载（收集约需数十秒）。
+            </div>
+          </div>
+
+          <!-- 事件日志 -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Events</div>
+                <strong>事件日志</strong>
+              </div>
+              <div class="chips" id="event-filter">
+                <button class="chip active" data-level="all">全部</button>
+                <button class="chip" data-level="error">错误</button>
+                <button class="chip" data-level="warning">警告</button>
+                <button class="chip" data-level="info">信息</button>
+              </div>
+            </div>
+            <div class="event-list" id="event-list"><div class="loading-line">加载中…</div></div>
+            <div class="pager">
+              <button class="btn sm" id="ev-prev">上一页</button>
+              <span class="page-info" id="ev-page-info">—</span>
+              <button class="btn sm" id="ev-next">下一页</button>
+            </div>
+          </div>
+
+          <!-- 控制器事件 -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Controller events</div>
+                <strong>控制器事件</strong>
+              </div>
+              <div class="chips" id="ctl-lines">
+                <button class="chip active" data-lines="100">100 行</button>
+                <button class="chip" data-lines="200">200 行</button>
+                <button class="chip" data-lines="500">500 行</button>
+              </div>
+            </div>
+            <div class="ctl-toolbar">
+              <button class="btn sm" id="btn-ctl-refresh">刷新</button>
+              <button class="btn sm ghost" id="btn-ctl-copy">复制</button>
+              <span class="tiny" id="ctl-total"></span>
+            </div>
+            <pre class="smart-pre" id="ctl-pre">加载中…</pre>
+          </div>
+        </div>
+
+        <!-- ============ 用户管理 ============ -->
+        <div class="view hidden" id="view-users">
+          <div class="banner hidden" id="users-warning">未启用认证，创建第一个管理员后启用</div>
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Accounts</div>
+                <strong>用户列表</strong>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="data" id="users-table">
+                <thead><tr>
+                  <th>用户名</th><th>角色</th><th>操作</th>
+                </tr></thead>
+                <tbody><tr><td colspan="3" class="muted">加载中…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">New account</div>
+                <strong>新建用户</strong>
+              </div>
+            </div>
+            <form id="user-form" class="form-row" autocomplete="off">
+              <div class="field">
+                <label for="nu-username">用户名</label>
+                <input class="input" id="nu-username" required />
+              </div>
+              <div class="field">
+                <label for="nu-password">口令</label>
+                <input class="input" id="nu-password" type="password" required />
+              </div>
+              <div class="field">
+                <label for="nu-role">角色</label>
+                <select class="select" id="nu-role" style="width:100%">
+                  <option value="viewer">只读用户</option>
+                  <option value="admin">管理员</option>
+                </select>
+              </div>
+              <div class="field" style="align-self:end;">
+                <button class="btn primary" id="btn-user-create" type="submit">创建用户</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- 磁盘详情抽屉 -->
+  <div class="drawer-scrim hidden" id="drawer-scrim"></div>
+  <aside class="drawer" id="drawer">
+    <div class="drawer-head">
+      <strong id="drawer-title">磁盘详情</strong>
+      <button class="icon-btn" id="drawer-close">✕</button>
+    </div>
+    <div class="drawer-body">
+      <dl class="kv" id="drawer-kv"></dl>
+      <div>
+        <button class="btn" id="btn-smart">查看 SMART</button>
+        <button class="btn ghost hidden" id="btn-smart-raw">查看原始输出</button>
+        <button class="btn ghost hidden" id="btn-smart-copy">复制</button>
+      </div>
+      <div id="smart-body" class="hidden"></div>
+      <pre class="smart-pre hidden" id="smart-pre"></pre>
+    </div>
+  </aside>
+
+  <!-- 通用确认对话框 -->
+  <div class="modal-scrim hidden" id="modal-scrim">
+    <div class="modal">
+      <h3 id="modal-title">确认</h3>
+      <div class="modal-body" id="modal-body"></div>
+      <div class="modal-actions" id="modal-actions"></div>
+    </div>
+  </div>
+
+  <script src="/static/vendor/chart.umd.min.js"></script>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

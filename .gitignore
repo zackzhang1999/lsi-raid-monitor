@@ -1,0 +1,10 @@
+# Local data and logs
+data/
+*.log
+*.log.*
+web_server.out
+charts/
+__pycache__/
+*.pyc
+.env
+dist/

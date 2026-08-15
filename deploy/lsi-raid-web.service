@@ -1,0 +1,16 @@
+[Unit]
+Description=LSI MegaRAID Monitor Web
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/lsi-raid-monitor
+Environment=LSI_DATA_DIR=/opt/lsi-raid-monitor/data
+Environment=LSI_WEB_HOST=0.0.0.0
+Environment=LSI_WEB_PORT=5200
+ExecStart=/usr/bin/python3 -m waitress --host=${LSI_WEB_HOST} --port=${LSI_WEB_PORT} web_server:app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
