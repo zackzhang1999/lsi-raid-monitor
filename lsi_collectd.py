@@ -477,6 +477,101 @@ def _parse_ata_table(output: str, smart: dict):
             smart["smart_temp"] = raw
 
 
+# ---- NVMe 磁盘（直连 PCIe/U.2，不经 MegaRAID）----
+
+
+def _read_nvme_smart(path: str) -> dict:
+    """通过 smartctl 读取单块 NVMe 盘的关键 SMART/健康字段。"""
+    smart: dict = {}
+    try:
+        proc = subprocess.run(
+            f"sudo {SMARTCTL} -a -d nvme {path}",
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        output = proc.stdout or proc.stderr
+    except Exception:
+        return smart
+
+    for line in output.splitlines():
+        uline = line.upper()
+        if "TEMPERATURE:" in uline and "SENSOR" not in uline:
+            m = re.search(r"(\d+)\s*Celsius", line)
+            if m:
+                smart["temperature"] = int(m.group(1))
+        elif "AVAILABLE SPARE:" in uline:
+            m = re.search(r"(\d+)\s*%", line)
+            if m:
+                smart["available_spare"] = int(m.group(1))
+        elif "PERCENTAGE USED:" in uline:
+            m = re.search(r"(\d+)\s*%", line)
+            if m:
+                smart["percentage_used"] = int(m.group(1))
+        elif "CRITICAL WARNING:" in uline:
+            smart["critical_warning"] = line.split(":", 1)[-1].strip()
+        elif "POWER ON HOURS:" in uline:
+            m = re.search(r":\s*([\d,]+)", line)
+            if m:
+                smart["power_on_hours"] = int(m.group(1).replace(",", ""))
+        elif "POWER CYCLES:" in uline:
+            m = re.search(r":\s*([\d,]+)", line)
+            if m:
+                smart["power_cycles"] = int(m.group(1).replace(",", ""))
+        elif "UNSAFE SHUTDOWNS:" in uline:
+            m = re.search(r":\s*([\d,]+)", line)
+            if m:
+                smart["unsafe_shutdowns"] = int(m.group(1).replace(",", ""))
+        elif "MEDIA AND DATA INTEGRITY ERRORS:" in uline:
+            m = re.search(r":\s*([\d,]+)", line)
+            if m:
+                smart["media_errors"] = int(m.group(1).replace(",", ""))
+    return smart
+
+
+def collect_nvme() -> list[dict]:
+    """采集 NVMe 直连盘：nvme list 提供身份/容量，smartctl 提供健康字段。"""
+    rows: list[dict] = []
+    try:
+        proc = subprocess.run(
+            "nvme list -o json",
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        data = json.loads(proc.stdout or "{}")
+    except Exception as e:
+        print(f"[{datetime.now():%H:%M:%S}] nvme list error: {e}", file=sys.stderr)
+        return rows
+
+    for dev in data.get("Devices", []):
+        path = str(dev.get("DevicePath", "")).strip()
+        if not path:
+            continue
+        smart = _read_nvme_smart(path)
+        rows.append(
+            {
+                "device": path,
+                "model": str(dev.get("ModelNumber", "")).strip(),
+                "serial": str(dev.get("SerialNumber", "")).strip(),
+                "firmware": str(dev.get("Firmware", "")).strip(),
+                "size_bytes": dev.get("PhysicalSize", 0),
+                "used_bytes": dev.get("UsedBytes", 0),
+                "temperature": smart.get("temperature", ""),
+                "available_spare": smart.get("available_spare", ""),
+                "percentage_used": smart.get("percentage_used", ""),
+                "critical_warning": smart.get("critical_warning", ""),
+                "power_on_hours": smart.get("power_on_hours", ""),
+                "power_cycles": smart.get("power_cycles", ""),
+                "unsafe_shutdowns": smart.get("unsafe_shutdowns", ""),
+                "media_errors": smart.get("media_errors", ""),
+            }
+        )
+    return rows
+
+
 # ---- 系统信息 ----
 
 
@@ -858,6 +953,23 @@ def _run_collection(now: datetime, force: bool = False):
         "avail_kb",
         "use_percent",
     ]
+    nvme_fields = [
+        "timestamp",
+        "device",
+        "model",
+        "serial",
+        "firmware",
+        "size_bytes",
+        "used_bytes",
+        "temperature",
+        "available_spare",
+        "percentage_used",
+        "critical_warning",
+        "power_on_hours",
+        "power_cycles",
+        "unsafe_shutdowns",
+        "media_errors",
+    ]
 
     # 磁盘（每分钟追加）
     disks = collect_disks()
@@ -902,6 +1014,13 @@ def _run_collection(now: datetime, force: bool = False):
         for r in fs_rows:
             r["timestamp"] = timestamp
         write_csv(date_dir, "fs.csv", fs_fields, fs_rows)
+
+    # NVMe 磁盘（每分钟追加）
+    nvme_rows = collect_nvme()
+    if nvme_rows:
+        for r in nvme_rows:
+            r["timestamp"] = timestamp
+        write_csv(date_dir, "nvme.csv", nvme_fields, nvme_rows)
 
     # VD（CSV 当天首次采集写入；状态变化告警每分钟检测）
     vds = collect_vds()

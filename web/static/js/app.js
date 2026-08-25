@@ -236,6 +236,7 @@ async function afterLogin() {
   // 角色相关可见性
   $('#nav-users').classList.toggle('hidden', !state.isAdmin);
   $('#btn-collect').classList.toggle('hidden', !state.isAdmin);
+  $('#btn-vd-import').classList.toggle('hidden', !state.isAdmin);
   $('#btn-logout').classList.toggle('hidden', !state.authRequired);
   $('#sel-interval').disabled = !state.isAdmin;
   $('#btn-alert-save').disabled = !state.isAdmin;
@@ -270,6 +271,7 @@ async function loadStatus() {
   renderTopology(st);
   renderMaintenance(st);
   renderPhysicalDisks(st);
+  renderNvmeDisks(st);
   renderSystem(st);
 }
 
@@ -607,7 +609,8 @@ function renderVirtualDisks() {
         <option value="init_start">初始化开始</option>
         <option value="init_stop">初始化停止</option>
         <option value="cc_start">CC 开始</option>
-        <option value="cc_stop">CC 停止</option>`;
+        <option value="cc_stop">CC 停止</option>
+        <option value="vd_delete">删除</option>`;
       sel.addEventListener('change', () => {
         const action = sel.value;
         sel.value = '';
@@ -648,6 +651,8 @@ const VD_ACTION_MAP = {
     desc: '对该虚拟盘启动一致性检查，会占用一定的 IO 资源。' },
   cc_stop: { target: 'cc', action: 'stop', text: 'CC 停止', danger: true,
     desc: '停止该虚拟盘上正在运行的一致性检查。' },
+  vd_delete: { target: 'vd_delete', action: 'delete', text: '删除', danger: true,
+    desc: '删除该虚拟盘会销毁阵列配置并导致数据丢失，且不可恢复。' },
 };
 
 function vdAction(v, key) {
@@ -755,6 +760,41 @@ function renderPhysicalDisks(st) {
   });
   updateRaidBar();
 }
+
+/* ---------- NVMe 磁盘 ---------- */
+function renderNvmeDisks(st) {
+  const disks = st.nvme_disks || [];
+  const tb = $('#nvme-table tbody');
+  if (!disks.length) {
+    tb.innerHTML = '<tr><td colspan="12" class="muted">无 NVMe 磁盘</td></tr>';
+    return;
+  }
+  tb.innerHTML = '';
+  disks.forEach(d => {
+    const cw = String(d.critical_warning || '');
+    const cwWarn = cw && cw !== '0x00' && cw !== '0x0';
+    const alerts = [];
+    if (cwWarn) alerts.push(`<span class="badge crit" title="Critical Warning">SMART</span>`);
+    if (Number(d.media_errors) > 0) alerts.push('<span class="badge crit">介质错误</span>');
+    if (d.available_spare != null && Number(d.available_spare) <= 10) alerts.push('<span class="badge warn">备用空间低</span>');
+    if (d.percentage_used != null && Number(d.percentage_used) >= 90) alerts.push('<span class="badge warn">寿命将尽</span>');
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="num">${esc(d.device || '—')}</td>
+      <td>${esc(d.model || '—')}</td>
+      <td class="num">${esc(d.serial || '—')}</td>
+      <td class="num">${esc(d.firmware || '—')}</td>
+      <td class="num">${esc(d.size || '—')}</td>
+      <td class="num">${esc(d.used || '—')}</td>
+      <td class="num">${fmtTemp(d.temperature)}</td>
+      <td class="num">${d.available_spare != null ? esc(d.available_spare) + '%' : '—'}</td>
+      <td class="num">${d.percentage_used != null ? esc(d.percentage_used) + '%' : '—'}</td>
+      <td class="num">${fmtHours(d.power_on_hours)}</td>
+      <td class="num">${num0(d.media_errors)}</td>
+      <td>${alerts.join(' ') || '<span class="tiny">—</span>'}</td>`;
+    tb.appendChild(tr);
+  });
+}
 function num0(v) { return v != null && !isNaN(v) ? esc(v) : '0'; }
 
 const DISK_ACTION_TEXT = {
@@ -825,8 +865,8 @@ function createRaid() {
   const n = state.raidSel.size;
   const err = raidLevelError(level, n);
   if (err) { toast(err, 'error'); return; }
-  if (name && !/^[\w .-]{1,32}$/.test(name)) {
-    toast('阵列名称仅支持字母数字/空格/._-，最长 32 字符', 'error');
+  if (name && !/^[\w .-]{1,15}$/.test(name)) {
+    toast('阵列名称仅支持字母数字/空格/._-，最长 15 字符', 'error');
     return;
   }
 
@@ -1557,6 +1597,11 @@ function bindUI() {
   // 创建磁盘阵列
   $('#btn-raid-create').addEventListener('click', createRaid);
   $('#raid-level').addEventListener('change', updateRaidBar);
+  // 导入外来（Foreign）虚拟盘配置
+  $('#btn-vd-import').addEventListener('click', () => {
+    raidAction({ target: 'vd_import', action: 'import' }, '导入外来配置',
+      '确认导入外来 (Foreign) 配置？该操作会把外部虚拟盘配置导入当前控制器，使其恢复可见与可访问。', true);
+  });
   $('#btn-logout').addEventListener('click', async () => {
     try { await api('/api/logout', { method: 'POST' }); } catch (e) { /* 忽略 */ }
     location.reload();

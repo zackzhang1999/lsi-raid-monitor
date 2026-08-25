@@ -268,6 +268,7 @@
                 <div class="eyebrow">Virtual disks</div>
                 <strong>虚拟磁盘</strong>
               </div>
+              <button class="btn sm admin-col hidden" id="btn-vd-import">导入外来配置</button>
             </div>
             <div class="table-wrap">
               <table class="data" id="vd-table">
@@ -297,7 +298,7 @@
                   <option value="10">RAID 10</option>
                   <option value="50">RAID 50</option>
                 </select>
-                <input class="input" id="raid-name" placeholder="阵列名称（可选）" maxlength="32" style="width:150px" />
+                <input class="input" id="raid-name" placeholder="阵列名称（可选，最长 15 字符）" maxlength="15" style="width:150px" />
                 <button class="btn sm danger" id="btn-raid-create" disabled>创建阵列</button>
               </div>
             </div>
@@ -310,6 +311,26 @@
                   <th>告警</th><th title="基于 SMART 与控制器计数器的规则化故障预测">预测</th><th>操作</th>
                 </tr></thead>
                 <tbody><tr><td colspan="14" class="muted">加载中…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- NVMe 磁盘 -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">NVMe disks</div>
+                <strong>NVMe 磁盘</strong>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="data" id="nvme-table">
+                <thead><tr>
+                  <th>设备</th><th>型号</th><th>序列号</th><th>固件</th><th>容量</th>
+                  <th>已用</th><th>温度</th><th>备用空间</th><th>已用寿命</th><th>通电时长</th>
+                  <th>介质错误</th><th>告警</th>
+                </tr></thead>
+                <tbody><tr><td colspan="12" class="muted">加载中…</td></tr></tbody>
               </table>
             </div>
           </div>

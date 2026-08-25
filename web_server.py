@@ -289,6 +289,20 @@ def _to_int(val, default=None):
         return default
 
 
+def _fmt_bytes(val, base=1024) -> str:
+    """把字节数格式化为可读容量（B/KB/MB/GB/TB/PB）。base 默认 1024。"""
+    n = _to_int(val)
+    if n is None or n <= 0:
+        return ""
+    size = float(n)
+    units = ("B", "KB", "MB", "GB", "TB", "PB") if base == 1000 else ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+    for unit in units:
+        if size < base:
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.2f} {unit}"
+        size /= base
+    return f"{size:.2f} EB"
+
+
 # ---- 磁盘故障预测 ----
 # 基于控制器计数器（PF/SMART 告警/介质错误）、SMART 关键属性
 # （重映射/待定/无法纠正扇区）及其跨天历史趋势的规则化评估。
@@ -390,6 +404,7 @@ def build_status() -> dict:
     patrol_rows = _read_csv(date_dir / "patrol.csv") if date_dir else []
     cc_rows = _read_csv(date_dir / "consistency.csv") if date_dir else []
     sys_rows = _read_csv(date_dir / "system.csv") if date_dir else []
+    nvme_rows = _read_csv(date_dir / "nvme.csv") if date_dir else []
 
     # 每盘取最新一行
     latest_disks: dict[tuple, dict] = {}
@@ -477,6 +492,33 @@ def build_status() -> dict:
         for v in vd_rows
     ]
 
+    # NVMe 直连盘（每分钟追加，按设备取最新一行）
+    latest_nvme: dict[str, dict] = {}
+    for row in nvme_rows:
+        dev = str(row.get("device", "")).strip()
+        if dev:
+            latest_nvme[dev] = row
+    nvme_disks = []
+    for dev, row in sorted(latest_nvme.items()):
+        nvme_disks.append(
+            {
+                "device": dev,
+                "model": row.get("model", ""),
+                "serial": row.get("serial", ""),
+                "firmware": row.get("firmware", ""),
+                "size": _fmt_bytes(row.get("size_bytes"), 1000),
+                "used": _fmt_bytes(row.get("used_bytes"), 1000),
+                "temperature": _to_int(row.get("temperature")),
+                "available_spare": _to_int(row.get("available_spare")),
+                "percentage_used": _to_int(row.get("percentage_used")),
+                "critical_warning": str(row.get("critical_warning", "")).strip(),
+                "power_on_hours": _to_int(row.get("power_on_hours")),
+                "power_cycles": _to_int(row.get("power_cycles")),
+                "unsafe_shutdowns": _to_int(row.get("unsafe_shutdowns")),
+                "media_errors": _to_int(row.get("media_errors")),
+            }
+        )
+
     pr = patrol_rows[-1] if patrol_rows else {}
     cc = cc_rows[-1] if cc_rows else {}
     maintenance = {
@@ -544,6 +586,7 @@ def build_status() -> dict:
         "controller": controller,
         "virtual_disks": virtual_disks,
         "physical_disks": physical_disks,
+        "nvme_disks": nvme_disks,
         "maintenance": maintenance,
         "system": system,
     }
@@ -882,29 +925,41 @@ def api_disk_smart():
         return jsonify(error="参数非法"), 400
     status = build_status()
     did = None
+    found = False
     for d in status["physical_disks"]:
         if d["eid"] == eid and d["slot"] == slot:
+            found = True
             did = d.get("did")
             break
-    if did is None:
-        return jsonify(error="未找到该磁盘或 DID 未知"), 404
-    try:
-        proc = subprocess.run(
-            f"sudo {SMARTCTL} -a -d megaraid,{did} {_smart_base_device()}",
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        output = proc.stdout or proc.stderr
-        if not output.strip():
-            return jsonify(error="smartctl 无输出"), 500
-        parsed = parse_smart_output(output)
-        return jsonify(output=output, attrs=parsed["attrs"], scsi=parsed["scsi"])
-    except FileNotFoundError:
-        return jsonify(error=f"smartctl 不存在: {SMARTCTL}"), 500
-    except subprocess.TimeoutExpired:
-        return jsonify(error="smartctl 执行超时"), 500
+    if not found:
+        return jsonify(error="未找到该磁盘"), 404
+
+    # 先尝试 smartctl 透传（仅对已组阵列、有有效 DID 的盘可靠）
+    if did is not None:
+        try:
+            proc = subprocess.run(
+                f"sudo {SMARTCTL} -a -d megaraid,{did} {_smart_base_device()}",
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            output = proc.stdout or proc.stderr
+            if output.strip():
+                parsed = parse_smart_output(output)
+                if parsed["attrs"] or parsed["scsi"]:
+                    return jsonify(output=output, attrs=parsed["attrs"], scsi=parsed["scsi"])
+        except FileNotFoundError:
+            pass
+        except subprocess.TimeoutExpired:
+            pass
+
+    # smartctl 无法获取结构化数据（如 UGood/JBOD 未组阵列盘），改用 storcli 读原始 SMART
+    hex_str = _storcli_smart_hex(eid, slot)
+    if hex_str:
+        attrs = parse_smart_hex(hex_str)
+        return jsonify(output=f"[storcli 原始 SMART 数据]\n{hex_str}", attrs=attrs, scsi={})
+    return jsonify(error="无法获取该磁盘的 SMART 数据"), 500
 
 
 # ---- 存储管理 API ----
@@ -1359,6 +1414,146 @@ def parse_smart_output(output: str) -> dict:
     return {"attrs": attrs, "scsi": scsi}
 
 
+# ATA SMART 属性 ID → 名称映射（用于解析 storcli 返回的原始 SMART 字节串）
+_ATA_SMART_ATTRS = {
+    1: "Raw_Read_Error_Rate",
+    2: "Throughput_Performance",
+    3: "Spin_Up_Time",
+    4: "Start_Stop_Count",
+    5: "Reallocated_Sector_Ct",
+    7: "Seek_Error_Rate",
+    8: "Seek_Time_Performance",
+    9: "Power_On_Hours",
+    10: "Spin_Retry_Count",
+    12: "Power_Cycle_Count",
+    13: "Soft_Read_Error_Rate",
+    170: "Available_Reservd_Space",
+    171: "Program_Fail_Count",
+    172: "Erase_Fail_Count",
+    173: "Wear_Leveling_Count",
+    174: "Unexpected_Power_Loss",
+    175: "Program_Fail_Count_Chip",
+    177: "Wear_Range_Delta",
+    178: "Used_Rsvd_Blk_Cnt",
+    179: "Used_Rsvd_Blk_Cnt_Tot",
+    180: "Unused_Rsvd_Blk_Cnt",
+    181: "Program_Fail_Cnt_Total",
+    182: "Erase_Fail_Count",
+    183: "SATA_Downshift_Count",
+    184: "End-to-End_Error",
+    185: "Head_Stability",
+    186: "Induced_Op-Vibration",
+    187: "Reported_Uncorrect",
+    188: "Command_Timeout",
+    189: "High_Fly_Writes",
+    190: "Airflow_Temperature_Cel",
+    191: "G-Sense_Error_Rate",
+    192: "Power-Off_Retract_Count",
+    193: "Load_Cycle_Count",
+    194: "Temperature_Celsius",
+    195: "Hardware_ECC_Recovered",
+    196: "Reallocated_Event_Count",
+    197: "Current_Pending_Sector",
+    198: "Offline_Uncorrectable",
+    199: "UDMA_CRC_Error_Count",
+    200: "Multi_Zone_Error_Rate",
+    201: "Soft_Read_Error_Rate",
+    202: "Data_Address_Mark_Errs",
+    203: "Run_Out_Cancel",
+    204: "Soft_ECC_Correction",
+    205: "Thermal_Asperity_Rate",
+    206: "Flying_Height",
+    207: "Spin_High_Current",
+    208: "Spin_Buzz",
+    209: "Offline_Seek_Performance",
+    220: "Disk_Shift",
+    221: "G-Sense_Error_Rate",
+    222: "Loaded_Hours",
+    223: "Load_Retry_Count",
+    224: "Load_Friction",
+    225: "Load_Unload_Retry_Count",
+    226: "Load-In_Time",
+    227: "Torque_Amplification_Count",
+    228: "Power-Off_Retract_Count",
+    229: "Head_Flying_Hours",
+    230: "Life_Left_SSD",
+    231: "Life_Left",
+    232: "Available_Reservd_Space",
+    233: "Media_Wearout_Indicator",
+    234: "Average_Erase_Count",
+    235: "Good_Block_Count",
+    240: "Head_Flying_Hours",
+    241: "Total_LBAs_Written",
+    242: "Total_LBAs_Read",
+    243: "Total_NAND_Writes",
+    244: "Thermal_Throttle",
+    245: "Timed_Workload_Media_Wear",
+    246: "Timed_Workload_Host_Reads",
+    247: "Timed_Workload_Timer",
+}
+
+
+def parse_smart_hex(hex_str: str) -> list[dict]:
+    """解析 storcli `show smart` 返回的原始 ATA SMART 字节串（hex）为属性列表。
+
+    ATA SMART Read Data 结构：前 2 字节为版本号，之后每 12 字节一个属性
+    （ID/flags/value/worst/raw6），raw 为 6 字节小端。
+    """
+    attrs = []
+    cleaned = re.sub(r"[^0-9a-fA-F]", "", hex_str or "")
+    if len(cleaned) < 4:
+        return attrs
+    try:
+        raw = bytes.fromhex(cleaned)
+    except ValueError:
+        return attrs
+    for off in range(2, min(len(raw) - 11, 2 + 30 * 12), 12):
+        aid = raw[off]
+        if aid == 0:
+            continue
+        flags = raw[off + 1] | (raw[off + 2] << 8)
+        value = raw[off + 3]
+        worst = raw[off + 4]
+        raw_val = int.from_bytes(raw[off + 5 : off + 11], "little")
+        attrs.append(
+            {
+                "id": aid,
+                "name": _ATA_SMART_ATTRS.get(aid, f"Unknown_Attribute_{aid}"),
+                "value": value,
+                "worst": worst,
+                "thresh": 0,
+                "type": "Pre-fail" if flags & 0x01 else "Old_age",
+                "updated": "Always" if flags & 0x02 else "Offline",
+                "raw": str(raw_val),
+            }
+        )
+    return attrs
+
+
+def _storcli_smart_hex(eid: int, slot: int) -> str | None:
+    """通过 storcli 读取指定物理盘（含未组阵列的 UGood/JBOD 盘）的原始 SMART 数据。"""
+    try:
+        proc = subprocess.run(
+            f"sudo {STORCLI} {CONTROLLER}/e{eid}/s{slot} show smart J",
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        output = proc.stdout.strip()
+        json_start = output.find("{")
+        if json_start == -1:
+            return None
+        data = json.loads(output[json_start:])
+        resp = data["Controllers"][0].get("Response Data", {})
+        for val in resp.values():
+            if isinstance(val, str) and val.strip():
+                return val
+    except Exception:
+        pass
+    return None
+
+
 # ---- RAID 维护操作 ----
 
 RAID_ACTIONS = {
@@ -1375,6 +1570,12 @@ RAID_ACTIONS = {
     "vd_init": {
         "start": "{ctrl}/v{vd} start init",
         "stop": "{ctrl}/v{vd} stop init",
+    },
+    "vd_delete": {
+        "delete": "{ctrl}/v{vd} del force",
+    },
+    "vd_import": {
+        "import": "{ctrl}/fall import",
     },
 }
 
@@ -1705,8 +1906,8 @@ def api_raid_create():
         return jsonify(ok=False, error="RAID10 需要偶数块盘"), 400
     if extra == "mult3" and n % 3 != 0:
         return jsonify(ok=False, error="RAID50 盘数需为 3 的倍数（每个 RAID5 子组 3 块盘）"), 400
-    if name and not re.fullmatch(r"[\w .-]{1,32}", name):
-        return jsonify(ok=False, error="阵列名称仅支持字母数字/空格/._-，最长 32 字符"), 400
+    if name and not re.fullmatch(r"[\w .-]{1,15}", name):
+        return jsonify(ok=False, error="阵列名称仅支持字母数字/空格/._-，最长 15 字符"), 400
 
     # 校验每块盘存在且处于未配置状态（UGood/JBOD）
     status = build_status()
@@ -1739,12 +1940,14 @@ def api_raid_create():
     if len(set(specs)) != len(specs):
         return jsonify(ok=False, error="磁盘列表有重复"), 400
 
-    cmd = f"{CONTROLLER} add vd r{level} drives={','.join(specs)}"
+    # storcli add vd 语法要求参数顺序为：r<level> [name=...] drives=... [PDperArray=...]
+    cmd = f"{CONTROLLER} add vd r{level}"
+    if name:
+        cmd += f" name={name}"
+    cmd += f" drives={','.join(specs)}"
     if level == "50":
         # RAID50 必须指定每个 RAID5 子组的盘数，固定为 3（盘数已校验为 3 的倍数）
         cmd += " pdperarray=3"
-    if name:
-        cmd += f" names={name}"
     ok, msg = _run_storcli(cmd)
     if ok:
         lsi_alert.log_event(
