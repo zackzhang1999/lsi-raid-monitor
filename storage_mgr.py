@@ -115,7 +115,9 @@ def list_devices() -> list[dict]:
         root_names.add(src)
         root_names.add(os.path.basename(src))
     raid_disks = _raid_disk_names()
-    return [_normalize(d, raid_disks, root_names) for d in _lsblk()]
+    # loop 设备为内核环回设备（如 snap 镜像挂载），不属磁盘管理范围，予以过滤
+    devices = [d for d in _lsblk() if str(d.get("type", "")).lower() != "loop"]
+    return [_normalize(d, raid_disks, root_names) for d in devices]
 
 
 def _find_device(path: str) -> dict | None:

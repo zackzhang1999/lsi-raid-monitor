@@ -76,6 +76,9 @@ DISK_ACTIONS = {
     "jbod": "set jbod",
     "locate_start": "start locate",
     "locate_stop": "stop locate",
+    "hotspare_global": "add hotsparedrive",
+    "hotspare_dedicated": "add hotsparedrive",  # 专用热备，后面拼 DGs=N
+    "hotspare_delete": "delete hotsparedrive",
 }
 
 # ---- 定位灯状态（storcli 无可靠回读接口，由本服务跟踪 locate_start/stop）----
@@ -898,8 +901,14 @@ def api_disk_action():
     action = str(data.get("action", ""))
     if eid is None or slot is None or action not in DISK_ACTIONS:
         return jsonify(ok=False, error="参数非法"), 400
+    cmd_suffix = DISK_ACTIONS[action]
+    if action == "hotspare_dedicated":
+        dg = _to_int(data.get("dg"))
+        if dg is None:
+            return jsonify(ok=False, error="请指定磁盘组(DG)编号"), 400
+        cmd_suffix += f" DGs={dg}"
     ok, msg = _run_storcli(
-        f"{CONTROLLER}/e{eid}/s{slot} {DISK_ACTIONS[action]}"
+        f"{CONTROLLER}/e{eid}/s{slot} {cmd_suffix}"
     )
     label = f"E{eid}:S{slot}"
     if ok:

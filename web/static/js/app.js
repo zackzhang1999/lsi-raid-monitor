@@ -105,7 +105,7 @@ const state = {
 };
 
 const HEALTH_TEXT = { ok: '正常', warn: '警告', crit: '严重', unknown: '未知' };
-const BADGE_OK_STATES = ['onln', 'optl', 'optimal', 'ok', 'online', 'good', 'ugood', 'jbod'];
+const BADGE_OK_STATES = ['onln', 'optl', 'optimal', 'ok', 'online', 'good', 'ugood', 'jbod', 'ghs', 'dhs'];
 const BADGE_CRIT_STATES = ['ubad', 'failed', 'fail', 'degraded', 'dead', 'offline', 'offln', 'missing'];
 
 function stateTone(s) {
@@ -748,7 +748,10 @@ function renderPhysicalDisks(st) {
         <option value="good">置为 UGood</option>
         <option value="jbod">置为 JBOD</option>
         <option value="locate_start">定位开</option>
-        <option value="locate_stop">定位关</option>`;
+        <option value="locate_stop">定位关</option>
+        <option value="hotspare_global">设为全局热备</option>
+        <option value="hotspare_dedicated">设为专用热备</option>
+        <option value="hotspare_delete">删除热备</option>`;
       sel.addEventListener('change', () => {
         const action = sel.value;
         sel.value = '';
@@ -804,18 +807,34 @@ const DISK_ACTION_TEXT = {
   jbod: ['置为 JBOD', '将磁盘置为 JBOD 直通模式，磁盘上的阵列配置信息可能被清除。'],
   locate_start: ['定位开', '点亮磁盘定位指示灯。'],
   locate_stop: ['定位关', '熄灭磁盘定位指示灯。'],
+  hotspare_global: ['设为全局热备', '将该磁盘设为全局热备盘，可接管任意磁盘组的故障盘。'],
+  hotspare_dedicated: ['设为专用热备', '将该磁盘设为指定磁盘组的专用热备盘，仅接管该磁盘组的故障盘。'],
+  hotspare_delete: ['删除热备', '移除该磁盘的热备盘属性。'],
 };
 const DANGER_ACTIONS = ['offline', 'good', 'jbod'];
 
 function diskAction(d, action) {
   const [text, desc] = DISK_ACTION_TEXT[action] || [action, ''];
   const label = d.label || ('E' + d.eid + ':S' + d.slot);
-  const doIt = async () => {
-    const r = await api('/api/disk_action', { method: 'POST', body: { eid: d.eid, slot: d.slot, action } });
+  const doIt = async (extraBody) => {
+    const r = await api('/api/disk_action', { method: 'POST', body: { eid: d.eid, slot: d.slot, action, ...(extraBody || {}) } });
     if (r && r.ok === false) throw new Error(r.error || '操作失败');
     toast(`磁盘 ${label}：${text} 已执行`, 'ok');
     await loadStatus();
   };
+  if (action === 'hotspare_dedicated') {
+    confirmModal(`${text}`,
+      `<p>磁盘 <strong class="mono">${esc(label)}</strong>（${esc(d.model || '')}）</p>
+       <p>${esc(desc)}</p>
+       <div class="field"><label for="hs-dg">目标磁盘组 (DG) 编号</label>
+       <input class="input" id="hs-dg" type="number" min="0" value="0" /></div>`,
+      '确认执行', false, async () => {
+        const v = ($('#hs-dg').value || '').trim();
+        if (!/^\d+$/.test(v)) throw new Error('请输入有效的 DG 编号');
+        await doIt({ dg: Number(v) });
+      });
+    return;
+  }
   if (DANGER_ACTIONS.includes(action)) {
     confirmModal(`危险操作：${text}`,
       `<p>磁盘 <strong class="mono">${esc(label)}</strong>（${esc(d.model || '')}）</p>

@@ -383,19 +383,32 @@ def _smart_base_device() -> str:
     return "/dev/sda"
 
 
-def collect_smart(dids: list[int]) -> list[dict]:
-    """通过 smartctl 采集 SMART 属性，兼容 SATA (ATA) 和 SAS (SCSI) 磁盘"""
+def collect_smart(disks: list[dict]) -> list[dict]:
+    """通过 smartctl 采集 SMART 属性，兼容 SATA (ATA) 和 SAS (SCSI) 磁盘。
+
+    smartctl 透传偶发失败（INQUIRY failed）时，回退到 storcli 读取原始
+    SMART hex，避免 power_on_hours 等字段被错误地记为 0。
+    """
     result = []
-    for did in dids:
+    for d in disks:
+        did = d.get("did")
+        eid = d.get("eid")
+        slot = d.get("slot")
+        if did in (None, ""):
+            continue
         try:
-            cmd = f"sudo {SMARTCTL} -a -d megaraid,{did} {_smart_base_device()}"
+            did_int = int(did)
+        except (ValueError, TypeError):
+            continue
+        try:
+            cmd = f"sudo {SMARTCTL} -a -d megaraid,{did_int} {_smart_base_device()}"
             proc = subprocess.run(
                 cmd, shell=True, capture_output=True, text=True, timeout=20
             )
             output = proc.stdout
 
             smart = {
-                "did": did,
+                "did": did_int,
                 "reallocated": 0,
                 "pending": 0,
                 "uncorrectable": 0,
@@ -429,6 +442,24 @@ def collect_smart(dids: list[int]) -> list[dict]:
             if smart["power_on_hours"] == 0:
                 _parse_ata_table(output, smart)
 
+            # smartctl 透传失败（未解析出通电时长）时，回退 storcli 原始 SMART
+            if smart["power_on_hours"] == 0 and eid is not None and slot is not None:
+                hex_str = _storcli_smart_hex(int(eid), int(slot))
+                if hex_str:
+                    raws = _parse_smart_hex_raw(hex_str)
+                    smart["reallocated"] = max(smart["reallocated"], raws.get(5, 0))
+                    smart["reported_uncorrectable"] = raws.get(187, 0)
+                    smart["command_timeout"] = raws.get(188, 0)
+                    smart["pending"] = raws.get(197, 0)
+                    smart["uncorrectable"] = max(
+                        smart["uncorrectable"], raws.get(198, 0)
+                    )
+                    smart["power_on_hours"] = max(
+                        smart["power_on_hours"], raws.get(9, 0)
+                    )
+                    if smart["smart_temp"] is None:
+                        smart["smart_temp"] = raws.get(194)
+
             result.append(smart)
 
         except Exception as e:
@@ -436,7 +467,7 @@ def collect_smart(dids: list[int]) -> list[dict]:
                 f"[{datetime.now():%H:%M:%S}] smartctl DID={did} error: {e}",
                 file=sys.stderr,
             )
-            result.append({"did": did, "reallocated": -1})
+            result.append({"did": did_int, "reallocated": -1})
 
     return result
 
@@ -475,6 +506,53 @@ def _parse_ata_table(output: str, smart: dict):
             smart["power_on_hours"] = max(smart.get("power_on_hours", 0), raw)
         elif aid == 194 and smart["smart_temp"] is None:
             smart["smart_temp"] = raw
+
+
+def _storcli_smart_hex(eid: int, slot: int) -> str | None:
+    """storcli 读取物理盘原始 SMART hex（smartctl 透传失败时的兜底）。"""
+    try:
+        proc = subprocess.run(
+            f"sudo {STORCLI} {CONTROLLER}/e{eid}/s{slot} show smart J",
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        output = proc.stdout.strip()
+        json_start = output.find("{")
+        if json_start == -1:
+            return None
+        data = json.loads(output[json_start:])
+        resp = data["Controllers"][0].get("Response Data", {})
+        for val in resp.values():
+            if isinstance(val, str) and val.strip():
+                return val
+    except Exception:
+        pass
+    return None
+
+
+def _parse_smart_hex_raw(hex_str: str) -> dict[int, int]:
+    """解析 storcli 原始 ATA SMART hex，返回 {属性ID: raw值}。
+
+    ATA SMART Read Data：前 2 字节版本号，之后每 12 字节一个属性
+    （ID/flags/value/worst/raw6），raw 为 6 字节小端。
+    """
+    result: dict[int, int] = {}
+    cleaned = re.sub(r"[^0-9a-fA-F]", "", hex_str or "")
+    if len(cleaned) < 4:
+        return result
+    try:
+        raw = bytes.fromhex(cleaned)
+    except ValueError:
+        return result
+    for off in range(2, min(len(raw) - 11, 2 + 30 * 12), 12):
+        aid = raw[off]
+        if aid == 0:
+            continue
+        raw_val = int.from_bytes(raw[off + 5 : off + 11], "little")
+        result[aid] = raw_val
+    return result
 
 
 # ---- NVMe 磁盘（直连 PCIe/U.2，不经 MegaRAID）----
@@ -1044,13 +1122,8 @@ def _run_collection(now: datetime, force: bool = False):
     # 避免服务重启/跨天后页面上通电时长等 SMART 字段长时间为 0）
     smart_file_missing = not (date_dir / "smart.csv").exists()
     if disks and (force or minute % 15 == 0 or smart_file_missing):
-        dids = sorted(
-            set(
-                int(d["did"]) for d in disks if d.get("did") not in (None, "")
-            )
-        )
-        if dids:
-            smart_data = collect_smart(dids)
+        smart_data = collect_smart(disks)
+        if smart_data:
             for s in smart_data:
                 s["timestamp"] = timestamp
             write_csv_once(date_dir, "smart.csv", smart_fields, smart_data)
