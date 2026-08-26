@@ -677,6 +677,19 @@ function pdRaidEligible(d) {
   return d.state === 'UGood' || d.state === 'JBOD';
 }
 
+function bgProgressCell(d, key) {
+  const p = Number(d[key + '_progress']);
+  if (d[key + '_progress'] == null || d[key + '_progress'] === '' || isNaN(p)) return '';
+  const pct = Math.max(0, Math.min(100, p));
+  const eta = d[key + '_eta'];
+  const title = key === 'copyback' ? 'Copyback 回拷中' : 'Rebuild 重建中';
+  const cls = key === 'copyback' ? 'rebuild-progress cb' : 'rebuild-progress';
+  return `<div class="${cls}" title="${title}">
+    <div class="rb-bar"><i style="width:${pct}%"></i></div>
+    <span class="rb-pct">${pct}%</span>${eta ? `<span class="rb-eta">${esc(eta)}</span>` : ''}
+  </div>`;
+}
+
 function renderPhysicalDisks(st) {
   const disks = st.physical_disks || [];
   const tb = $('#pd-table tbody');
@@ -711,7 +724,7 @@ function renderPhysicalDisks(st) {
       <td class="num">${esc(d.sn || '—')}</td>
       <td class="num">${esc(d.fw_rev || '—')}</td>
       <td class="num">${d.dg != null ? esc(d.dg) : '—'}</td>
-      <td>${stateBadge(d.state)}</td>
+      <td>${stateBadge(d.state)}${bgProgressCell(d, 'rebuild')}${bgProgressCell(d, 'copyback')}</td>
       <td class="num">${fmtTemp(d.temperature)}</td>
       <td class="num">${num0(d.media_error)}/${num0(d.other_error)}/${num0(d.predictive_failure)}</td>
       <td class="num">${num0(d.reallocated)}/${num0(d.pending)}/${num0(d.uncorrectable)}</td>
@@ -754,7 +767,9 @@ function renderPhysicalDisks(st) {
         <option value="locate_stop">定位关</option>
         <option value="hotspare_global">设为全局热备</option>
         <option value="hotspare_dedicated">设为专用热备</option>
-        <option value="hotspare_delete">删除热备</option>`;
+        <option value="hotspare_delete">删除热备</option>
+        <option value="copyback_start">启动 Copyback</option>
+        <option value="copyback_stop">停止 Copyback</option>`;
       sel.addEventListener('change', () => {
         const action = sel.value;
         sel.value = '';
@@ -813,6 +828,8 @@ const DISK_ACTION_TEXT = {
   hotspare_global: ['设为全局热备', '将该磁盘设为全局热备盘，可接管任意磁盘组的故障盘。'],
   hotspare_dedicated: ['设为专用热备', '将该磁盘设为指定磁盘组的专用热备盘，仅接管该磁盘组的故障盘。'],
   hotspare_delete: ['删除热备', '移除该磁盘的热备盘属性。'],
+  copyback_start: ['启动 Copyback', '将当前盘的数据回拷到指定目标盘（替换盘）。请确认目标盘已插入且状态正确。'],
+  copyback_stop: ['停止 Copyback', '停止当前盘正在进行的 Copyback 回拷操作。'],
 };
 const DANGER_ACTIONS = ['offline', 'good', 'jbod'];
 
@@ -835,6 +852,20 @@ function diskAction(d, action) {
         const v = ($('#hs-dg').value || '').trim();
         if (!/^\d+$/.test(v)) throw new Error('请输入有效的 DG 编号');
         await doIt({ dg: Number(v) });
+      });
+    return;
+  }
+  if (action === 'copyback_start') {
+    confirmModal(`${text}`,
+      `<p>源盘 <strong class="mono">${esc(label)}</strong>（${esc(d.model || '')}）</p>
+       <p>${esc(desc)}</p>
+       <div class="field"><label for="cb-target">目标盘 (e:s)</label>
+       <input class="input" id="cb-target" type="text" placeholder="例如 134:2" /></div>`,
+      '确认执行', false, async () => {
+        const v = ($('#cb-target').value || '').trim();
+        const m = v.match(/^(\d+):(\d+)$/);
+        if (!m) throw new Error('请输入有效的目标盘 e:s（如 134:2）');
+        await doIt({ target_eid: Number(m[1]), target_slot: Number(m[2]) });
       });
     return;
   }

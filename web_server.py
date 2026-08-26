@@ -79,6 +79,8 @@ DISK_ACTIONS = {
     "hotspare_global": "add hotsparedrive",
     "hotspare_dedicated": "add hotsparedrive",  # 专用热备，后面拼 DGs=N
     "hotspare_delete": "delete hotsparedrive",
+    "copyback_start": "start copyback",  # 后面拼 target=e:s
+    "copyback_stop": "stop copyback",
 }
 
 # ---- 定位灯状态（storcli 无可靠回读接口，由本服务跟踪 locate_start/stop）----
@@ -455,6 +457,10 @@ def build_status() -> dict:
                 "predictive_failure": _to_int(row.get("predictive_failure"), 0),
                 "smart_alert": row.get("smart_alert", ""),
                 "shield_counter": _to_int(row.get("shield_counter"), 0),
+                "rebuild_progress": _to_int(row.get("rebuild_progress")),
+                "rebuild_eta": row.get("rebuild_eta", ""),
+                "copyback_progress": _to_int(row.get("copyback_progress")),
+                "copyback_eta": row.get("copyback_eta", ""),
                 "locate": f"{eid}:{slot}" in locate_state,
                 "dev_speed": attr.get("dev_speed", ""),
                 "link_speed": attr.get("link_speed", ""),
@@ -907,6 +913,12 @@ def api_disk_action():
         if dg is None:
             return jsonify(ok=False, error="请指定磁盘组(DG)编号"), 400
         cmd_suffix += f" DGs={dg}"
+    if action == "copyback_start":
+        teid = _to_int(data.get("target_eid"))
+        tslot = _to_int(data.get("target_slot"))
+        if teid is None or tslot is None:
+            return jsonify(ok=False, error="请指定 copyback 目标盘(e:s)"), 400
+        cmd_suffix += f" target={teid}:{tslot}"
     ok, msg = _run_storcli(
         f"{CONTROLLER}/e{eid}/s{slot} {cmd_suffix}"
     )

@@ -87,11 +87,55 @@ def _response_data(data: dict | None) -> dict | None:
 # ---- 磁盘采集 ----
 
 
+def _collect_drive_bg_progress(cmd: str) -> dict[tuple[int, int], dict]:
+    """采集各物理盘后台操作进度（rebuild/copyback），返回
+    {(eid, slot): {"progress": int|None, "eta": str}}"""
+    data = run_storcli(f"{CONTROLLER}/eall/sall {cmd} J")
+    if not is_success(data):
+        return {}
+    result: dict[tuple[int, int], dict] = {}
+    try:
+        resp = data["Controllers"][0].get("Response Data", [])
+        for item in resp:
+            if not isinstance(item, dict):
+                continue
+            m = re.match(r"/c\d+/e(\d+)/s(\d+)", str(item.get("Drive-ID", "")))
+            if not m:
+                continue
+            if str(item.get("Status", "")).lower() != "in progress":
+                continue
+            progress = item.get("Progress%")
+            try:
+                progress = int(progress)
+            except (ValueError, TypeError):
+                progress = None
+            result[(int(m.group(1)), int(m.group(2)))] = {
+                "progress": progress,
+                "eta": str(item.get("Estimated Time Left", "")).strip(),
+            }
+    except Exception as e:
+        print(
+            f"[{datetime.now():%H:%M:%S}] {cmd} parse error: {e}", file=sys.stderr
+        )
+    return result
+
+
+def collect_rebuild() -> dict[tuple[int, int], dict]:
+    return _collect_drive_bg_progress("show rebuild")
+
+
+def collect_copyback() -> dict[tuple[int, int], dict]:
+    return _collect_drive_bg_progress("show copyback")
+
+
 def collect_disks() -> list[dict]:
     data = run_storcli(f"{CONTROLLER}/eall/sall show all J")
     resp = _response_data(data)
     if not resp:
         return []
+
+    rebuild_map = collect_rebuild()
+    copyback_map = collect_copyback()
 
     disks = []
     try:
@@ -123,6 +167,8 @@ def collect_disks() -> list[dict]:
             if temp is None:
                 temp = _find_temperature(detail)
 
+            rb = rebuild_map.get((eid, slot), {})
+            cb = copyback_map.get((eid, slot), {})
             disks.append(
                 {
                     "eid": eid,
@@ -144,6 +190,10 @@ def collect_disks() -> list[dict]:
                         state.get("S.M.A.R.T alert flagged by drive", "No")
                     ).strip(),
                     "shield_counter": _to_int(state.get("Shield Counter", 0)),
+                    "rebuild_progress": rb.get("progress", ""),
+                    "rebuild_eta": rb.get("eta", ""),
+                    "copyback_progress": cb.get("progress", ""),
+                    "copyback_eta": cb.get("eta", ""),
                 }
             )
 
@@ -189,6 +239,10 @@ def _append_failed_drives(data: dict | None, disks: list[dict]):
                     "predictive_failure": 0,
                     "smart_alert": "",
                     "shield_counter": 0,
+                    "rebuild_progress": "",
+                    "rebuild_eta": "",
+                    "copyback_progress": "",
+                    "copyback_eta": "",
                 }
             )
     except Exception:
@@ -948,6 +1002,10 @@ def _run_collection(now: datetime, force: bool = False):
         "predictive_failure",
         "smart_alert",
         "shield_counter",
+        "rebuild_progress",
+        "rebuild_eta",
+        "copyback_progress",
+        "copyback_eta",
     ]
     ctrl_fields = [
         "timestamp",
