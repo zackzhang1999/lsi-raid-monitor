@@ -96,6 +96,7 @@ const state = {
   fsUsage: null,
   showHiddenFs: false,
   ctlLines: 100,
+  ctlQuery: '',
   storageLoaded: false,
   usersLoaded: false,
   nfsLoaded: false,
@@ -235,6 +236,8 @@ async function afterLogin() {
   hideLogin();
   // 角色相关可见性
   $('#nav-users').classList.toggle('hidden', !state.isAdmin);
+  // 未创建管理员账号时的安全提示横幅
+  $('#security-banner').classList.toggle('hidden', state.authRequired);
   $('#btn-collect').classList.toggle('hidden', !state.isAdmin);
   $('#btn-vd-import').classList.toggle('hidden', !state.isAdmin);
   $('#btn-logout').classList.toggle('hidden', !state.authRequired);
@@ -1555,6 +1558,12 @@ async function createUser(ev) {
     toast('用户已创建', 'ok');
     $('#user-form').reset();
     await loadUsers();
+    // 创建第一个管理员后认证即时启用：刷新状态并隐藏提示横幅，未登录则弹出登录框
+    const me = await api('/api/me');
+    state.me = me;
+    state.authRequired = !!me.auth_required;
+    $('#security-banner').classList.toggle('hidden', state.authRequired);
+    if (me.auth_required && !me.logged_in) { showLogin(); }
   } catch (e) {
     toast(e.message, 'error');
   } finally {
@@ -1581,6 +1590,17 @@ function switchView(v) {
 function bindUI() {
   // 侧边栏导航
   $$('.nav-btn').forEach(b => b.addEventListener('click', () => switchView(b.dataset.view)));
+
+  // 未启用认证安全提示：点击跳转到用户管理页创建管理员
+  const gotoCreateUser = () => {
+    switchView('users');
+    const u = $('#nu-username');
+    if (u) setTimeout(() => u.focus(), 50);
+  };
+  $('#security-banner').addEventListener('click', gotoCreateUser);
+  $('#security-banner').addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); gotoCreateUser(); }
+  });
   $('#btn-sidebar').addEventListener('click', () => {
     const sb = $('#sidebar');
     if (window.innerWidth <= 860) {
@@ -1669,6 +1689,14 @@ function bindUI() {
     loadCtlEvents();
   }));
   $('#btn-ctl-refresh').addEventListener('click', loadCtlEvents);
+  let ctlSearchTimer = null;
+  $('#ctl-search').addEventListener('input', () => {
+    clearTimeout(ctlSearchTimer);
+    ctlSearchTimer = setTimeout(() => {
+      state.ctlQuery = $('#ctl-search').value.trim();
+      loadCtlEvents();
+    }, 300);
+  });
   $('#btn-log-download').addEventListener('click', downloadLogs);
   $('#btn-ctl-copy').addEventListener('click', async () => {
     try {
@@ -2060,9 +2088,11 @@ async function downloadLogs() {
 async function loadCtlEvents() {
   const pre = $('#ctl-pre');
   try {
-    const d = await api('/api/controller_events?lines=' + state.ctlLines);
+    const q = encodeURIComponent(state.ctlQuery || '');
+    const d = await api('/api/controller_events?lines=' + state.ctlLines + (q ? '&q=' + q : ''));
     pre.textContent = d.output || '（无输出）';
-    $('#ctl-total').textContent = d.total_lines != null ? `共 ${d.total_lines} 行` : '';
+    $('#ctl-total').textContent = d.total_lines != null
+      ? (state.ctlQuery ? `匹配 ${d.total_lines} 行` : `共 ${d.total_lines} 行`) : '';
   } catch (e) {
     pre.textContent = '加载失败：' + e.message;
   }

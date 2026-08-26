@@ -1718,6 +1718,7 @@ _events_cache: dict = {"ts": 0.0, "data": None}
 @login_required
 def api_controller_events():
     lines = min(_to_int(request.args.get("lines"), 200) or 200, 1000)
+    q = (request.args.get("q") or "").strip()
     now = time.time()
     if _events_cache["data"] is not None and now - _events_cache["ts"] < 60:
         text = _events_cache["data"]
@@ -1733,8 +1734,14 @@ def api_controller_events():
         if ln.startswith(("Description =", "Events =", "Controller Properties", "Status =", "CLI Version", "Operating system", "Controller =")):
             all_lines = all_lines[:i]
             break
-    tail = all_lines[-lines:]
-    return jsonify(output="\n".join(tail), total_lines=len(all_lines))
+    # 关键字筛选：大小写不敏感，空格分隔多个关键字，任一匹配即保留
+    if q:
+        keys = [k.lower() for k in q.split() if k]
+        matched = [ln for ln in all_lines if any(k in ln.lower() for k in keys)]
+    else:
+        matched = all_lines
+    tail = matched[-lines:]
+    return jsonify(output="\n".join(tail), total_lines=len(matched))
 
 
 def _run_storcli_text(args: str, timeout: int = 60) -> tuple[bool, str]:

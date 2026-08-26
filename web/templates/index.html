@@ -90,6 +90,16 @@
         </div>
       </header>
 
+      <!-- 未启用认证安全提示 -->
+      <div class="security-banner hidden" id="security-banner" role="button" tabindex="0">
+        <span class="sec-glyph">⚠</span>
+        <span class="sec-text">
+          <strong>尚未创建管理员账号，系统未启用身份验证。</strong>
+          当前任何人访问本页面均可查看并执行存储操作，存在数据安全风险。
+        </span>
+        <button class="btn sm" id="btn-sec-create" type="button">立即创建管理员</button>
+      </div>
+
       <section class="content">
         <!-- ============ 监控概览 ============ -->
         <div class="view" id="view-overview">
@@ -492,6 +502,7 @@
               </div>
             </div>
             <div class="ctl-toolbar">
+              <input class="input sm" id="ctl-search" type="search" placeholder="关键字筛选，空格分隔" />
               <button class="btn sm" id="btn-ctl-refresh">刷新</button>
               <button class="btn sm ghost" id="btn-ctl-copy">复制</button>
               <span class="tiny" id="ctl-total"></span>
