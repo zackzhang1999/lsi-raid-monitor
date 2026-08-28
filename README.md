@@ -35,7 +35,7 @@ UI 基于 google-design 设计体系（DM Sans / JetBrains Mono，浅色主色 `
 
 本系统部署在装有 LSI/Broadcom MegaRAID 阵列卡的服务器上，通过官方命令行工具 `storcli64` 与 `smartmontools` 的 `smartctl` 持续采集：
 
-- **物理磁盘**：槽位、型号、序列号、固件、状态（Onln/UGood/JBOD/Failed…）、温度、介质错误/其他错误/预测性故障计数、SMART 告警位、重建（rebuild）/回拷（copyback）进度；
+- **物理磁盘**：槽位、型号、序列号、固件、状态（Onln/UGood/JBOD/Failed…）、温度、介质错误/其他错误/预测性故障计数、SMART 告警位、重建（rebuild）/回拷（copyback）/安全擦除（erase）进度；
 - **控制器**：型号、固件版本、健康状态、ROC 温度、BBU/CacheVault 状态与温度；
 - **虚拟磁盘**：DG/VD、RAID 级别、容量、状态、OS 设备名、写缓存、成员盘清单；
 - **SMART 关键属性**：重映射扇区(5)、待定扇区(197)、无法纠正扇区(198)、上报不可纠正(187)、命令超时(188)、通电时长(9)、温度(194)；同时兼容 SAS(SCSI) 盘；
@@ -117,7 +117,9 @@ UI 基于 google-design 设计体系（DM Sans / JetBrains Mono，浅色主色 `
 - VD 删除、外来配置（Foreign）导入
 - 创建阵列：RAID 0/1/5/6/10/50，仅允许未配置盘（UGood/JBOD，JBOD 自动转 UGood）
 - 磁盘操作：上线/下线/置 UGood/置 JBOD/全局热备/专用热备/移除热备/启动回拷/停止回拷/定位灯开关
+- 磁盘安全擦除（Erase）：simple/normal/threepass/thorough/crypto 五种覆写模式，需输入盘位标识并勾选风险确认双重校验；擦除为后台任务，进度条实时显示在磁盘列表（红色进度条 + 预计剩余时间），可随时"停止 Erase"中止
 - 阵列卡蜂鸣器报警：打开/临时关闭/永久关闭；JBOD 模式开关
+- 外来配置（Foreign Configuration）：从其它机器迁移来的磁盘自带原机阵列元数据，置 UGood 后控制器会检测到外来配置——磁盘列表 DG 列显示 **F** 徽章，虚拟磁盘卡片顶部出现「载入外部配置」按钮，点击确认即执行 `/cX/fall import` 将原阵列配置导回本控制器（磁盘恢复为原 DG/VD 成员）；无外来配置时按钮自动隐藏。注意：置 UGood 本身不会让盘变成可用块设备，需要导入外来配置或手动创建阵列/置 JBOD
 
 **平台能力**
 - 用户体系：管理员（全部权限）/ 只读用户（仅查看）；PBKDF2-HMAC-SHA256 加盐哈希（12 万次迭代）
@@ -305,8 +307,9 @@ Web 内置采集线程默认开启；如仍想用外部 cron 触发，两者**�
 ### 9.1 触发与调度
 
 - 内置线程每隔一分钟整点对齐（sleep 到下一分钟的 00 秒）执行 `python3 lsi_collectd.py`，超时上限 110 秒。
-- 采集脚本入口顺序：`--force` 判断 → 间隔门控（分钟数 % interval == 0）→ 文件锁 → 分钟去重标记 → 执行采集。任一环节被拦截则静默退出。
+- 采集脚本入口顺序：`--force` / `--quick` 判断 → 间隔门控（分钟数 % interval == 0）→ 文件锁 → 分钟去重标记 → 执行采集。任一环节被拦截则静默退出。
 - Web“立即采集”即 `--force` 运行，绕过门控与去重（仍受锁保护）。
+- **操作后即时刷新**：所有磁盘/阵列操作（上线/下线/置 UGood/JBOD/热备/Copyback、安全擦除、导入外来配置、巡读/CC/VD 初始化、创建/删除阵列等）成功后，后端同步触发 `python3 lsi_collectd.py --quick` —— 与 `--force` 一样绕过门控与去重，但跳过 SMART 等耗时采集，仅约 1 秒即可让页面反映最新状态，无需等待下一轮定时采集。
 
 ### 9.2 各数据项频率
 
@@ -319,7 +322,7 @@ Web 内置采集线程默认开启；如仍想用外部 cron 触发，两者**�
 | 文件系统用量 | 每 | `fs.csv` 追加 |
 | NVMe 直连盘 | 每 | `nvme.csv` 追加 |
 | 巡读 / CC 属性 | 每 | `patrol.csv` / `consistency.csv` 覆盖写 |
-| VD 清单 | 每天 | `vds.csv` 当天首采写入 |
+| VD 清单 | 每（操作后即时） | `vds.csv` 追加，展示时取最新一轮快照 |
 | 磁盘属性（SN/固件/速率） | 每天 | `attributes.csv` 当天首采写入 |
 | SMART | 每 15 分钟（minute%15==0） | `smart.csv` 覆盖写；当天缺失或 --force 时立即补采 |
 
@@ -338,7 +341,7 @@ data/
 ├── YYYY-MM-DD/            # 每日一个目录
 │   ├── disks.csv           时间,EID,SLOT,DID,DG,型号,状态,容量,接口,介质,
 │   │                       温度,介质错误,其他错误,PF,SMART告警,Shield,
-│   │                       rebuild进度/ETA,copyback进度/ETA
+│   │                       rebuild进度/ETA,copyback进度/ETA,erase进度/ETA
 │   ├── controller.csv      时间,型号,固件,健康,VD数,PD数,ROC温度,
 │   │                       BBU型号/状态/温度,各VD状态拼接
 │   ├── vds.csv             时间,DG/VD,类型,状态,容量,名称
@@ -454,8 +457,11 @@ data/
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/api/disk_action` | `{eid,slot,action}`，action ∈ online/offline/good/jbod/locate_start/locate_stop/hotspare_global/hotspare_dedicated(+dg)/hotspare_delete/copyback_start(+target_eid,target_slot)/copyback_stop |
-| POST | `/api/raid_action` | `{target,action,vd}`：patrolread start/stop/pause/resume；cc、vd_init start/stop；vd_delete delete；vd_import import |
+| POST | `/api/disk_action` | `{eid,slot,action}`，action ∈ online/offline/good/jbod/locate_start/locate_stop/hotspare_global/hotspare_dedicated(+dg)/hotspare_delete/copyback_start(+target_eid,target_slot)/copyback_stop/erase_stop |
+| POST | `/api/disk_erase` | 启动安全擦除，`{eid,slot,pattern:simple\|normal\|threepass\|thorough\|crypto,confirm:"E{eid}:{slot}",acknowledge:true}`，管理员 + 双重确认 |
+| POST | `/api/raid_action` | `{target,action,vd}`：patrolread start/stop/pause/resume；cc、vd_init start/stop；vd_delete delete |
+| GET | `/api/foreign_config` | 查询控制器外来配置状态 `{ok,present,count,description}` |
+| POST | `/api/foreign_import` | 导入外来配置 `{acknowledge:true}`，即 storcli `/cX/fall import` |
 | POST | `/api/raid/create` | `{level,drives:[{eid,slot}],name}` 创建阵列 |
 
 **存储管理**

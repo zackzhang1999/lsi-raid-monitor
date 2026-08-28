@@ -239,7 +239,7 @@ async function afterLogin() {
   // 未创建管理员账号时的安全提示横幅
   $('#security-banner').classList.toggle('hidden', state.authRequired);
   $('#btn-collect').classList.toggle('hidden', !state.isAdmin);
-  $('#btn-vd-import').classList.toggle('hidden', !state.isAdmin);
+  $('#btn-vd-import').classList.toggle('hidden', !state.isAdmin); // 是否有外来配置由 loadStatus 动态控制
   $('#btn-logout').classList.toggle('hidden', !state.authRequired);
   $('#sel-interval').disabled = !state.isAdmin;
   $('#btn-alert-save').disabled = !state.isAdmin;
@@ -276,6 +276,13 @@ async function loadStatus() {
   renderPhysicalDisks(st);
   renderNvmeDisks(st);
   renderSystem(st);
+  // 控制器检测到外来配置时显示「载入外部配置」按钮
+  const hasForeign = !!(st.controller && st.controller.foreign_present);
+  const btnImport = $('#btn-vd-import');
+  btnImport.textContent = hasForeign
+    ? `载入外部配置${st.controller.foreign_count > 1 ? `（${st.controller.foreign_count}）` : ''}`
+    : '载入外部配置';
+  btnImport.classList.toggle('hidden', !state.isAdmin || !hasForeign);
 }
 
 function renderTopbar(st) {
@@ -682,8 +689,9 @@ function bgProgressCell(d, key) {
   if (d[key + '_progress'] == null || d[key + '_progress'] === '' || isNaN(p)) return '';
   const pct = Math.max(0, Math.min(100, p));
   const eta = d[key + '_eta'];
-  const title = key === 'copyback' ? 'Copyback 回拷中' : 'Rebuild 重建中';
-  const cls = key === 'copyback' ? 'rebuild-progress cb' : 'rebuild-progress';
+  const titles = { rebuild: 'Rebuild 重建中', copyback: 'Copyback 回拷中', erase: 'Erase 安全擦除中' };
+  const title = titles[key] || key;
+  const cls = 'rebuild-progress' + (key !== 'rebuild' ? ' ' + key : '');
   return `<div class="${cls}" title="${title}">
     <div class="rb-bar"><i style="width:${pct}%"></i></div>
     <span class="rb-pct">${pct}%</span>${eta ? `<span class="rb-eta">${esc(eta)}</span>` : ''}
@@ -708,6 +716,7 @@ function renderPhysicalDisks(st) {
     updateRaidBar();
     return;
   }
+  const foreignBadge = ' <span class="badge warn" title="外来阵列配置：该盘带有其它系统的阵列元数据，可在顶部通过「载入外部配置」导回原阵列">F</span>';
   tb.innerHTML = '';
   disks.forEach(d => {
     const tr = document.createElement('tr');
@@ -723,8 +732,8 @@ function renderPhysicalDisks(st) {
       <td>${esc(d.model || '—')}</td>
       <td class="num">${esc(d.sn || '—')}</td>
       <td class="num">${esc(d.fw_rev || '—')}</td>
-      <td class="num">${d.dg != null ? esc(d.dg) : '—'}</td>
-      <td>${stateBadge(d.state)}${bgProgressCell(d, 'rebuild')}${bgProgressCell(d, 'copyback')}</td>
+      <td class="num">${d.dg != null ? esc(d.dg) : '—'}${String(d.dg).toUpperCase() === 'F' ? foreignBadge : ''}</td>
+      <td>${stateBadge(d.state)}${bgProgressCell(d, 'rebuild')}${bgProgressCell(d, 'copyback')}${bgProgressCell(d, 'erase')}</td>
       <td class="num">${fmtTemp(d.temperature)}</td>
       <td class="num">${num0(d.media_error)}/${num0(d.other_error)}/${num0(d.predictive_failure)}</td>
       <td class="num">${num0(d.reallocated)}/${num0(d.pending)}/${num0(d.uncorrectable)}</td>
@@ -769,7 +778,9 @@ function renderPhysicalDisks(st) {
         <option value="hotspare_dedicated">设为专用热备</option>
         <option value="hotspare_delete">删除热备</option>
         <option value="copyback_start">启动 Copyback</option>
-        <option value="copyback_stop">停止 Copyback</option>`;
+        <option value="copyback_stop">停止 Copyback</option>
+        <option value="erase">安全擦除 (Erase)</option>
+        <option value="erase_stop">停止 Erase</option>`;
       sel.addEventListener('change', () => {
         const action = sel.value;
         sel.value = '';
@@ -830,6 +841,8 @@ const DISK_ACTION_TEXT = {
   hotspare_delete: ['删除热备', '移除该磁盘的热备盘属性。'],
   copyback_start: ['启动 Copyback', '将当前盘的数据回拷到指定目标盘（替换盘）。请确认目标盘已插入且状态正确。'],
   copyback_stop: ['停止 Copyback', '停止当前盘正在进行的 Copyback 回拷操作。'],
+  erase: ['安全擦除 (Erase)', '通过控制器对该盘执行安全擦除，盘上所有数据将被彻底销毁且不可恢复。'],
+  erase_stop: ['停止 Erase', '停止当前盘正在进行的 Erase 安全擦除操作。'],
 };
 const DANGER_ACTIONS = ['offline', 'good', 'jbod'];
 
@@ -866,6 +879,34 @@ function diskAction(d, action) {
         const m = v.match(/^(\d+):(\d+)$/);
         if (!m) throw new Error('请输入有效的目标盘 e:s（如 134:2）');
         await doIt({ target_eid: Number(m[1]), target_slot: Number(m[2]) });
+      });
+    return;
+  }
+  if (action === 'erase') {
+    confirmModal(`危险操作：${text}`,
+      `<p>磁盘 <strong class="mono">${esc(label)}</strong>（${esc(d.model || '')}）</p>
+       <p class="warn-text">${esc(desc)} 请再次核对盘位，该操作不可撤销。</p>
+       <div class="field"><label for="erase-pattern">擦除模式</label>
+       <select class="select" id="erase-pattern">
+         <option value="simple">simple — 单遍快速覆写</option>
+         <option value="normal">normal — 三遍覆写</option>
+         <option value="threepass">threepass — 三遍（随机→清零→校验）</option>
+         <option value="thorough">thorough — 九遍深度覆写</option>
+         <option value="crypto">crypto — 加密擦除（仅 SED/ISE 盘）</option>
+       </select></div>
+       <div class="field"><label for="erase-confirm">输入盘位标识确认（如 ${esc(label)}）</label>
+       <input class="input mono" id="erase-confirm" type="text" placeholder="${esc(label)}" autocomplete="off" /></div>
+       <label class="check-row"><input type="checkbox" id="erase-ack" />
+       <span>我已知晓该盘上的所有数据将被彻底销毁且无法恢复</span></label>`,
+      '开始擦除', true, async () => {
+        const pattern = $('#erase-pattern').value;
+        const typed = ($('#erase-confirm').value || '').trim();
+        if (typed !== label) throw new Error(`请输入正确的盘位标识 "${label}"`);
+        if (!$('#erase-ack').checked) throw new Error('请先勾选风险确认');
+        const r = await api('/api/disk_erase', { method: 'POST', body: { eid: d.eid, slot: d.slot, pattern, confirm: label, acknowledge: true } });
+        if (r && r.ok === false) throw new Error(r.error || '启动擦除失败');
+        toast(`磁盘 ${label}：安全擦除已启动`, 'ok');
+        await loadStatus();
       });
     return;
   }
@@ -1667,10 +1708,20 @@ function bindUI() {
   // 创建磁盘阵列
   $('#btn-raid-create').addEventListener('click', createRaid);
   $('#raid-level').addEventListener('change', updateRaidBar);
-  // 导入外来（Foreign）虚拟盘配置
+  // 导入外来（Foreign）虚拟盘配置：仅当控制器检测到外来配置时显示
   $('#btn-vd-import').addEventListener('click', () => {
-    raidAction({ target: 'vd_import', action: 'import' }, '导入外来配置',
-      '确认导入外来 (Foreign) 配置？该操作会把外部虚拟盘配置导入当前控制器，使其恢复可见与可访问。', true);
+    const c = (state.status && state.status.controller) || {};
+    const count = Number(c.foreign_count) || 1;
+    const desc = c.foreign_desc
+      ? `检测到外来配置：${esc(c.foreign_desc)}。导入后控制器将恢复原阵列（DG/VD），原有数据可继续访问。`
+      : `确认导入外来 (Foreign) 配置？该操作会把外部虚拟盘配置导入当前控制器，使其恢复可见与可访问。检测到 ${count} 组外来配置。`;
+    confirmModal('载入外部配置', `<p>${desc}</p><p class="tiny">导入完成后将自动刷新状态，原 UGood+F 标记的磁盘会回到原阵列。</p>`, '确认导入', true, async () => {
+      const r = await api('/api/foreign_import', { method: 'POST', body: { acknowledge: true } });
+      if (r && r.ok === false) throw new Error(r.error || '导入失败');
+      toast('外来配置已导入', 'ok');
+      await loadStatus();
+      await loadVdDetail();
+    });
   });
   $('#btn-logout').addEventListener('click', async () => {
     try { await api('/api/logout', { method: 'POST' }); } catch (e) { /* 忽略 */ }

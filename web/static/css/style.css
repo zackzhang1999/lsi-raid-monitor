@@ -631,6 +631,10 @@ table.data .admin-col.col-hidden { display: none; }
 .rebuild-progress .rb-eta { font-family: var(--font-mono); font-size: 10px; color: var(--muted-foreground); white-space: nowrap; }
 .rebuild-progress.cb .rb-bar i { background: var(--ring); }
 .rebuild-progress.cb .rb-pct { color: var(--ring); }
+.rebuild-progress.erase .rb-bar i { background: var(--crit); }
+.rebuild-progress.erase .rb-pct { color: var(--crit); }
+.check-row { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; cursor: pointer; }
+.check-row input[type="checkbox"] { margin-top: 2px; }
 
 /* ---------- 确认输入 ---------- */
 .confirm-input-note { font-size: 12px; }

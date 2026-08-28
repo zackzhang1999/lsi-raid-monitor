@@ -128,6 +128,10 @@ def collect_copyback() -> dict[tuple[int, int], dict]:
     return _collect_drive_bg_progress("show copyback")
 
 
+def collect_erase() -> dict[tuple[int, int], dict]:
+    return _collect_drive_bg_progress("show erase")
+
+
 def collect_disks() -> list[dict]:
     data = run_storcli(f"{CONTROLLER}/eall/sall show all J")
     resp = _response_data(data)
@@ -136,8 +140,14 @@ def collect_disks() -> list[dict]:
 
     rebuild_map = collect_rebuild()
     copyback_map = collect_copyback()
+    erase_map = collect_erase()
 
     disks = []
+    # 正在后台操作（erase/rebuild 等）的盘会从 show all 列表中消失，
+    # 且仅在 Command Status 的 Detailed Status 里报 "in progress" 错误；
+    # 记录下来供 _append_failed_drives 区分"忙"与真正的 Failed。
+    busy_drives: set[tuple[int, int]] = set(erase_map) | set(rebuild_map) | set(copyback_map)
+
     try:
         # 第一遍：收集摘要
         summaries: dict[str, dict] = {}
@@ -169,6 +179,7 @@ def collect_disks() -> list[dict]:
 
             rb = rebuild_map.get((eid, slot), {})
             cb = copyback_map.get((eid, slot), {})
+            er = erase_map.get((eid, slot), {})
             disks.append(
                 {
                     "eid": eid,
@@ -194,20 +205,47 @@ def collect_disks() -> list[dict]:
                     "rebuild_eta": rb.get("eta", ""),
                     "copyback_progress": cb.get("progress", ""),
                     "copyback_eta": cb.get("eta", ""),
+                    "erase_progress": er.get("progress", ""),
+                    "erase_eta": er.get("eta", ""),
                 }
             )
 
     except Exception as e:
         print(f"[{datetime.now():%H:%M:%S}] disk parse error: {e}", file=sys.stderr)
 
-    _append_failed_drives(data, disks)
+    _append_failed_drives(data, disks, busy_drives)
     return disks
 
 
-def _append_failed_drives(data: dict | None, disks: list[dict]):
-    """Failed/掉线的盘在 Response Data 中没有条目，只在 Command Status 的
-    Detailed Status 里以 ErrCd 45 等形式出现；补一条 state=Failed 记录，
-    避免故障盘从页面上"消失"。"""
+def _query_single_drive(ctrl: str, eid: int, slot: int) -> dict:
+    """单盘回查：show /cX/eX/sX 对已脱离 show all 列表的盘（UBad/Failed）
+    仍能返回完整摘要（State/Model/Size/温度等），用于补记时还原真实状态。
+
+    ctrl 为控制器编号（正则捕获组，不带 /c 前缀）。"""
+    try:
+        data = run_storcli(f"/c{ctrl}/e{eid}/s{slot} show J")
+        if not data:
+            return {}
+        rd = data["Controllers"][0].get("Response Data", {})
+        rows = rd.get("Drive Information", [])
+        if rows and isinstance(rows[0], dict):
+            return rows[0]
+    except Exception:
+        pass
+    return {}
+
+
+def _append_failed_drives(
+    data: dict | None, disks: list[dict], busy_drives: set[tuple[int, int]] = frozenset()
+):
+    """Failed/UBad/掉线的盘在 show all 的 Response Data 中没有条目，只在
+    Command Status 的 Detailed Status 里以 ErrCd 45 等形式出现；补一条记录
+    避免故障盘从页面上"消失"。
+
+    - 正在执行 erase 等后台操作的盘也会短暂地从列表中消失（ErrCd 255
+      "Drive erase is in progress"），盘本身并未故障，补记为对应的状态名。
+    - 其余消失的盘逐盘回查单盘信息还原真实状态（UBad 等）；
+      回查失败才兜底记为 Failed。"""
     try:
         detailed = (
             data["Controllers"][0].get("Command Status", {}).get("Detailed Status", [])
@@ -216,24 +254,42 @@ def _append_failed_drives(data: dict | None, disks: list[dict]):
         for entry in detailed:
             if not isinstance(entry, dict) or entry.get("Status") == "Success":
                 continue
-            m = re.match(r"/c\d+/e(\d+)/s(\d+)", str(entry.get("Drive", "")))
+            m = re.match(r"/c(\d+)/e(\d+)/s(\d+)", str(entry.get("Drive", "")))
             if not m:
                 continue
-            eid, slot = int(m.group(1)), int(m.group(2))
+            ctrl, eid, slot = m.group(1), int(m.group(2)), int(m.group(3))
             if (eid, slot) in present:
                 continue
+            errmsg = str(entry.get("ErrMsg", ""))
+            # 后台操作进行中导致的临时消失：不算 Failed
+            if (eid, slot) in busy_drives or "in progress" in errmsg.lower():
+                state = (
+                    "Erase"
+                    if "erase" in errmsg.lower()
+                    else "Rebuild"
+                    if "rebuild" in errmsg.lower()
+                    else "Copyback"
+                    if "copyback" in errmsg.lower()
+                    else "BgOp"
+                )
+                summary: dict = {}
+            else:
+                # 逐盘回查还原真实状态（UBad/Offln/……）
+                summary = _query_single_drive(ctrl, eid, slot)
+                state = str(summary.get("State", "")).strip() or "Failed"
+            temperature = parse_temperature(summary.get("Drive Temperature", ""))
             disks.append(
                 {
                     "eid": eid,
                     "slot": slot,
-                    "did": "",
-                    "dg": "",
-                    "model": "",
-                    "state": "Failed",
-                    "size": "",
-                    "intf": "",
-                    "med": "",
-                    "temperature": "",
+                    "did": summary.get("DID", ""),
+                    "dg": summary.get("DG", ""),
+                    "model": str(summary.get("Model", "")).strip(),
+                    "state": state,
+                    "size": str(summary.get("Size", "")).strip(),
+                    "intf": str(summary.get("Intf", "")).strip(),
+                    "med": str(summary.get("Med", "")).strip(),
+                    "temperature": temperature if temperature is not None else "",
                     "media_error": 0,
                     "other_error": 0,
                     "predictive_failure": 0,
@@ -243,6 +299,8 @@ def _append_failed_drives(data: dict | None, disks: list[dict]):
                     "rebuild_eta": "",
                     "copyback_progress": "",
                     "copyback_eta": "",
+                    "erase_progress": "",
+                    "erase_eta": "",
                 }
             )
     except Exception:
@@ -359,6 +417,33 @@ def collect_vds() -> list[dict]:
 
 
 # ---- 磁盘详细属性 ----
+
+
+def collect_foreign_config() -> dict:
+    """检测控制器上是否存在外来阵列配置（Foreign Configuration）。
+
+    从其它机器/背板迁移过来的盘带有原机的阵列元数据时，storcli 将其视为
+    "外来配置"：盘状态 UGood/UBad、部分场景下 DG 列显示 F。
+    返回 {"present": bool, "count": int, "description": str}。
+    """
+    data = run_storcli(f"{CONTROLLER} /fall show J", timeout=30)
+    if not data:
+        return {"present": False, "count": 0, "description": "查询失败"}
+    try:
+        cs = data["Controllers"][0].get("Command Status", {})
+        desc = str(cs.get("Description", ""))
+        # 无外来配置时 storcli 仍返回 Success，但 Description 提示 "Couldn't find"
+        if "couldn" in desc.lower() and "foreign" in desc.lower():
+            return {"present": False, "count": 0, "description": desc}
+        if cs.get("Status") != "Success":
+            return {"present": False, "count": 0, "description": desc or "查询失败"}
+        # 有外来配置时统计个数（Description 形如 "X foreign configurations found"）
+        m = re.search(r"(\d+)\s+foreign", desc, re.IGNORECASE)
+        count = int(m.group(1)) if m else 1
+        return {"present": True, "count": count, "description": desc}
+    except Exception as e:
+        print(f"[{datetime.now():%H:%M:%S}] foreign config parse error: {e}", file=sys.stderr)
+        return {"present": False, "count": 0, "description": "解析失败"}
 
 
 def collect_disk_attributes() -> list[dict]:
@@ -964,23 +1049,26 @@ def _should_run(now: datetime) -> bool:
 def main():
     now = datetime.now()
     force = "--force" in sys.argv
+    # --quick（Web 操作后即时刷新）：与 --force 一样绕过门控与分钟去重，
+    # 但跳过 SMART 等耗时采集，只刷新磁盘/控制器/VD 等关键状态
+    quick = "--quick" in sys.argv
     # --force（Web“立即采集”）绕过间隔门控与分钟去重
-    if not force and not _should_run(now):
+    if not force and not quick and not _should_run(now):
         return
     lock_fd = _acquire_lock()
     if lock_fd is None:
         return  # 另一个实例（cron 或内置线程）正在采集
     try:
         minute_key = now.strftime("%Y-%m-%d %H:%M")
-        if not force and _already_collected(minute_key):
+        if not force and not quick and _already_collected(minute_key):
             return
-        _run_collection(now, force)
+        _run_collection(now, force, quick)
         MARKER_FILE.write_text(minute_key, encoding="utf-8")
     finally:
         lock_fd.close()
 
 
-def _run_collection(now: datetime, force: bool = False):
+def _run_collection(now: datetime, force: bool = False, quick: bool = False):
     timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
     date_dir = BASE_DIR / now.strftime("%Y-%m-%d")
     minute = now.minute
@@ -1006,6 +1094,8 @@ def _run_collection(now: datetime, force: bool = False):
         "rebuild_eta",
         "copyback_progress",
         "copyback_eta",
+        "erase_progress",
+        "erase_eta",
     ]
     ctrl_fields = [
         "timestamp",
@@ -1019,6 +1109,9 @@ def _run_collection(now: datetime, force: bool = False):
         "bbu_state",
         "bbu_temperature",
         "vd_states",
+        "foreign_present",
+        "foreign_count",
+        "foreign_desc",
     ]
     vd_fields = ["timestamp", "dg_vd", "type", "state", "size", "name"]
     patrol_fields = [
@@ -1127,6 +1220,11 @@ def _run_collection(now: datetime, force: bool = False):
         ctrl["timestamp"] = timestamp
     else:
         ctrl = {"timestamp": timestamp, "health": "N/A"}
+    # 外来阵列配置状态（供 Web 显示 F 标记与"载入外部配置"入口）
+    fc = collect_foreign_config()
+    ctrl["foreign_present"] = 1 if fc.get("present") else 0
+    ctrl["foreign_count"] = fc.get("count", 0)
+    ctrl["foreign_desc"] = fc.get("description", "")
     write_csv(date_dir, "controller.csv", ctrl_fields, [ctrl])
 
     # 故障邮件报警（基于本次采集结果）
@@ -1158,12 +1256,12 @@ def _run_collection(now: datetime, force: bool = False):
             r["timestamp"] = timestamp
         write_csv(date_dir, "nvme.csv", nvme_fields, nvme_rows)
 
-    # VD（CSV 当天首次采集写入；状态变化告警每分钟检测）
+    # VD（每轮追加最新快照，确保创建/删除阵列后页面即时刷新；状态变化告警每分钟检测）
     vds = collect_vds()
-    if vds and not (date_dir / "vds.csv").exists():
+    if vds:
         for v in vds:
             v["timestamp"] = timestamp
-        write_csv_once(date_dir, "vds.csv", vd_fields, vds)
+        write_csv(date_dir, "vds.csv", vd_fields, vds)
 
     # 磁盘状态变化 / VD 变化邮件告警（基于本次采集结果）
     lsi_alert.check_state_changes(disks, vds)
@@ -1178,8 +1276,9 @@ def _run_collection(now: datetime, force: bool = False):
 
     # SMART（每 15 分钟采集一次；--force 或当天 smart.csv 缺失时立即补采，
     # 避免服务重启/跨天后页面上通电时长等 SMART 字段长时间为 0）
+    # --quick 模式跳过 SMART（逐盘透传耗时长，操作后刷新不需要）
     smart_file_missing = not (date_dir / "smart.csv").exists()
-    if disks and (force or minute % 15 == 0 or smart_file_missing):
+    if disks and not quick and (force or minute % 15 == 0 or smart_file_missing):
         smart_data = collect_smart(disks)
         if smart_data:
             for s in smart_data:

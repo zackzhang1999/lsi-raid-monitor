@@ -37,6 +37,7 @@ from flask import (
 )
 
 import lsi_alert
+import lsi_collectd
 import storage_mgr
 import user_mgr
 
@@ -81,6 +82,7 @@ DISK_ACTIONS = {
     "hotspare_delete": "delete hotsparedrive",
     "copyback_start": "start copyback",  # 后面拼 target=e:s
     "copyback_stop": "stop copyback",
+    "erase_stop": "stop erase",
 }
 
 # ---- 定位灯状态（storcli 无可靠回读接口，由本服务跟踪 locate_start/stop）----
@@ -194,6 +196,20 @@ def _collect_once(extra_args: list[str] | None = None) -> None:
         _status_cache.update(ts=0.0)
     except Exception:
         pass
+
+
+def _refresh_after_action() -> None:
+    """磁盘/RAID 操作成功后同步触发一轮快速采集（--quick 跳过 SMART），
+    让 /api/status 立即反映最新状态，页面无需等待下一轮定时采集。"""
+    try:
+        subprocess.run(
+            [sys.executable, str(COLLECTD), "--quick"],
+            capture_output=True,
+            timeout=60,
+        )
+    except Exception:
+        pass
+    _status_cache.update(ts=0.0)
 
 
 def _collector_loop() -> None:
@@ -461,6 +477,8 @@ def build_status() -> dict:
                 "rebuild_eta": row.get("rebuild_eta", ""),
                 "copyback_progress": _to_int(row.get("copyback_progress")),
                 "copyback_eta": row.get("copyback_eta", ""),
+                "erase_progress": _to_int(row.get("erase_progress")),
+                "erase_eta": row.get("erase_eta", ""),
                 "locate": f"{eid}:{slot}" in locate_state,
                 "dev_speed": attr.get("dev_speed", ""),
                 "link_speed": attr.get("link_speed", ""),
@@ -488,8 +506,20 @@ def build_status() -> dict:
         "bbu_model": ctrl_row.get("bbu_model", ""),
         "bbu_state": ctrl_row.get("bbu_state", ""),
         "bbu_temperature": _to_int(ctrl_row.get("bbu_temperature")),
+        "foreign_present": _to_int(ctrl_row.get("foreign_present"), 0) == 1,
+        "foreign_count": _to_int(ctrl_row.get("foreign_count"), 0),
+        "foreign_desc": ctrl_row.get("foreign_desc", ""),
     }
 
+    # vds.csv 每轮采集都追加快照，这里只取最新一轮（避免同一天新旧快照混排）
+    latest_vd_ts = ""
+    for row in vd_rows[::-1]:
+        ts = str(row.get("timestamp", ""))
+        if ts:
+            latest_vd_ts = ts
+            break
+    if latest_vd_ts:
+        vd_rows = [r for r in vd_rows if str(r.get("timestamp", "")) == latest_vd_ts]
     virtual_disks = [
         {
             "dg_vd": v.get("dg_vd", ""),
@@ -931,10 +961,106 @@ def api_disk_action():
         lsi_alert.log_event(
             "warning", f"磁盘操作: {label} {action}（{session.get('username', '')}）"
         )
-        _status_cache.update(ts=0.0)
+        _refresh_after_action()
         return jsonify(ok=True)
     lsi_alert.log_event("error", f"磁盘操作失败: {label} {action} — {msg}")
     return jsonify(ok=False, error=msg), 500
+
+
+@app.post("/api/disk_erase")
+@admin_required
+def api_disk_erase():
+    """启动磁盘安全擦除（storcli /ex/sx start erase）。
+
+    需要显式输入槽位标识 + 勾选"我已知晓"双重确认，防止误操作；
+    erase 为后台任务，进度经采集链路（show erase）展示在磁盘列表。
+    """
+    data = request.get_json(silent=True) or {}
+    eid = _to_int(data.get("eid"))
+    slot = _to_int(data.get("slot"))
+    confirm_label = str(data.get("confirm", "")).strip()
+    acknowledged = bool(data.get("acknowledge"))
+    if eid is None or slot is None:
+        return jsonify(ok=False, error="参数非法"), 400
+    # 兼容两种输入格式："E134:0" 与界面显示一致的 "E134:S0"
+    if confirm_label not in (f"E{eid}:{slot}", f"E{eid}:S{slot}"):
+        return jsonify(ok=False, error=f"请输入正确的盘位标识（如 \"E{eid}:S{slot}\"）"), 400
+    if not acknowledged:
+        return jsonify(ok=False, error="请勾选确认已知晓数据将被彻底销毁"), 400
+
+    pattern = str(data.get("pattern", "simple")).strip().lower()
+    if pattern not in (
+        "simple",
+        "normal",
+        "thorough",
+        "standard",
+        "threepass",
+        "crypto",
+    ):
+        return jsonify(ok=False, error="擦除模式非法"), 400
+
+    label = f"E{eid}:S{slot}"
+    ok, msg = _run_storcli(
+        f"{CONTROLLER}/e{eid}/s{slot} start erase {pattern}"
+    )
+    if not ok and "in progress" in msg.lower():
+        # 该盘已有擦除任务在跑（storcli ErrCd 255），并非失败
+        return jsonify(ok=False, error=f"{label} 已有擦除任务在进行中，请等待完成或先停止"), 409
+    if ok:
+        lsi_alert.log_event(
+            "warning",
+            f"磁盘擦除: {label} 启动 erase（{pattern}）（{session.get('username', '')}）",
+        )
+        _refresh_after_action()
+        return jsonify(ok=True)
+    lsi_alert.log_event("error", f"磁盘擦除失败: {label} — {msg}")
+    return jsonify(ok=False, error=msg), 500
+
+
+@app.get("/api/foreign_config")
+@admin_required
+def api_foreign_config():
+    """查询控制器上的外来阵列配置（Foreign Configuration）状态。
+
+    外来配置来源：从其它机器/背板迁移过来的盘带有原机阵列元数据。
+    storcli 将这些盘显示为 UGood/UBad（部分场景 DG 列显示 F），
+    导入（import）后原阵列/VD 会在本控制器上恢复。
+    """
+    data = lsi_collectd.run_storcli(f"{CONTROLLER} /fall show J", timeout=30)
+    if not data:
+        return jsonify(ok=False, error="storcli 查询失败"), 500
+    try:
+        cs = data["Controllers"][0].get("Command Status", {})
+        desc = str(cs.get("Description", ""))
+        present = not ("couldn" in desc.lower() and "foreign" in desc.lower())
+        m = re.search(r"(\d+)\s+foreign", desc, re.IGNORECASE)
+        count = int(m.group(1)) if (present and m) else (1 if present else 0)
+        return jsonify(ok=True, present=present, count=count, description=desc)
+    except Exception as e:
+        return jsonify(ok=False, error=f"解析失败: {e}"), 500
+
+
+@app.post("/api/foreign_import")
+@admin_required
+def api_foreign_import():
+    """导入外来阵列配置（storcli /cX/fall import）。
+
+    将迁移盘上原有的阵列元数据导回控制器，恢复其原 DG/VD 结构。
+    导入后相关盘从 UGood/UBad 变为 Onln（或 Dgrd 等），由原配置决定。
+    高危操作：若控制器上已有同编号 DG 可能冲突；导入前请确认来源盘合法。
+    """
+    data = request.get_json(silent=True) or {}
+    if not data.get("acknowledge"):
+        return jsonify(ok=False, error="请先确认导入风险"), 400
+    ok, msg = _run_storcli(f"{CONTROLLER} /fall import", timeout=60)
+    if not ok:
+        lsi_alert.log_event("error", f"外来配置导入失败 — {msg}")
+        return jsonify(ok=False, error=msg), 500
+    lsi_alert.log_event(
+        "warning", f"外来配置已导入（{session.get('username', '')}）"
+    )
+    _refresh_after_action()
+    return jsonify(ok=True)
 
 
 @app.get("/api/disk_smart")
@@ -1617,7 +1743,7 @@ def api_raid_action():
     desc = f"RAID 操作: {target} {action}" + (f" (v{vd})" if vd is not None else "")
     if ok:
         lsi_alert.log_event("warning", f"{desc}（{session.get('username', '')}）")
-        _status_cache.update(ts=0.0)
+        _refresh_after_action()
         return jsonify(ok=True)
     lsi_alert.log_event("error", f"{desc} 失败 — {msg}")
     return jsonify(ok=False, error=msg), 500
@@ -1984,7 +2110,7 @@ def api_raid_create():
             + (f" 名称={name}" if name else "")
             + f"（{session.get('username', '')}）",
         )
-        _status_cache.update(ts=0.0)
+        _refresh_after_action()
         return jsonify(ok=True)
     lsi_alert.log_event("error", f"创建阵列失败 RAID{level} drives={','.join(specs)} — {msg}")
     return jsonify(ok=False, error=msg), 500
