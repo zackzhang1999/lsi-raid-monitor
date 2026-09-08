@@ -19,6 +19,8 @@ from pathlib import Path
 
 # 引入本地邮件报警模块
 import lsi_alert
+# SQLite 数据底座（与 CSV 双写，供长期趋势查询）
+import db
 
 # ---- 配置 ----
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -1206,6 +1208,7 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
         for d in disks:
             d["timestamp"] = timestamp
         write_csv(date_dir, "disks.csv", disk_fields, disks)
+        db.insert_rows("disks", disks)
     else:
         write_csv(
             date_dir,
@@ -1226,6 +1229,7 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
     ctrl["foreign_count"] = fc.get("count", 0)
     ctrl["foreign_desc"] = fc.get("description", "")
     write_csv(date_dir, "controller.csv", ctrl_fields, [ctrl])
+    db.insert_rows("controller", [ctrl])
 
     # 故障邮件报警（基于本次采集结果）
     lsi_alert.check_and_alert(disks, ctrl)
@@ -1234,6 +1238,7 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
     sys_info = collect_system_info()
     sys_info["timestamp"] = timestamp
     write_csv(date_dir, "system.csv", sys_fields, [sys_info])
+    db.insert_rows("system", [sys_info])
 
     # IO 性能计数（每分钟追加原始计数器）
     io_rows = collect_io()
@@ -1241,6 +1246,7 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
         for r in io_rows:
             r["timestamp"] = timestamp
         write_csv(date_dir, "io.csv", io_fields, io_rows)
+        db.insert_rows("io", io_rows)
 
     # 文件系统用量（每分钟追加）
     fs_rows = collect_fs()
@@ -1248,6 +1254,7 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
         for r in fs_rows:
             r["timestamp"] = timestamp
         write_csv(date_dir, "fs.csv", fs_fields, fs_rows)
+        db.insert_rows("fs", fs_rows)
 
     # NVMe 磁盘（每分钟追加）
     nvme_rows = collect_nvme()
@@ -1255,6 +1262,7 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
         for r in nvme_rows:
             r["timestamp"] = timestamp
         write_csv(date_dir, "nvme.csv", nvme_fields, nvme_rows)
+        db.insert_rows("nvme", nvme_rows)
 
     # VD（每轮追加最新快照，确保创建/删除阵列后页面即时刷新；状态变化告警每分钟检测）
     vds = collect_vds()
@@ -1262,6 +1270,7 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
         for v in vds:
             v["timestamp"] = timestamp
         write_csv(date_dir, "vds.csv", vd_fields, vds)
+        db.insert_rows("vds", vds)
 
     # 磁盘状态变化 / VD 变化邮件告警（基于本次采集结果）
     lsi_alert.check_state_changes(disks, vds)
@@ -1273,6 +1282,7 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
             for a in attrs:
                 a["timestamp"] = timestamp
             write_csv_once(date_dir, "attributes.csv", attr_fields, attrs)
+            db.insert_rows("attrs", attrs)
 
     # SMART（每 15 分钟采集一次；--force 或当天 smart.csv 缺失时立即补采，
     # 避免服务重启/跨天后页面上通电时长等 SMART 字段长时间为 0）
@@ -1284,6 +1294,7 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
             for s in smart_data:
                 s["timestamp"] = timestamp
             write_csv_once(date_dir, "smart.csv", smart_fields, smart_data)
+            db.insert_rows("smart", smart_data)
             # SMART 关键属性 (5/187/188/197/198) 数值变化邮件告警
             lsi_alert.check_smart_attr_changes(smart_data)
 
@@ -1292,11 +1303,13 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
     if pr:
         pr["timestamp"] = timestamp
         write_csv_once(date_dir, "patrol.csv", patrol_fields, [pr])
+        db.insert_rows("patrol", [pr])
 
     cc = collect_consistency_check()
     if cc:
         cc["timestamp"] = timestamp
         write_csv_once(date_dir, "consistency.csv", cc_fields, [cc])
+        db.insert_rows("consistency", [cc])
 
 
 if __name__ == "__main__":

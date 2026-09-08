@@ -75,7 +75,8 @@ info "注册 systemd 服务 $SERVICE_NAME"
 cat > "/etc/systemd/system/$SERVICE_NAME" <<EOF
 [Unit]
 Description=LSI MegaRAID Monitor Web
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -83,9 +84,16 @@ WorkingDirectory=$INSTALL_DIR
 Environment=LSI_DATA_DIR=$INSTALL_DIR/data
 Environment=LSI_WEB_HOST=0.0.0.0
 Environment=LSI_WEB_PORT=$WEB_PORT
+Environment=LSI_COOKIE_SECURE=${LSI_COOKIE_SECURE:-0}
 ExecStart=$PYTHON -m waitress --host=0.0.0.0 --port=$WEB_PORT web_server:app
 Restart=always
 RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=$INSTALL_DIR/data
+ProtectHome=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]
 WantedBy=multi-user.target

@@ -18,11 +18,13 @@ import json
 import os
 import re
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
 import threading
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta
 from functools import wraps
 from pathlib import Path
@@ -40,9 +42,14 @@ import lsi_alert
 import lsi_collectd
 import storage_mgr
 import user_mgr
+import db
+import pam_auth
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_DIR = Path(os.environ.get("LSI_DATA_DIR", str(PROJECT_ROOT / "data")))
+
+VERSION = "1.5.3"
+AUTH_MODE = os.environ.get("LSI_AUTH_MODE", "pam")
 
 LOCAL_STORCLI = PROJECT_ROOT / "storcli64"
 STORCLI = os.environ.get(
@@ -51,6 +58,29 @@ STORCLI = os.environ.get(
 )
 CONTROLLER = os.environ.get("LSI_CONTROLLER", "/c0")
 SMARTCTL = os.environ.get("SMARTCTL_PATH", "/usr/sbin/smartctl")
+
+# ---- 登录防爆破：按来源 IP 在时间窗内限制失败次数 ----
+LOGIN_WINDOW_SECONDS = 300
+LOGIN_MAX_ATTEMPTS = 10
+_login_attempts: defaultdict[str, list] = defaultdict(list)
+
+
+def _login_block_seconds(ip: str) -> int:
+    now = time.time()
+    attempts = [t for t in _login_attempts[ip] if now - t < LOGIN_WINDOW_SECONDS]
+    _login_attempts[ip] = attempts
+    if len(attempts) < LOGIN_MAX_ATTEMPTS:
+        return 0
+    oldest = min(attempts)
+    return int(LOGIN_WINDOW_SECONDS - (now - oldest)) + 1
+
+
+def _record_login_failure(ip: str) -> None:
+    _login_attempts[ip].append(time.time())
+
+
+def _clear_login_failures(ip: str) -> None:
+    _login_attempts.pop(ip, None)
 
 
 def _smart_base_device() -> str:
@@ -173,6 +203,7 @@ app.secret_key = _load_secret_key()
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("LSI_COOKIE_SECURE", "0") == "1",
     PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
     MAX_CONTENT_LENGTH=1 * 1024 * 1024,
 )
@@ -230,6 +261,19 @@ def _start_embedded_collector() -> None:
     t.start()
 
 
+# 启动时把历史 CSV 幂等迁移进 SQLite，并按配置执行保留清理
+try:
+    db.migrate_from_csv()
+    try:
+        retention_days = int(os.environ.get("LSI_RETENTION_DAYS", "0"))
+    except (ValueError, TypeError):
+        retention_days = 0
+    if retention_days > 0:
+        db.prune(retention_days)
+except Exception as exc:  # SQLite 异常不应阻断 Web 服务启动
+    print(f"[db] init error: {exc}", file=sys.stderr)
+
+
 _start_embedded_collector()
 
 
@@ -238,6 +282,11 @@ def security_headers(resp):
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["Referrer-Policy"] = "same-origin"
+    resp.headers["X-Permitted-Cross-Domain-Policies"] = "none"
+    resp.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    resp.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    if getattr(resp, "mimetype", None) == "text/html":
+        resp.headers["Cache-Control"] = "no-store"
     return resp
 
 
@@ -245,6 +294,8 @@ def security_headers(resp):
 
 
 def auth_required() -> bool:
+    if AUTH_MODE == "pam":
+        return True
     return user_mgr.users_exist()
 
 
@@ -332,6 +383,19 @@ def _fmt_bytes(val, base=1024) -> str:
 _PREDICT_LEVELS = {"ok": 0, "info": 1, "warn": 2, "crit": 3}
 
 
+def _linear_slope(points: list[tuple[float, float]]) -> float:
+    """对 (x, y) 序列做最小二乘线性拟合，返回斜率；不足两点返回 0。"""
+    n = len(points)
+    if n < 2:
+        return 0.0
+    mean_x = sum(x for x, _ in points) / n
+    mean_y = sum(y for _, y in points) / n
+    denom = sum((x - mean_x) ** 2 for x, _ in points)
+    if denom == 0:
+        return 0.0
+    return sum((x - mean_x) * (y - mean_y) for x, y in points) / denom
+
+
 def _smart_history() -> dict:
     """按 did 汇总各日期目录中的 SMART 快照（每天一份），用于趋势判断"""
     hist: dict[str, list] = {}
@@ -395,18 +459,21 @@ def _predict_disk(row: dict, hist_rows: list, temp_warn: int, temp_crit: int) ->
     if poh >= 43800:
         bump("info", f"通电时长 {poh} 小时（超过 5 年），注意老化风险")
 
-    # 趋势：与最早一份快照对比，关键计数器增长即升级
-    if len(hist_rows) >= 2:
-        first_day, first = hist_rows[0]
-        last_day = hist_rows[-1][0]
+    # 趋势：用每日 SMART 快照做线性斜率，关键计数器持续增长即升级
+    if len(hist_rows) >= 3:
+        span_days = len(hist_rows) - 1
         for field, name, lv in (
             ("pending", "待定扇区", "crit"),
             ("reallocated", "重映射扇区", "warn"),
             ("uncorrectable", "无法纠正错误", "warn"),
         ):
-            delta = _to_int(latest.get(field), 0) - _to_int(first.get(field), 0)
-            if delta > 0:
-                bump(lv, f"{name}在 {first_day} ~ {last_day} 期间新增 {delta} 个，呈增长趋势")
+            pts = [
+                (i, float(_to_int(hist_rows[i][1].get(field), 0)))
+                for i in range(len(hist_rows))
+            ]
+            slope = _linear_slope(pts)
+            if slope > 0:
+                bump(lv, f"{name}近 {span_days} 天呈上升趋势，平均每天 +{slope:.2f}")
 
     return {"level": level, "reasons": reasons}
 
@@ -638,7 +705,51 @@ def build_status() -> dict:
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", version=VERSION)
+
+
+# ---- 健康检查（供负载均衡 / 监控系统 / systemd 探活）----
+
+
+@app.get("/api/healthz")
+def api_healthz():
+    marker = BASE_DIR / ".last_collect"
+    last_collect = None
+    age_seconds = None
+    if marker.exists():
+        try:
+            last_collect = marker.read_text(encoding="utf-8").strip()
+            age_seconds = int((datetime.now() - datetime.strptime(last_collect, "%Y-%m-%d %H:%M")).total_seconds())
+        except Exception:
+            last_collect = None
+            age_seconds = None
+    interval = _load_collection_config().get("interval_minutes", 1)
+    max_age_seconds = (interval * 2 + 1) * 60
+    healthy = age_seconds is None or age_seconds <= max_age_seconds
+    try:
+        usage = shutil.disk_usage(BASE_DIR)
+        disk = {"total": usage.total, "used": usage.used, "free": usage.free}
+    except OSError:
+        disk = {"total": None, "used": None, "free": None}
+    payload = {
+        "ok": healthy,
+        "version": VERSION,
+        "host": socket.gethostname(),
+        "now": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "last_collect": last_collect,
+        "last_collect_age_seconds": age_seconds,
+        "collector": {
+            "interval_minutes": interval,
+            "max_age_seconds": max_age_seconds,
+        },
+        "storcli": {
+            "path": STORCLI,
+            "available": bool(os.path.isfile(STORCLI)),
+        },
+        "data_dir": str(BASE_DIR),
+        "disk": disk,
+    }
+    return jsonify(payload), 200 if healthy else 503
 
 
 # ---- 认证 API ----
@@ -649,16 +760,32 @@ def api_login():
     data = request.get_json(silent=True) or {}
     username = str(data.get("username", "")).strip()
     password = str(data.get("password", ""))
-    role = user_mgr.verify_password(username, password)
+    ip = request.remote_addr or "unknown"
+    block = _login_block_seconds(ip)
+    if block > 0:
+        return jsonify(ok=False, error=f"尝试次数过多，请 {block} 秒后重试"), 429
+    if AUTH_MODE == "pam":
+        role = pam_auth.user_role(username) if pam_auth.authenticate(username, password) else None
+    else:
+        role = user_mgr.verify_password(username, password)
     if not role:
-        lsi_alert.log_event("warning", f"登录失败: {username} ({request.remote_addr})")
+        _record_login_failure(ip)
+        lsi_alert.log_event("warning", f"登录失败: {username} ({ip})")
         return jsonify(ok=False, error="用户名或口令错误"), 401
+    _clear_login_failures(ip)
     session.clear()
     session["username"] = username
     session["role"] = role
     session.permanent = True
     lsi_alert.log_event("info", f"用户 {username} 登录")
-    return jsonify(ok=True, username=username, role=role)
+    return jsonify(
+        ok=True,
+        username=username,
+        role=role,
+        version=VERSION,
+        auth_mode=AUTH_MODE,
+        manage_users=AUTH_MODE != "pam",
+    )
 
 
 @app.post("/api/logout")
@@ -671,6 +798,9 @@ def api_logout():
 def api_me():
     required = auth_required()
     return jsonify(
+        version=VERSION,
+        auth_mode=AUTH_MODE,
+        manage_users=AUTH_MODE != "pam",
         auth_required=required,
         logged_in=bool(session.get("username")) if required else True,
         username=session.get("username", ""),
@@ -687,6 +817,101 @@ def api_status():
     return jsonify(build_status())
 
 
+@app.get("/api/disk_ledger")
+@login_required
+def api_disk_ledger():
+    st = build_status()
+    rows = []
+    for d in st.get("physical_disks", []):
+        first_seen, last_seen, count = db.disk_times(d.get("eid"), d.get("slot"))
+        pred = d.get("prediction") or {}
+        level = pred.get("level", "ok")
+        advice = {
+            "ok": "正常",
+            "info": "关注",
+            "warn": "建议安排更换",
+            "crit": "立即更换",
+        }.get(level, "正常")
+        rows.append(
+            {
+                "label": d.get("label"),
+                "eid": d.get("eid"),
+                "slot": d.get("slot"),
+                "model": d.get("model"),
+                "sn": d.get("sn"),
+                "fw_rev": d.get("fw_rev"),
+                "state": d.get("state"),
+                "temperature": d.get("temperature"),
+                "power_on_hours": d.get("power_on_hours"),
+                "reallocated": d.get("reallocated"),
+                "pending": d.get("pending"),
+                "uncorrectable": d.get("uncorrectable"),
+                "predict_level": level,
+                "predict_reasons": pred.get("reasons", []),
+                "replace_advice": advice,
+                "first_seen": datetime.fromtimestamp(first_seen).strftime("%Y-%m-%d %H:%M") if first_seen else None,
+                "last_seen": datetime.fromtimestamp(last_seen).strftime("%Y-%m-%d %H:%M") if last_seen else None,
+                "sample_count": count,
+            }
+        )
+    return jsonify(total=len(rows), disks=rows)
+
+
+@app.get("/api/report/summary")
+@login_required
+def api_report_summary():
+    st = build_status()
+    disks = st.get("physical_disks", [])
+    ctrl = st.get("controller", {})
+
+    def wear_score(d):
+        return (
+            _to_int(d.get("reallocated"), 0) * 3
+            + _to_int(d.get("pending"), 0) * 12
+            + _to_int(d.get("uncorrectable"), 0) * 6
+            + (_to_int(d.get("predictive_failure"), 0) * 50)
+        )
+
+    wear_top = sorted(disks, key=wear_score, reverse=True)[:8]
+    lifetime_top = sorted(
+        disks, key=lambda d: _to_int(d.get("power_on_hours"), 0), reverse=True
+    )[:8]
+
+    return jsonify(
+        generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        host=socket.gethostname(),
+        version=VERSION,
+        health=st.get("health"),
+        controller={
+            "model": ctrl.get("model"),
+            "fw": ctrl.get("fw"),
+            "health": ctrl.get("health"),
+        },
+        disks_total=len(disks),
+        vds_total=len(st.get("virtual_disks", [])),
+        wear_top=[
+            {
+                "label": d.get("label"),
+                "model": d.get("model"),
+                "reallocated": d.get("reallocated"),
+                "pending": d.get("pending"),
+                "uncorrectable": d.get("uncorrectable"),
+                "predict_level": (d.get("prediction") or {}).get("level", "ok"),
+            }
+            for d in wear_top
+        ],
+        lifetime_top=[
+            {
+                "label": d.get("label"),
+                "model": d.get("model"),
+                "power_on_hours": d.get("power_on_hours"),
+                "power_on_days": round(_to_int(d.get("power_on_hours"), 0) / 24, 1),
+            }
+            for d in lifetime_top
+        ],
+    )
+
+
 @app.get("/api/history")
 @login_required
 def api_history():
@@ -694,6 +919,18 @@ def api_history():
     if hours not in (6, 24, 72):
         hours = 24
     since = datetime.now() - timedelta(hours=hours)
+
+    if db.has_data():
+        series: dict[str, list] = {}
+        for row in db.history("disks", int(since.timestamp())):
+            temp = _to_int(row.get("temperature"))
+            if temp is None or row.get("state") == "N/A":
+                continue
+            label = f"E{row.get('eid')}:S{row.get('slot')}"
+            series.setdefault(label, []).append([int(row["_ts_epoch"] * 1000), temp])
+        return jsonify(
+            series=[{"label": label, "points": pts} for label, pts in sorted(series.items())]
+        )
 
     series: dict[str, list] = {}
     for date_dir in _date_dirs():
@@ -768,10 +1005,12 @@ def api_alert_config_get():
     return jsonify(
         enabled=lsi_alert.alert_enabled(cfg),
         sendmail_available=lsi_alert.sendmail_available(cfg),
+        webhook_configured=lsi_alert.webhook_enabled(cfg),
         locked=lsi_alert.locked_fields(),
         config={
             "alert_email_to": cfg.get("alert_email_to", ""),
             "sendmail_path": cfg.get("sendmail_path", ""),
+            "webhook_url": cfg.get("webhook_url", ""),
             "temp_warn": int(cfg.get("temp_warn", 45)),
             "temp_crit": int(cfg.get("temp_crit", 55)),
             "policies": lsi_alert.effective_policies(cfg),
@@ -788,6 +1027,8 @@ def api_alert_config_save():
         cfg["alert_email_to"] = str(data["alert_email_to"]).strip()
     if "sendmail_path" in data:
         cfg["sendmail_path"] = str(data["sendmail_path"]).strip()
+    if "webhook_url" in data:
+        cfg["webhook_url"] = str(data["webhook_url"]).strip()
     for key in ("temp_warn", "temp_crit"):
         if key in data:
             val = _to_int(data[key])
@@ -820,6 +1061,20 @@ def api_alert_test():
     )
     if ok:
         lsi_alert.log_event("info", "测试报警邮件发送成功")
+        return jsonify(ok=True)
+    return jsonify(ok=False, error=msg), 500
+
+
+@app.post("/api/webhook_test")
+@admin_required
+def api_webhook_test():
+    ok, msg = lsi_alert.send_webhook(
+        "测试报警",
+        f"这是一条来自 LSI RAID 监控的测试消息。\n主机: {socket.gethostname()}\n时间: {datetime.now():%Y-%m-%d %H:%M:%S}",
+        "info",
+    )
+    if ok:
+        lsi_alert.log_event("info", "测试 Webhook 发送成功")
         return jsonify(ok=True)
     return jsonify(ok=False, error=msg), 500
 
@@ -1214,12 +1469,16 @@ def api_nfs_remove():
 @app.get("/api/users")
 @admin_required
 def api_users_list():
+    if AUTH_MODE == "pam":
+        return jsonify(users=[]), 200
     return jsonify(users=user_mgr.list_users())
 
 
 @app.post("/api/users")
 @admin_required
 def api_users_create():
+    if AUTH_MODE == "pam":
+        return jsonify(ok=False, error="PAM 模式下用户由系统管理"), 501
     data = request.get_json(silent=True) or {}
     username = str(data.get("username", "")).strip()
     ok, msg = user_mgr.create_user(
@@ -1236,6 +1495,8 @@ def api_users_create():
 @app.delete("/api/users/<username>")
 @admin_required
 def api_users_delete(username: str):
+    if AUTH_MODE == "pam":
+        return jsonify(ok=False, error="PAM 模式下用户由系统管理"), 501
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", username):
         return jsonify(ok=False, error="非法用户名"), 400
     if username == session.get("username"):
@@ -1250,6 +1511,8 @@ def api_users_delete(username: str):
 @app.post("/api/users/<username>/password")
 @admin_required
 def api_users_reset_password(username: str):
+    if AUTH_MODE == "pam":
+        return jsonify(ok=False, error="PAM 模式下用户由系统管理"), 501
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", username):
         return jsonify(ok=False, error="非法用户名"), 400
     data = request.get_json(silent=True) or {}
@@ -1440,6 +1703,20 @@ def api_fs_history():
         hours = 24
     since = datetime.now() - timedelta(hours=hours)
     hidden = _load_fs_hidden()
+
+    if db.has_data():
+        series: dict[str, list] = {}
+        for row in db.history("fs", int(since.timestamp())):
+            if row.get("mountpoint") in hidden:
+                continue
+            label = f"{row.get('device')} ({row.get('mountpoint')})"
+            try:
+                pct = float(row.get("use_percent") or 0)
+            except (ValueError, TypeError):
+                continue
+            series.setdefault(label, []).append([int(row["_ts_epoch"] * 1000), pct])
+        return jsonify(series=[{"label": k, "points": v} for k, v in sorted(series.items())])
+
     series: dict[str, list] = {}
     for date_dir in _date_dirs():
         try:
@@ -1476,6 +1753,36 @@ def api_io_history():
     if hours not in (6, 24, 72):
         hours = 24
     since = datetime.now() - timedelta(hours=hours)
+
+    if db.has_data():
+        samples: dict[str, list] = {}
+        for row in db.history("io", int(since.timestamp())):
+            samples.setdefault(row.get("name", ""), []).append(
+                (
+                    row["_ts_epoch"],
+                    _to_int(row.get("sectors_read"), 0),
+                    _to_int(row.get("sectors_written"), 0),
+                    _to_int(row.get("reads"), 0) + _to_int(row.get("writes"), 0),
+                )
+            )
+        series = []
+        for name, pts in sorted(samples.items()):
+            pts.sort(key=lambda p: p[0])
+            out = []
+            for (t1, r1, w1, io1), (t2, r2, w2, io2) in zip(pts, pts[1:]):
+                dt = t2 - t1
+                if dt <= 0 or r2 < r1 or w2 < w1:
+                    continue
+                out.append(
+                    [
+                        int(t2 * 1000),
+                        round((r2 - r1) * 512 / 1024 / dt, 1),
+                        round((w2 - w1) * 512 / 1024 / dt, 1),
+                        round((io2 - io1) / dt, 1),
+                    ]
+                )
+            series.append({"label": name, "points": out})
+        return jsonify(series=series)
 
     samples: dict[str, list] = {}
     for date_dir in _date_dirs():

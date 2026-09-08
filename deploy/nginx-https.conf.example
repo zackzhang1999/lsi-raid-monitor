@@ -1,0 +1,32 @@
+# LSI RAID 监控台 — Nginx HTTPS 反代示例
+# 将本文件改名为 lsi-raid-monitor.conf 放入 /etc/nginx/conf.d/ 后：
+#   nginx -t && systemctl reload nginx
+# 反代后请把服务设为 LSI_COOKIE_SECURE=1，并限制 5200 端口仅本机访问。
+
+server {
+    listen 80;
+    server_name your.domain.example;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name your.domain.example;
+
+    ssl_certificate     /etc/ssl/certs/your-domain.crt;
+    ssl_certificate_key /etc/ssl/private/your-domain.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    client_max_body_size 1m;
+
+    location / {
+        proxy_pass http://127.0.0.1:5200;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 130s;
+    }
+}

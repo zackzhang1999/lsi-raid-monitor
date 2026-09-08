@@ -119,6 +119,9 @@ const state = {
   ctlLines: 100,
   ctlQuery: '',
   storageLoaded: false,
+  opsLoaded: false,
+  bayCapacity: 'auto',
+  bayLayout: {},
   usersLoaded: false,
   nfsLoaded: false,
   refreshTimer: null,
@@ -128,7 +131,7 @@ const state = {
 
 const HEALTH_TEXT = { ok: '正常', warn: '警告', crit: '严重', unknown: '未知' };
 const BADGE_OK_STATES = ['onln', 'optl', 'optimal', 'ok', 'online', 'good', 'ugood', 'jbod', 'ghs', 'dhs'];
-const BADGE_CRIT_STATES = ['ubad', 'failed', 'fail', 'degraded', 'dead', 'offline', 'offln', 'missing'];
+const BADGE_CRIT_STATES = ['ubad', 'failed', 'fail', 'degraded', 'dead', 'offline', 'offlin', 'offln', 'missing'];
 
 function stateTone(s) {
   const v = String(s || '').toLowerCase();
@@ -246,7 +249,13 @@ async function boot() {
     const me = await api('/api/me');
     state.me = me;
     state.authRequired = !!me.auth_required;
-    if (me.auth_required && !me.logged_in) { showLogin(); return; }
+    if (me.auth_required && !me.logged_in) {
+      $('#login-sub').textContent = me.auth_mode === 'pam'
+        ? '使用服务器系统账号登录'
+        : '登录以查看控制器、磁盘与存储状态';
+      showLogin();
+      return;
+    }
     await afterLogin();
   } catch (e) {
     toast('无法连接后端：' + e.message, 'error');
@@ -258,7 +267,7 @@ async function afterLogin() {
   state.isAdmin = !me.auth_required || me.role === 'admin';
   hideLogin();
   // 角色相关可见性
-  $('#nav-users').classList.toggle('hidden', !state.isAdmin);
+  $('#nav-users').classList.toggle('hidden', !(me.manage_users && state.isAdmin));
   // 未创建管理员账号时的安全提示横幅
   $('#security-banner').classList.toggle('hidden', state.authRequired);
   $('#btn-collect').classList.toggle('hidden', !state.isAdmin);
@@ -267,9 +276,11 @@ async function afterLogin() {
   $('#sel-interval').disabled = !state.isAdmin;
   $('#btn-alert-save').disabled = !state.isAdmin;
   $('#btn-alert-test').disabled = !state.isAdmin;
+  $('#btn-webhook-test').disabled = !state.isAdmin;
   const name = me.username || 'admin';
   $('#user-name').textContent = name + (state.authRequired ? '' : '（未认证）');
   $('#user-avatar').textContent = (name[0] || '?');
+  $('#app-version').textContent = me.version ? 'v' + me.version : '';
   await loadAll();
   if (state.refreshTimer) clearInterval(state.refreshTimer);
   state.refreshTimer = setInterval(() => loadStatus().catch(() => {}), 60000);
@@ -1232,10 +1243,14 @@ async function loadAlertConfig() {
   const sm = $('#sendmail-badge');
   sm.className = 'badge ' + (cfg.sendmail_available ? 'ok' : 'crit');
   sm.textContent = cfg.sendmail_available ? 'sendmail 可用' : 'sendmail 不可用';
+  const wh = $('#webhook-badge');
+  wh.className = 'badge ' + (cfg.webhook_configured ? 'ok' : '');
+  wh.textContent = cfg.webhook_configured ? 'Webhook 已配置' : 'Webhook 未配置';
 
   const map = [
     ['alert_email_to', '#alert-email'],
     ['sendmail_path', '#alert-sendmail'],
+    ['webhook_url', '#alert-webhook'],
     ['temp_warn', '#alert-warn'],
     ['temp_crit', '#alert-crit'],
   ];
@@ -1263,6 +1278,7 @@ async function saveAlertConfig(ev) {
     const body = {
       alert_email_to: $('#alert-email').value.trim(),
       sendmail_path: $('#alert-sendmail').value.trim(),
+      webhook_url: $('#alert-webhook').value.trim(),
       temp_warn: Number($('#alert-warn').value),
       temp_crit: Number($('#alert-crit').value),
       policies: Object.fromEntries(
@@ -1288,6 +1304,20 @@ async function testAlert() {
     const r = await api('/api/alert_test', { method: 'POST' });
     if (r && r.ok === false) throw new Error(r.error || '发送失败');
     toast('测试报警已发送', 'ok');
+  } catch (e) {
+    toast(e.message, 'error');
+  } finally {
+    btnLoading(btn, false);
+  }
+}
+
+async function testWebhook() {
+  const btn = $('#btn-webhook-test');
+  btnLoading(btn, true);
+  try {
+    const r = await api('/api/webhook_test', { method: 'POST' });
+    if (r && r.ok === false) throw new Error(r.error || '发送失败');
+    toast('测试 Webhook 已发送', 'ok');
   } catch (e) {
     toast(e.message, 'error');
   } finally {
@@ -1696,16 +1726,367 @@ async function createUser(ev) {
   }
 }
 
+/* ---------- 运维中心 ---------- */
+
+function levelBadge(level) {
+  const map = { ok: ['', '正常'], info: ['info', '关注'], warn: ['warn', '预警'], crit: ['crit', '高危'] };
+  const [cls, text] = map[level] || ['', level || '正常'];
+  return `<span class="badge ${cls}">${text}</span>`;
+}
+
+async function loadOps() {
+  state.opsLoaded = true;
+  await Promise.allSettled([renderEnclosures(), loadLedger(), loadReport()]);
+}
+
+function diskVisualTone(d) {
+  let tone = stateTone(d.state);
+  const pv = (d.prediction && d.prediction.level) || 'ok';
+  if (pv === 'crit') tone = 'crit';
+  else if (pv === 'warn' && tone !== 'crit') tone = 'warn';
+  const tt = tempTone(Number(d.temperature));
+  if (tt === 'crit') tone = 'crit';
+  else if (tt === 'warn' && tone !== 'crit') tone = 'warn';
+  return tone === 'ok' || tone === 'warn' || tone === 'crit' ? tone : 'unknown';
+}
+
+function isHotSpare(d) {
+  return /(^|[^a-z])h?s$/i.test(String(d.state || '')) && !/online/i.test(String(d.state || ''));
+}
+
+function bayProgress(d) {
+  const kinds = [
+    ['rebuild', 'var(--warn)'],
+    ['copyback', 'var(--primary)'],
+    ['erase', 'var(--crit)'],
+  ];
+  for (const [k, color] of kinds) {
+    const p = Number(d[k + '_progress']);
+    if (p > 0) return { pct: Math.min(100, p), color };
+  }
+  return null;
+}
+
+const BAY_SPECS = [
+  { bays: 8, u: '2U', uHeight: 220 },
+  { bays: 12, u: '2U', uHeight: 220 },
+  { bays: 16, u: '4U', uHeight: 440 },
+  { bays: 20, u: '5U', uHeight: 550 },
+  { bays: 24, u: '4U', uHeight: 440 },
+];
+
+function baySpecFor(bays) {
+  return BAY_SPECS.find(s => s.bays === Number(bays)) || null;
+}
+
+function autoBaySpec(count) {
+  const target = Math.max(8, count);
+  return BAY_SPECS.find(s => s.bays >= target) || BAY_SPECS[BAY_SPECS.length - 1];
+}
+
+function bayKey(d) {
+  return d.eid + ':' + d.slot;
+}
+
+function loadBayLayout() {
+  try {
+    state.bayLayout = JSON.parse(localStorage.getItem('lsi-bay-layout') || '{}');
+  } catch (e) {
+    state.bayLayout = {};
+  }
+}
+
+function saveBayLayout() {
+  try {
+    localStorage.setItem('lsi-bay-layout', JSON.stringify(state.bayLayout));
+  } catch (e) { /* 忽略 */ }
+}
+
+function arrangeDisks(list, capacity, eid) {
+  const key = String(eid);
+  const slots = new Array(capacity).fill(null);
+  const byKey = {};
+  list.forEach(d => { byKey[bayKey(d)] = d; });
+  const saved = state.bayLayout[key];
+  if (Array.isArray(saved)) {
+    const placed = new Set();
+    saved.forEach((k, i) => {
+      if (i < capacity && byKey[k]) {
+        slots[i] = byKey[k];
+        placed.add(k);
+      }
+    });
+    list.forEach(d => {
+      if (!placed.has(bayKey(d))) {
+        const idx = slots.indexOf(null);
+        if (idx >= 0) slots[idx] = d;
+      }
+    });
+    return slots;
+  }
+  list.forEach((d, i) => { if (i < capacity) slots[i] = d; });
+  return slots;
+}
+
+let _dragState = null;
+
+function onTrayDragStart(ev) {
+  _dragState = { eid: ev.currentTarget.dataset.eid, idx: Number(ev.currentTarget.dataset.idx) };
+  ev.dataTransfer.effectAllowed = 'move';
+  try { ev.dataTransfer.setData('text/plain', ''); } catch (e) { /* 忽略 */ }
+  ev.currentTarget.classList.add('dragging');
+}
+
+function onTrayDragOver(ev) {
+  ev.preventDefault();
+  ev.dataTransfer.dropEffect = 'move';
+  ev.currentTarget.classList.add('drop-target');
+}
+
+function onTrayDragLeave(ev) {
+  ev.currentTarget.classList.remove('drop-target');
+}
+
+function onTrayDrop(ev) {
+  ev.preventDefault();
+  ev.currentTarget.classList.remove('drop-target');
+  if (!_dragState) return;
+  const srcEid = _dragState.eid;
+  const srcIdx = _dragState.idx;
+  const dstEid = ev.currentTarget.dataset.eid;
+  const dstIdx = Number(ev.currentTarget.dataset.idx);
+  if (srcEid !== dstEid || srcIdx === dstIdx) return;
+  moveBay(String(srcEid), srcIdx, dstIdx);
+}
+
+function onTrayDragEnd(ev) {
+  ev.currentTarget.classList.remove('dragging');
+  _dragState = null;
+  $$('.drop-target').forEach(el => el.classList.remove('drop-target'));
+}
+
+function moveBay(eid, from, to) {
+  const st = state.status;
+  const disks = (st.physical_disks || [])
+    .filter(d => String(d.eid) === String(eid))
+    .sort((a, b) => Number(a.slot) - Number(b.slot));
+  const spec = state.bayCapacity && state.bayCapacity !== 'auto'
+    ? baySpecFor(Number(state.bayCapacity)) || autoBaySpec(disks.length)
+    : autoBaySpec(disks.length);
+  const capacity = spec.bays;
+  const slots = arrangeDisks(disks, capacity, eid);
+  if (from < 0 || from >= slots.length || to < 0 || to >= slots.length || !slots[from]) return;
+  const moved = slots[from];
+  slots[from] = slots[to];
+  slots[to] = moved;
+  state.bayLayout[String(eid)] = slots.map(d => (d ? bayKey(d) : null));
+  saveBayLayout();
+  renderEnclosures();
+}
+
+async function renderEnclosures() {
+  const wrap = $('#enclosure-view');
+  wrap.innerHTML = '<div class="loading-line">加载中…</div>';
+  let st = state.status;
+  if (!st) {
+    try {
+      st = await api('/api/status');
+      state.status = st;
+    } catch (e) {
+      wrap.innerHTML = `<div class="muted">加载失败：${esc(e.message)}</div>`;
+      return;
+    }
+  }
+  const disks = st.physical_disks || [];
+  const ctrl = st.controller || {};
+  loadBayLayout();
+  wrap.innerHTML = '';
+  if (!disks.length) {
+    wrap.innerHTML = '<div class="muted">暂无磁盘数据</div>';
+    return;
+  }
+
+  const tools = document.createElement('div');
+  tools.className = 'bay-tools';
+  tools.innerHTML = '<span class="tiny">拖动托盘可重新排布盘位；定位灯亮起时对应 LED 会闪烁</span><button class="btn sm" id="btn-bay-reset" type="button">重置排布</button>';
+  wrap.appendChild(tools);
+  $('#btn-bay-reset').addEventListener('click', () => {
+    state.bayLayout = {};
+    saveBayLayout();
+    renderEnclosures();
+  });
+
+  const groups = {};
+  disks.forEach(d => {
+    const eid = String(d.eid);
+    (groups[eid] || (groups[eid] = [])).push(d);
+  });
+
+  Object.keys(groups).sort((a, b) => Number(a) - Number(b)).forEach(eid => {
+    const list = groups[eid].slice().sort((a, b) => Number(a.slot) - Number(b.slot));
+    const spec = state.bayCapacity && state.bayCapacity !== 'auto'
+      ? baySpecFor(Number(state.bayCapacity)) || autoBaySpec(list.length)
+      : autoBaySpec(list.length);
+    const capacity = spec.bays;
+    const uLabel = spec.u;
+    const rows = capacity / 4;
+    const gap = 14;
+    const trayH = Math.max(64, Math.floor((spec.uHeight - (rows - 1) * gap) / rows));
+    const placed = arrangeDisks(list, capacity, eid);
+    const ctrlTone = stateTone(ctrl.health) === 'crit' ? 'crit' : stateTone(ctrl.health) === 'warn' ? 'warn' : 'ok';
+    const bbuTone = stateTone(ctrl.bbu_state) === 'crit' ? 'crit' : stateTone(ctrl.bbu_state) === 'warn' ? 'warn' : 'ok';
+    const healthText = HEALTH_TEXT[st.health] || st.health || '未知';
+    const rocText = ctrl.roc_temp != null ? ctrl.roc_temp + '°C' : '—';
+    const view = document.createElement('div');
+    view.className = 'chassis-view';
+    view.innerHTML = `
+      <div class="chassis">
+        <span class="rack-ear rack-ear-left" aria-hidden="true"></span>
+        <span class="rack-ear rack-ear-right" aria-hidden="true"></span>
+        <span class="screw screw-tl" aria-hidden="true"></span>
+        <span class="screw screw-tr" aria-hidden="true"></span>
+        <span class="screw screw-bl" aria-hidden="true"></span>
+        <span class="screw screw-br" aria-hidden="true"></span>
+        <div class="chassis-top">
+          <div class="chassis-brand">
+            <span class="chassis-name">MegaRAID Storage</span>
+            <span class="chassis-model">${esc(ctrl.model || 'Controller')} · FW ${esc(ctrl.fw || '—')}</span>
+            <span class="chassis-asset">${esc(st.host || '')} · Enclosure ${esc(eid)}</span>
+          </div>
+          <div class="chassis-status">
+            <span class="status-cell"><span class="panel-led led-power"></span>PWR</span>
+            <span class="status-cell"><span class="panel-led led-fan"></span>FAN</span>
+            <span class="status-cell"><span class="panel-led led-${bbuTone}"></span>BBU</span>
+            <span class="status-cell"><span class="panel-led led-${ctrlTone}"></span>CTRL</span>
+          </div>
+        </div>
+        <div class="chassis-screen screen-${esc(st.health || 'unknown')}" aria-hidden="true">${esc(healthText)} · ROC ${esc(rocText)}</div>
+        <div class="bay-rack"></div>
+        <div class="chassis-foot">
+          <span class="panel-label">Enclosure ${esc(eid)} · ${uLabel} · ${capacity} 盘位 · 已装 ${list.length}</span>
+          <span class="chassis-vents"></span>
+        </div>
+      </div>`;
+    const rack = view.querySelector('.bay-rack');
+    rack.style.setProperty('--tray-h', trayH + 'px');
+    for (let i = 0; i < capacity; i++) {
+      const d = placed[i];
+      const tray = document.createElement('button');
+      tray.type = 'button';
+      tray.dataset.eid = eid;
+      tray.dataset.idx = String(i);
+      if (!d) {
+        tray.className = 'tray tray-empty';
+        tray.disabled = true;
+        tray.innerHTML = `<span class="tray-slot">空槽</span>`;
+      } else {
+        const tone = diskVisualTone(d);
+        const hs = isHotSpare(d);
+        const prog = bayProgress(d);
+        tray.className = 'tray tray-' + tone + (hs ? ' tray-hs' : '') + (d.locate ? ' tray-locate' : '');
+        const stateText = (hs ? '热备 · ' : '') + (d.state || '—');
+        const tempText = d.temperature != null ? d.temperature + '°C' : '—';
+        tray.innerHTML = `
+          <span class="tray-handle"></span>
+          <span class="tray-led"></span>
+          <span class="tray-meta">
+            <span class="tray-slot">${esc(d.label)}</span>
+            <span class="tray-model">${esc(d.model || '—')}</span>
+          </span>
+          <span class="tray-temp">${tempText}</span>
+          <span class="tray-state">${esc(stateText)}</span>
+          ${prog ? `<span class="tray-progress"><i style="width:${prog.pct}%;background:${prog.color}"></i></span>` : ''}`;
+        tray.title = `${d.model || '—'} · ${d.sn || '—'} · ${d.state || '—'} · ${tempText}`;
+        tray.draggable = true;
+        tray.addEventListener('dragstart', onTrayDragStart);
+        tray.addEventListener('dragend', onTrayDragEnd);
+        tray.addEventListener('click', () => openDrawer(d));
+      }
+      tray.addEventListener('dragover', onTrayDragOver);
+      tray.addEventListener('dragleave', onTrayDragLeave);
+      tray.addEventListener('drop', onTrayDrop);
+      rack.appendChild(tray);
+    }
+    wrap.appendChild(view);
+  });
+}
+
+async function loadLedger() {
+  const tb = $('#ledger-table tbody');
+  tb.innerHTML = '<tr><td colspan="12" class="muted">加载中…</td></tr>';
+  let data;
+  try {
+    data = await api('/api/disk_ledger');
+  } catch (e) {
+    tb.innerHTML = `<tr><td colspan="12" class="muted">加载失败：${esc(e.message)}</td></tr>`;
+    return;
+  }
+  const rows = data.disks || [];
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td colspan="12" class="muted">暂无磁盘数据</td></tr>';
+    return;
+  }
+  tb.innerHTML = rows.map(r => {
+    const adviceCls = r.replace_advice === '立即更换' ? 'crit' : r.replace_advice === '建议安排更换' ? 'warn' : r.replace_advice === '关注' ? 'info' : '';
+    return `<tr>
+      <td class="num">${esc(r.label)}</td>
+      <td>${esc(r.model || '—')}</td>
+      <td class="num">${esc(r.sn || '—')}</td>
+      <td>${stateBadge(r.state)}</td>
+      <td class="num">${r.temperature != null ? esc(r.temperature) + '°C' : '—'}</td>
+      <td class="num">${esc(fmtHours(r.power_on_hours))}</td>
+      <td class="num">${esc(r.reallocated != null ? r.reallocated : '—')}</td>
+      <td class="num">${esc(r.pending != null ? r.pending : '—')}</td>
+      <td class="num">${esc(r.uncorrectable != null ? r.uncorrectable : '—')}</td>
+      <td>${levelBadge(r.predict_level)}</td>
+      <td><span class="badge ${adviceCls}">${esc(r.replace_advice)}</span></td>
+      <td class="num">${esc(r.last_seen || '—')}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function loadReport() {
+  const wear = $('#wear-top');
+  const life = $('#lifetime-top');
+  let data;
+  try {
+    data = await api('/api/report/summary');
+  } catch (e) {
+    wear.innerHTML = `<div class="muted">加载失败：${esc(e.message)}</div>`;
+    life.innerHTML = '<div class="muted">加载失败</div>';
+    return;
+  }
+  const wearRows = data.wear_top || [];
+  wear.innerHTML = wearRows.length
+    ? wearRows.map(x => `<div class="rank-row">
+        <span class="rank-label">${esc(x.label)}</span>
+        <span class="rank-sub">${esc(x.model || '—')}</span>
+        <span class="rank-metrics">重映射 ${esc(x.reallocated)} · 待定 ${esc(x.pending)} · 无法纠正 ${esc(x.uncorrectable)}</span>
+        ${levelBadge(x.predict_level)}
+      </div>`).join('')
+    : '<div class="muted">暂无磨损数据</div>';
+
+  const lifeRows = data.lifetime_top || [];
+  life.innerHTML = lifeRows.length
+    ? lifeRows.map(x => `<div class="rank-row">
+        <span class="rank-label">${esc(x.label)}</span>
+        <span class="rank-sub">${esc(x.model || '—')}</span>
+        <span class="rank-metrics">${esc(x.power_on_hours)} 小时 · ${esc(x.power_on_days)} 天</span>
+      </div>`).join('')
+    : '<div class="muted">暂无通电时长数据</div>';
+}
+
 /* ---------- 视图切换 ---------- */
 function switchView(v) {
   state.view = v;
   $$('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.view === v));
-  ['overview', 'storage', 'logs', 'users'].forEach(name => {
+  ['overview', 'storage', 'logs', 'ops', 'users'].forEach(name => {
     $('#view-' + name).classList.toggle('hidden', name !== v);
   });
   if (v === 'storage' && !state.storageLoaded) loadStorage();
   if (v === 'storage' && !state.fsUsage) loadFsUsage();
   if (v === 'storage' && !state.nfsLoaded) loadNfs();
+  if (v === 'ops' && !state.opsLoaded) loadOps();
   if (v === 'users' && !state.usersLoaded) loadUsers();
   $('#sidebar').classList.remove('open');
   $('#sidebar-scrim').classList.remove('show');
@@ -1792,7 +2173,15 @@ function bindUI() {
         method: 'POST',
         body: { username: $('#login-username').value.trim(), password: $('#login-password').value },
       });
-      state.me = { auth_required: true, logged_in: true, username: r.username, role: r.role };
+      state.me = {
+        auth_required: true,
+        logged_in: true,
+        username: r.username,
+        role: r.role,
+        version: r.version,
+        auth_mode: r.auth_mode || 'local',
+        manage_users: r.manage_users !== false,
+      };
       await afterLogin();
     } catch (e) {
       $('#login-error').textContent = e.message || '登录失败';
@@ -1804,6 +2193,7 @@ function bindUI() {
   // 报警配置
   $('#alert-form').addEventListener('submit', saveAlertConfig);
   $('#btn-alert-test').addEventListener('click', testAlert);
+  $('#btn-webhook-test').addEventListener('click', testWebhook);
 
   // 图表类型与时间范围
   $$('#chart-type .chip').forEach(ch => ch.addEventListener('click', () => {
@@ -1863,6 +2253,11 @@ function bindUI() {
   // 存储 / 用户
   $('#btn-storage-refresh').addEventListener('click', () => { loadStorage(); loadFsUsage(); });
   $('#btn-fs-refresh').addEventListener('click', loadFsUsage);
+  $('#btn-ledger-refresh').addEventListener('click', () => { renderEnclosures(); loadLedger(); loadReport(); });
+  $('#bay-capacity').addEventListener('change', (ev) => {
+    state.bayCapacity = ev.target.value;
+    renderEnclosures();
+  });
   $$('#alarm-actions [data-alarm]').forEach(b =>
     b.addEventListener('click', () => alarmAction(b.dataset.alarm)));
   $$('#jbod-actions [data-jbod]').forEach(b =>

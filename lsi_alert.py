@@ -19,6 +19,7 @@ import subprocess
 import socket
 from datetime import datetime
 from pathlib import Path
+from urllib import request as urlrequest
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_DIR = Path(os.environ.get("LSI_DATA_DIR", str(PROJECT_ROOT / "data")))
@@ -30,6 +31,7 @@ EVENTS_FILE = BASE_DIR / "events.jsonl"
 DEFAULT_CONFIG = {
     "alert_email_to": "",
     "sendmail_path": "/usr/sbin/sendmail",
+    "webhook_url": "",
     "temp_warn": 45,
     "temp_crit": 55,
     "policies": {},
@@ -52,6 +54,7 @@ DEFAULT_POLICIES = {
 ENV_OVERRIDES = {
     "alert_email_to": "ALERT_EMAIL_TO",
     "sendmail_path": "SENDMAIL_PATH",
+    "webhook_url": "WEBHOOK_URL",
     "temp_warn": "ALERT_TEMP_WARN",
     "temp_crit": "ALERT_TEMP_CRIT",
 }
@@ -139,6 +142,11 @@ def alert_enabled(cfg: dict | None = None) -> bool:
     return bool(str(cfg.get("alert_email_to", "")).strip())
 
 
+def webhook_enabled(cfg: dict | None = None) -> bool:
+    cfg = cfg or load_config()
+    return bool(str(cfg.get("webhook_url", "")).strip())
+
+
 # ---- 事件日志（Web 事件页面读取同一文件）----
 
 
@@ -196,15 +204,50 @@ def send_mail(subject: str, body: str, cfg: dict | None = None) -> tuple[bool, s
         return False, str(e)
 
 
+def send_webhook(subject: str, body: str, level: str = "error", cfg: dict | None = None) -> tuple[bool, str]:
+    """向通用 Webhook 地址 POST 一条 JSON 报警，兼容钉钉/飞书/企业微信的自定义机器人
+    请使用它们提供的「关键字/加签」地址以通过安全校验。"""
+    cfg = cfg or load_config()
+    url = str(cfg.get("webhook_url", "")).strip()
+    if not url:
+        return False, "未配置 Webhook 地址"
+    payload = {
+        "source": "lsi-raid-monitor",
+        "host": socket.gethostname(),
+        "level": level,
+        "subject": subject,
+        "message": body,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    req = urlrequest.Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=10) as resp:
+            status = resp.status
+            resp.read(64)
+        if 200 <= status < 300:
+            return True, "发送成功"
+        return False, f"Webhook 返回 HTTP {status}"
+    except Exception as e:
+        return False, str(e)
+
+
 def _alert(subject: str, body: str, level: str = "error"):
-    """记录事件并按配置发送邮件"""
+    """记录事件并按配置发送邮件与 Webhook"""
     log_event(level, f"{subject} — {body.splitlines()[0] if body else ''}")
     cfg = load_config()
-    if not alert_enabled(cfg):
-        return
-    ok, err = send_mail(subject, body, cfg)
-    if not ok:
-        log_event("warning", f"报警邮件发送失败: {err}")
+    if alert_enabled(cfg):
+        ok, err = send_mail(subject, body, cfg)
+        if not ok:
+            log_event("warning", f"报警邮件发送失败: {err}")
+    if webhook_enabled(cfg):
+        ok, err = send_webhook(subject, body, level, cfg)
+        if not ok:
+            log_event("warning", f"报警 Webhook 发送失败: {err}")
 
 
 # ---- 状态快照（去重：只在状态变化时报警）----

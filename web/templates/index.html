@@ -18,7 +18,7 @@
       } catch (e) {}
     })();
   </script>
-  <link rel="stylesheet" href="/static/css/style.css" />
+  <link rel="stylesheet" href="/static/css/style.css?v={{ version }}" />
 </head>
 <body>
   <a class="skip-link" href="#content-main">跳到主内容</a>
@@ -45,7 +45,7 @@
           <p>LSI Storage Monitor</p>
         </div>
       </div>
-      <p class="login-sub">登录以查看控制器、磁盘与存储状态</p>
+      <p class="login-sub" id="login-sub">登录以查看控制器、磁盘与存储状态</p>
       <div class="field">
         <label for="login-username">用户名</label>
         <input class="input" id="login-username" required />
@@ -94,7 +94,7 @@
               <rect x="3.5" y="10.2" width="17" height="5.2" rx="1.8" />
               <rect x="3.5" y="16.9" width="17" height="5.2" rx="1.8" />
             </svg>
-          </span><span class="label">磁盘管理</span>
+          </span><span class="label">文件管理</span>
         </button>
         <button class="nav-btn" data-view="logs">
           <span class="glyph" aria-hidden="true">
@@ -104,6 +104,16 @@
               <path d="M4 17.5h9.5" />
             </svg>
           </span><span class="label">日志中心</span>
+        </button>
+        <button class="nav-btn" data-view="ops">
+          <span class="glyph" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 4h6v6H4z" />
+              <path d="M14 4h6v6h-6z" />
+              <path d="M4 14h6v6H4z" />
+              <path d="M14 14h6v6h-6z" />
+            </svg>
+          </span><span class="label">运维中心</span>
         </button>
         <button class="nav-btn hidden" data-view="users" id="nav-users">
           <span class="glyph" aria-hidden="true">
@@ -119,6 +129,7 @@
       <div class="sidebar-foot">
         <span class="foot-line"><span class="foot-dot"></span>MegaRAID Storage Monitor</span>
         <span class="foot-meta">每 60 秒自动刷新</span>
+        <span class="foot-meta" id="app-version"></span>
       </div>
     </aside>
     <div class="sidebar-scrim" id="sidebar-scrim"></div>
@@ -218,11 +229,12 @@
               <div class="card-head">
                 <div>
                   <div class="eyebrow">Alerting</div>
-                  <strong>邮件报警配置</strong>
+                  <strong>报警通知配置</strong>
                 </div>
                 <div class="chips">
                   <span class="badge" id="alert-enabled-badge">—</span>
                   <span class="badge" id="sendmail-badge">—</span>
+                  <span class="badge" id="webhook-badge">—</span>
                 </div>
               </div>
               <form id="alert-form" class="form-row" autocomplete="off">
@@ -234,6 +246,11 @@
                 <div class="field">
                   <label for="alert-sendmail">sendmail 路径</label>
                   <input class="input mono" id="alert-sendmail" placeholder="/usr/sbin/sendmail" />
+                  <span class="hint hidden" data-lock-hint>已由环境变量锁定</span>
+                </div>
+                <div class="field" style="grid-column: 1 / -1;">
+                  <label for="alert-webhook">Webhook 地址（可选，钉钉/飞书/企业微信机器人）</label>
+                  <input class="input mono" id="alert-webhook" placeholder="https://..." />
                   <span class="hint hidden" data-lock-hint>已由环境变量锁定</span>
                 </div>
                 <div class="field">
@@ -263,6 +280,7 @@
                 <div class="hero-actions" style="grid-column: 1 / -1; display:flex; gap: 8px;">
                   <button class="btn primary" id="btn-alert-save" type="submit">保存配置</button>
                   <button class="btn" id="btn-alert-test" type="button">发送测试报警</button>
+                  <button class="btn" id="btn-webhook-test" type="button">测试 Webhook</button>
                 </div>
               </form>
             </div>
@@ -421,7 +439,7 @@
           </div>
         </div>
 
-        <!-- ============ 磁盘管理 ============ -->
+        <!-- ============ 文件管理 ============ -->
         <div class="view hidden" id="view-storage">
           <!-- 文件系统使用率 -->
           <div class="card">
@@ -575,6 +593,71 @@
           </div>
         </div>
 
+        <!-- ============ 运维中心 ============ -->
+        <div class="view hidden" id="view-ops">
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Drive bays</div>
+                <strong>机箱盘位可视化</strong>
+              </div>
+              <div class="card-head-actions">
+                <label class="tiny" for="bay-capacity">机箱规格</label>
+                <select class="select" id="bay-capacity">
+                  <option value="auto">自动（按盘数）</option>
+                  <option value="8">2U · 8 盘位</option>
+                  <option value="12">2U · 12 盘位</option>
+                  <option value="16">4U · 16 盘位</option>
+                  <option value="20">5U · 20 盘位</option>
+                  <option value="24">4U · 24 盘位</option>
+                </select>
+                <div class="bay-legend" aria-hidden="true">
+                  <span class="lg lg-ok">正常</span>
+                  <span class="lg lg-warn">关注</span>
+                  <span class="lg lg-crit">严重</span>
+                  <span class="lg lg-hs">热备</span>
+                  <span class="lg lg-empty">空槽</span>
+                </div>
+              </div>
+            </div>
+            <div id="enclosure-view"><div class="loading-line">加载中…</div></div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Asset ledger</div>
+                <strong>磁盘资产台账</strong>
+              </div>
+              <button class="btn sm" id="btn-ledger-refresh">刷新</button>
+            </div>
+            <div class="table-wrap">
+              <table class="data" id="ledger-table">
+                <thead><tr>
+                  <th>盘位</th><th>型号</th><th>序列号</th><th>状态</th><th>温度</th><th>通电时长</th>
+                  <th>重映射</th><th>待定</th><th>无法纠正</th><th>预测</th><th>换盘建议</th><th>最近出现</th>
+                </tr></thead>
+                <tbody><tr><td colspan="12" class="muted">加载中…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="grid grid-2">
+            <div class="card">
+              <div class="card-head">
+                <div><div class="eyebrow">Wear ranking</div><strong>磨损排行</strong></div>
+              </div>
+              <div id="wear-top" class="loading-line">加载中…</div>
+            </div>
+            <div class="card">
+              <div class="card-head">
+                <div><div class="eyebrow">Power-on hours</div><strong>通电时长排行</strong></div>
+              </div>
+              <div id="lifetime-top" class="loading-line">加载中…</div>
+            </div>
+          </div>
+        </div>
+
         <!-- ============ 用户管理 ============ -->
         <div class="view hidden" id="view-users">
           <div class="banner hidden" id="users-warning">未启用认证，创建第一个管理员后启用</div>
@@ -655,7 +738,7 @@
     </div>
   </div>
 
-  <script src="/static/vendor/chart.umd.min.js"></script>
-  <script src="/static/js/app.js"></script>
+  <script src="/static/vendor/chart.umd.min.js?v={{ version }}"></script>
+  <script src="/static/js/app.js?v={{ version }}"></script>
 </body>
 </html>
