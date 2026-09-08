@@ -72,6 +72,27 @@ function btnLoading(btn, on) {
   btn.disabled = !!on;
 }
 
+function cssToken(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+/* 数字滚动（自然缓动） */
+function countUp(el, target, duration) {
+  if (!el || target == null || isNaN(target)) return;
+  duration = duration || 850;
+  if (el.__countRaf) cancelAnimationFrame(el.__countRaf);
+  const from = parseFloat(el.textContent) || 0;
+  const start = performance.now();
+  const step = (now) => {
+    const p = Math.min(1, (now - start) / duration);
+    const eased = 1 - Math.pow(1 - p, 3);
+    el.textContent = String(Math.round(from + (target - from) * eased));
+    if (p < 1) el.__countRaf = requestAnimationFrame(step);
+    else el.__countRaf = null;
+  };
+  el.__countRaf = requestAnimationFrame(step);
+}
+
 /* ---------- 全局状态 ---------- */
 const state = {
   me: null,
@@ -157,7 +178,9 @@ function scoreColor(s) {
 /* ---------- 主题 ---------- */
 function applyTheme(t, save) {
   document.documentElement.classList.toggle('dark', t === 'dark');
-  $('#btn-theme').textContent = t === 'dark' ? '☀' : '◐';
+  const tb = $('#btn-theme');
+  tb.textContent = t === 'dark' ? '☀' : '◐';
+  tb.setAttribute('aria-label', t === 'dark' ? '切换到浅色主题' : '切换到深色主题');
   if (save) localStorage.setItem('lsi-theme', t);
   if (state.chart) loadHistory(); // 重建图表以适配坐标轴颜色
 }
@@ -362,14 +385,17 @@ function renderHealth(st) {
   const { total, subs } = computeHealth(st);
   const C = 2 * Math.PI * 54;
   const ring = $('#ring-val');
-  ring.style.strokeDashoffset = String(C * (1 - total / 100));
-  ring.setAttribute('stroke', scoreColor(total).replace('var(--ok)', '#34a853').replace('var(--warn)', '#f9ab00').replace('var(--crit)', '#ea4335'));
-  $('#health-score').textContent = total;
+  const toneVar = total >= 80 ? '--ok' : total >= 60 ? '--warn' : '--crit';
+  ring.style.stroke = cssToken(toneVar) || '#4f8cff';
+  requestAnimationFrame(() => {
+    ring.style.strokeDashoffset = String(C * (1 - total / 100));
+  });
+  countUp($('#health-score'), total);
   const hb = $('#health-badge');
   hb.className = 'badge ' + (total >= 80 ? 'ok' : total >= 60 ? 'warn' : 'crit');
   hb.textContent = total >= 80 ? '健康' : total >= 60 ? '需要关注' : '存在风险';
-  $('#sub-scores').innerHTML = subs.map(s => `
-    <div class="sub-score">
+  $('#sub-scores').innerHTML = subs.map((s, i) => `
+    <div class="sub-score" style="--d:${i}">
       <span>${esc(s.name)}</span>
       <span class="bar"><i style="width:${s.score}%;background:${scoreColor(s.score)}"></i></span>
       <span class="pct">${s.score}</span>
@@ -467,8 +493,8 @@ function renderStatCards(st) {
       sub: `${esc(c.bbu_model || '无 BBU')}${c.bbu_temperature != null ? ' · ' + esc(c.bbu_temperature) + '°C' : ''}`,
     },
   ];
-  $('#stat-cards').innerHTML = cards.map(k => `
-    <div class="card">
+  $('#stat-cards').innerHTML = cards.map((k, i) => `
+    <div class="card" style="--d:${i}">
       <div class="eyebrow">${k.label}</div>
       <div class="stat-value">${k.value}</div>
       <div class="stat-sub">${k.sub}</div>
@@ -481,12 +507,13 @@ function renderTopology(st) {
   const grid = $('#topo-grid');
   if (!disks.length) { grid.innerHTML = '<div class="loading-line">无物理磁盘数据</div>'; return; }
   grid.innerHTML = '';
-  disks.forEach(d => {
+  disks.forEach((d, idx) => {
     const tone = stateTone(d.state);
     const tTone = tempTone(Number(d.temperature));
     const cls = tone === 'crit' ? 'st-crit' : (tTone || tone) === 'warn' ? 'st-warn' : tone === 'ok' ? 'st-ok' : 'st-unknown';
     const cell = document.createElement('button');
     cell.className = 'topo-cell ' + cls;
+    cell.style.setProperty('--d', idx);
     cell.innerHTML = `
       <span class="slot">${esc(d.label || ('E' + d.eid + ':S' + d.slot))}</span>
       <span class="state">${esc(d.state || '—')}</span>
@@ -1017,8 +1044,8 @@ function renderSystem(st) {
 function chartPalette() {
   const dark = document.documentElement.classList.contains('dark');
   return dark
-    ? ['#2dccd3', '#f1204a', '#edbbe8', '#fbeb35', '#baf6f0']
-    : ['#4285f4', '#ea4335', '#fbbc05', '#0043ad', '#34a853'];
+    ? ['#5f8cff', '#ff8f8f', '#f0b45c', '#58cfd6', '#b39dff', '#58d1a0']
+    : ['#2767e8', '#d95f5f', '#d99a2b', '#2a9aa6', '#7a5af8', '#2f9d72'];
 }
 
 const CHART_TYPES = {
@@ -1087,13 +1114,16 @@ async function loadHistory() {
   emptyBox.classList.add('hidden');
   canvas.style.visibility = 'visible';
   const css = getComputedStyle(document.body);
-  const tickColor = css.getPropertyValue('--muted-foreground').trim() || '#7f8d9f';
-  const gridColor = css.getPropertyValue('--border').trim() || '#ebebeb';
+  const tickColor = css.getPropertyValue('--muted-foreground').trim() || '#7f8b9a';
+  const gridColor = css.getPropertyValue('--border').trim() || '#e2e7ee';
+  const tooltipBg = css.getPropertyValue('--popover').trim() || '#ffffff';
+  const tooltipInk = css.getPropertyValue('--popover-foreground').trim() || '#26303d';
+  const tooltipLine = css.getPropertyValue('--border').trim() || '#e2e7ee';
   datasets.forEach(ds => {
-    ds.borderWidth = 1.5;
+    ds.borderWidth = 1.8;
     ds.pointRadius = 0;
     ds.pointHitRadius = 8;
-    ds.tension = 0.25;
+    ds.tension = 0.34;
   });
   Chart.defaults.font.family = "'JetBrains Mono', monospace";
   Chart.defaults.font.size = 10;
@@ -1105,10 +1135,31 @@ async function loadHistory() {
     options: {
       responsive: true,
       maintainAspectRatio: false,
+      animation: { duration: 1100, easing: 'easeOutQuart' },
       interaction: { mode: 'nearest', intersect: false },
       plugins: {
-        legend: { labels: { color: tickColor, boxWidth: 10, boxHeight: 2, font: { family: "'DM Sans', sans-serif", size: 11 } } },
+        legend: {
+          labels: {
+            color: tickColor,
+            boxWidth: 12,
+            boxHeight: 2,
+            usePointStyle: true,
+            pointStyle: 'line',
+            font: { family: "'DM Sans', 'PingFang SC', sans-serif", size: 11, weight: '500' },
+            padding: 16,
+          },
+        },
         tooltip: {
+          backgroundColor: tooltipBg,
+          titleColor: tooltipInk,
+          bodyColor: tooltipInk,
+          borderColor: tooltipLine,
+          borderWidth: 1,
+          padding: 11,
+          cornerRadius: 10,
+          displayColors: true,
+          titleFont: { family: "'JetBrains Mono', monospace", size: 11, weight: '600' },
+          bodyFont: { family: "'JetBrains Mono', monospace", size: 11 },
           callbacks: {
             title: (items) => items.length ? fmtDayClock(items[0].parsed.x) : '',
             label: (item) => `${item.dataset.label}: ${item.parsed.y} ${unit}`,
@@ -1119,12 +1170,14 @@ async function loadHistory() {
         x: {
           type: 'linear',
           ticks: { color: tickColor, maxTicksLimit: 8, callback: (v) => fmt(v) },
-          grid: { color: gridColor },
+          grid: { color: gridColor, drawTicks: false },
+          border: { display: false },
         },
         y: {
           title: { display: true, text: unit, color: tickColor },
           ticks: { color: tickColor },
-          grid: { color: gridColor },
+          grid: { color: gridColor, drawTicks: false },
+          border: { display: false },
         },
       },
     },
@@ -1146,11 +1199,11 @@ async function loadEvents() {
   if (!events.length) {
     list.innerHTML = '<div class="loading-line">暂无事件</div>';
   } else {
-    list.innerHTML = events.map(ev => {
+    list.innerHTML = events.map((ev, i) => {
       const lv = String(ev.level || 'info').toLowerCase();
       const cls = lv === 'error' ? 'crit' : lv === 'warning' ? 'warn' : 'info';
       const lvText = lv === 'error' ? '错误' : lv === 'warning' ? '警告' : '信息';
-      return `<div class="event-item">
+      return `<div class="event-item" style="--d:${i}">
         <span class="event-time">${esc(fmtDateTime(ev.timestamp))}</span>
         <span class="badge ${cls}">${lvText}</span>
         <span>${esc(ev.message)}</span>

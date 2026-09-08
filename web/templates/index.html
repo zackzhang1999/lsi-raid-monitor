@@ -3,22 +3,49 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>LSI RAID 监控</title>
+  <meta name="description" content="MegaRAID 存储监控台：控制器健康、磁盘拓扑、趋势与运维操作。" />
+  <meta name="theme-color" content="#0c0f14" />
+  <meta name="color-scheme" content="dark light" />
+  <title>MegaRAID 存储监控台</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2310161d'/%3E%3Crect x='7' y='8' width='18' height='4.4' rx='1.6' fill='%234f8cff'/%3E%3Crect x='7' y='14.4' width='18' height='4.4' rx='1.6' fill='%239fc3ff' opacity='.9'/%3E%3Crect x='7' y='20.8' width='18' height='4.4' rx='1.6' fill='%234f8cff' opacity='.7'/%3E%3C/svg%3E" />
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem('lsi-theme');
+        if (t === 'dark' || (!t && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+          document.documentElement.classList.add('dark');
+        }
+      } catch (e) {}
+    })();
+  </script>
   <link rel="stylesheet" href="/static/css/style.css" />
 </head>
 <body>
+  <a class="skip-link" href="#content-main">跳到主内容</a>
   <div id="toast-root"></div>
 
   <!-- 登录遮罩 -->
   <div id="login-overlay" class="overlay hidden">
+    <div class="login-ambient" aria-hidden="true">
+      <span class="orb orb-a"></span>
+      <span class="orb orb-b"></span>
+      <span class="grid-lines"></span>
+    </div>
     <form id="login-form" class="login-card" autocomplete="off">
       <div class="brand">
-        <div class="brand-mark">LSI</div>
+        <div class="brand-mark" aria-hidden="true">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3.2" y="3.6" width="17.6" height="5.2" rx="1.5" />
+            <rect x="3.2" y="9.9" width="17.6" height="5.2" rx="1.5" />
+            <rect x="3.2" y="16.2" width="17.6" height="5.2" rx="1.5" />
+          </svg>
+        </div>
         <div class="brand-copy">
-          <h1>RAID 监控</h1>
-          <p>MegaRAID Storage Monitor</p>
+          <h1>MegaRAID 监控台</h1>
+          <p>LSI Storage Monitor</p>
         </div>
       </div>
+      <p class="login-sub">登录以查看控制器、磁盘与存储状态</p>
       <div class="field">
         <label for="login-username">用户名</label>
         <input class="input" id="login-username" required />
@@ -28,7 +55,8 @@
         <input class="input" id="login-password" type="password" required />
       </div>
       <div class="login-error" id="login-error"></div>
-      <button class="btn primary" id="login-btn" type="submit">登录</button>
+      <button class="btn primary btn-block" id="login-btn" type="submit">登录</button>
+      <p class="login-foot">仅授权管理员可执行写操作</p>
     </form>
   </div>
 
@@ -36,31 +64,67 @@
     <!-- 侧边栏 -->
     <aside class="sidebar" id="sidebar">
       <div class="brand">
-        <div class="brand-mark">LSI</div>
+        <div class="brand-mark" aria-hidden="true">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3.2" y="3.6" width="17.6" height="5.2" rx="1.5" />
+            <rect x="3.2" y="9.9" width="17.6" height="5.2" rx="1.5" />
+            <rect x="3.2" y="16.2" width="17.6" height="5.2" rx="1.5" />
+          </svg>
+        </div>
         <div class="brand-copy">
-          <h1>RAID 监控</h1>
-          <p>MegaRAID Storage</p>
+          <h1>MegaRAID 监控台</h1>
+          <p>LSI Storage Monitor</p>
         </div>
       </div>
-      <nav class="nav">
+      <nav class="nav" aria-label="主导航">
         <button class="nav-btn active" data-view="overview">
-          <span class="glyph">◫</span><span class="label">监控概览</span>
+          <span class="glyph" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3.5" y="3.5" width="7" height="7" rx="1.8" />
+              <rect x="13.5" y="3.5" width="7" height="7" rx="1.8" />
+              <rect x="3.5" y="13.5" width="7" height="7" rx="1.8" />
+              <rect x="13.5" y="13.5" width="7" height="7" rx="1.8" />
+            </svg>
+          </span><span class="label">监控概览</span>
         </button>
         <button class="nav-btn" data-view="storage">
-          <span class="glyph">▤</span><span class="label">磁盘管理</span>
+          <span class="glyph" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3.5" y="3.5" width="17" height="5.2" rx="1.8" />
+              <rect x="3.5" y="10.2" width="17" height="5.2" rx="1.8" />
+              <rect x="3.5" y="16.9" width="17" height="5.2" rx="1.8" />
+            </svg>
+          </span><span class="label">磁盘管理</span>
         </button>
         <button class="nav-btn" data-view="logs">
-          <span class="glyph">≡</span><span class="label">日志中心</span>
+          <span class="glyph" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+              <path d="M4 6.5h16" />
+              <path d="M4 12h16" />
+              <path d="M4 17.5h9.5" />
+            </svg>
+          </span><span class="label">日志中心</span>
         </button>
         <button class="nav-btn hidden" data-view="users" id="nav-users">
-          <span class="glyph">⚇</span><span class="label">用户管理</span>
+          <span class="glyph" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="9" cy="8.5" r="3.2" />
+              <path d="M3.8 19.5c.7-3 2.7-4.6 5.2-4.6s4.5 1.6 5.2 4.6" />
+              <path d="M15.5 5.8a3.1 3.1 0 1 1 .2 6.1" />
+              <path d="M17 14.9c1.9.5 3.1 1.9 3.5 4.1" />
+            </svg>
+          </span><span class="label">用户管理</span>
         </button>
       </nav>
-      <div class="sidebar-foot">LSI MegaRAID 存储监控 · 每 60 秒自动刷新</div>
+      <div class="sidebar-foot">
+        <span class="foot-line"><span class="foot-dot"></span>MegaRAID Storage Monitor</span>
+        <span class="foot-meta">每 60 秒自动刷新</span>
+      </div>
     </aside>
     <div class="sidebar-scrim" id="sidebar-scrim"></div>
 
     <main class="main">
+      <span id="content-main" tabindex="-1" class="main-anchor"></span>
       <!-- 顶栏 -->
       <header class="topbar">
         <div class="topbar-left">
