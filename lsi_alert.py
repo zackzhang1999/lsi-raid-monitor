@@ -187,7 +187,7 @@ def send_mail(subject: str, body: str, cfg: dict | None = None) -> tuple[bool, s
     m = EmailMessage()
     m["From"] = f"lsi-raid-monitor@{host}"
     m["To"] = ", ".join(recipients)
-    m["Subject"] = f"[LSI RAID] {subject}"
+    m["Subject"] = f"[DataMax-LSI] {subject}"
     m.set_content(body)
     msg = m.as_string()
     try:

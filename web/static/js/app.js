@@ -1,4 +1,4 @@
-/* LSI RAID Monitor — 原生 JS SPA（google-design 体系） */
+/* DataMax-LSI — Amax 存储管理系统（原生 JS SPA） */
 /* global Chart */
 'use strict';
 
@@ -2085,7 +2085,7 @@ async function renderEnclosures() {
         <span class="screw screw-br" aria-hidden="true"></span>
         <div class="chassis-top">
           <div class="chassis-brand">
-            <span class="chassis-name">MegaRAID Storage</span>
+            <span class="chassis-name">DataMax-LSI</span>
             <span class="chassis-model">${esc(ctrl.model || 'Controller')} · FW ${esc(ctrl.fw || '—')}</span>
             <span class="chassis-asset">${esc(st.host || '')} · Enclosure ${esc(eid)}</span>
           </div>
@@ -2934,9 +2934,13 @@ function appendBcacheControls(body, data, devData) {
   const admin = !!state.isAdmin;
   const devs = data.devices || [];
   const blockDevs = (devData && devData.devices) || [];
-  const isBlank = d => !d.mounted && !d.in_bcache && String(d.fstype || '').toLowerCase() !== 'bcache';
-  const freeCache = blockDevs.filter(d => isBlank(d) && !d.has_partitions && (Number(d.rota) === 0 || /nvme/i.test(d.device)));
-  const freeBacking = blockDevs.filter(isBlank);
+  const usable = d => !d.mounted && !d.in_bcache;
+  const freeCache = blockDevs.filter(d => usable(d) && !d.has_partitions && (Number(d.rota) === 0 || /nvme/i.test(d.device)));
+  const freeBacking = blockDevs.filter(usable);
+  const bcCands = blockDevs.filter(d => !d.in_bcache && d.bcache_role);
+  const cacheCands = bcCands.filter(d => d.bcache_role === 'cache');
+  const backingCands = bcCands.filter(d => d.bcache_role !== 'cache');
+  const noActiveSet = (data.cache_sets || []).length === 0;
   const ready = !!(data.available && data.module_loaded);
   const fmtSize = (b) => {
     if (b == null || !Number(b)) return '';
@@ -2953,11 +2957,13 @@ function appendBcacheControls(body, data, devData) {
   let html = '';
 
   if (admin && ready) {
-    if (freeCache.length && freeBacking.length) {
-      const cacheOpts = freeCache.map(d =>
-        `<option value="${esc(d.path)}">${esc(d.device)} · ${fmtSize(d.size)} · ${esc(d.model || d.tran || 'SSD')}</option>`).join('');
-      const backOpts = freeBacking.map(d =>
-        `<option value="${esc(d.path)}">${esc(d.device)} · ${fmtSize(d.size)}${d.has_partitions ? ' · 含分区(将被清空)' : ''}</option>`).join('');
+    const poolCache = freeCache.length ? freeCache : (noActiveSet ? cacheCands : []);
+    const poolBacking = freeBacking.length ? freeBacking : (noActiveSet ? backingCands : []);
+    if (poolCache.length && poolBacking.length) {
+      const cacheOpts = poolCache.map(d =>
+        `<option value="${esc(d.path)}">${esc(d.device)} · ${fmtSize(d.size)} · ${esc(d.model || d.tran || 'SSD')}${d.fstype || d.bcache_role ? ' · 旧数据(将被清空)' : ''}</option>`).join('');
+      const backOpts = poolBacking.map(d =>
+        `<option value="${esc(d.path)}">${esc(d.device)} · ${fmtSize(d.size)}${d.bcache_role || d.fstype || d.has_partitions ? ' · 旧数据(将被清空)' : ''}</option>`).join('');
       html += `
         <div class="field" style="margin-top:14px">
           <label>新建 bcache（缓存盘 + 被加速盘）</label>
@@ -2967,14 +2973,12 @@ function appendBcacheControls(body, data, devData) {
             <button class="btn sm danger" id="btn-bcache-create">创建缓存</button>
           </div>
           <label class="check-row" style="margin-top:8px"><input type="checkbox" id="bcache-ack" />
-            <span>确认两块设备上的现有数据都可以被清空</span></label>
+            <span>确认两块设备上的现有数据/旧 bcache 配置都可以被清空</span></label>
         </div>`;
     } else {
       const csetList = data.cache_sets || [];
       const degraded = csetList.some(c => c.cache_offline) || devs.some(x => /no cache/i.test(String(x.state || '')));
-      const bcCands = blockDevs.filter(d => !d.in_bcache && String(d.fstype || '').toLowerCase() === 'bcache');
-      const cacheCands = bcCands.filter(d => d.bcache_role === 'cache');
-      const backingCands = bcCands.filter(d => d.bcache_role !== 'cache');
+      const needBacking = !devs.length || devs.some(x => /no cache/i.test(String(x.state || '')));
       let showReattach = false;
       try { showReattach = localStorage.getItem('lsi-bcache-stopped') === '1'; } catch (e) { /* 忽略 */ }
       if (showReattach && csetList.length && backingCands.length) {
@@ -2987,6 +2991,8 @@ function appendBcacheControls(body, data, devData) {
       } else {
         if (degraded && csetList.length && cacheCands.length) {
           html += '<div class="tiny" style="margin-top:12px">检测到缓存盘已恢复，可重新接入：</div><div class="bcache-ops"><button class="btn sm primary" data-bcache-recover>恢复缓存</button></div>';
+        } else if (needBacking && csetList.length && backingCands.length) {
+          html += '<div class="tiny" style="margin-top:12px">检测到已有缓存集，可接入 backing：</div><div class="bcache-ops"><button class="btn sm primary" data-bcache-recover>接入 backing 并恢复缓存</button></div>';
         } else {
           html += '<div class="tiny" style="margin-top:12px">暂无可用空白缓存盘/被加速盘（已被 bcache 使用或已挂载的设备不会出现在这里）。</div>';
         }
@@ -3043,6 +3049,19 @@ function appendBcacheControls(body, data, devData) {
         <pre class="smart-pre hidden" data-gc-pre="${esc(uuid)}"></pre>
       </div>`;
     }).join('');
+  }
+
+  if (admin) {
+    const cachePaths = Array.from(new Set([
+      ...(data.cache_sets || []).map(c => c.cache_info && c.cache_info.device).filter(Boolean),
+      ...cacheCands.map(d => d.path),
+    ]));
+    if (cachePaths.length) {
+      html += `<div class="bcache-ops" style="margin-top:10px">
+        <span class="tiny">销毁缓存盘（整块清空）：</span>
+        ${cachePaths.map(p => `<button class="btn sm danger" data-destroy-cache="${esc(p)}">${esc(p)}</button>`).join('')}
+      </div>`;
+    }
   }
 
   if (!admin) {
@@ -3206,6 +3225,24 @@ function appendBcacheControls(body, data, devData) {
         if (!$('#cache-off-ack').checked) throw new Error('请勾选风险确认');
         const r = await api('/api/bcache/cache_unregister', { method: 'POST', body: { uuid, confirm: val, acknowledge: true } });
         toast(r.message || '已注销', 'ok');
+        await loadBcache();
+      });
+  }));
+  body.querySelectorAll('[data-destroy-cache]').forEach(b => b.addEventListener('click', () => {
+    const path = b.dataset.destroyCache;
+    confirmModal('一键销毁缓存盘',
+      `<p class="warn-text">将注销缓存盘 ${esc(path)} 并清空整块盘（wipefs）。该盘上所有数据/旧 bcache 配置都会消失，且不可恢复。</p>
+       <p>backing（被加速盘）上的正式数据不受影响，但缓存内容会丢失。</p>
+       <div class="field"><label>输入设备路径确认</label>
+       <input class="input mono" id="destroy-cache-confirm" placeholder="${esc(path)}" autocomplete="off" /></div>
+       <label class="check-row"><input type="checkbox" id="destroy-cache-ack" />
+       <span>我已知晓该盘将被整块清空且不可恢复</span></label>`,
+      '确认销毁', true, async () => {
+        const val = ($('#destroy-cache-confirm').value || '').trim();
+        if (val !== path) throw new Error('设备路径不一致');
+        if (!$('#destroy-cache-ack').checked) throw new Error('请勾选风险确认');
+        const r = await api('/api/bcache/destroy_cache', { method: 'POST', body: { cache_path: path, confirm: val, acknowledge: true } });
+        toast(r.message || '已销毁', 'ok');
         await loadBcache();
       });
   }));

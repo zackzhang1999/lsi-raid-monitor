@@ -219,7 +219,7 @@ def block_devices() -> list[dict]:
             "fstype": disk.get("fstype") or "",
             "in_bcache": path in used,
             "mounted": bool(direct_mount),
-            "bcache_role": _super_role(path) if (disk.get("fstype") or "").lower() == "bcache" else "",
+            "bcache_role": _super_role(path),
         })
     return result
 
@@ -631,7 +631,7 @@ def recover() -> tuple[bool, str]:
     """恢复 bcache：清理失效缓存集引用，注册缓存盘与 backing，再重新绑定。"""
     devs = block_devices()
     candidates = [d for d in devs
-                  if str(d.get("fstype", "")).lower() == "bcache" and not d.get("in_bcache")]
+                  if d.get("bcache_role") in ("backing", "cache") and not d.get("in_bcache")]
     if not candidates:
         return False, "没有找到需要恢复的 bcache 盘"
     try:
@@ -719,5 +719,62 @@ def recover() -> tuple[bool, str]:
                 if rc != 0:
                     return False, f"{new_bcache} 已恢复，但自动挂载 {mp} 失败：{(err or '').strip()[-200:]}"
         return True, f"缓存已恢复：{new_bcache}"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _cset_uuid_for_cache(path: str) -> str | None:
+    devname = os.path.basename(path)
+    for uuid in _cache_set_uuids():
+        link = f"/sys/fs/bcache/{uuid}/cache0"
+        if not os.path.islink(link):
+            continue
+        try:
+            target = os.readlink(link)
+        except Exception:
+            continue
+        if f"/block/{devname}/" in target:
+            return uuid
+    return None
+
+
+def destroy_cache(cache_path: str) -> tuple[bool, str]:
+    """注销并清空一块缓存盘，使其变成空盘。"""
+    if not re.fullmatch(r"/dev/(sd[a-z]+|nvme\d+n\d+)$", cache_path):
+        return False, "只支持整块设备"
+    devs = block_devices()
+    by_path = {d["path"]: d for d in devs}
+    if cache_path not in by_path:
+        return False, "缓存盘不存在于系统可见列表中"
+    try:
+        # 1) 确保没有脏数据留在缓存上
+        for dev in bcache_devices()[0]["devices"]:
+            name = dev.get("name")
+            if not name:
+                continue
+            if dev.get("mounted"):
+                rc, _, err = _run(["umount", f"/dev/{name}"], timeout=60)
+                if rc != 0:
+                    return False, f"卸载 /dev/{name} 失败：{(err or '').strip()[-200:]}"
+            try:
+                with open(f"/sys/block/{name}/bcache/stop", "w", encoding="utf-8") as f:
+                    f.write("1")
+            except Exception:
+                pass
+        # 2) 注销包含该缓存盘的缓存集
+        time.sleep(1)
+        uuid = _cset_uuid_for_cache(cache_path)
+        if uuid:
+            path = f"/sys/fs/bcache/{uuid}/unregister"
+            if os.path.exists(path):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("1")
+            time.sleep(1)
+        # 3) wipefs 清空缓存盘数据
+        rc, _, err = _run(["wipefs", "-a", cache_path], timeout=60)
+        if rc != 0:
+            return False, (err or "").strip()[-300:] or "wipefs 失败"
+        _run(["blockdev", "--rereadpt", cache_path], timeout=20)
+        return True, f"{cache_path} 已销毁并清空"
     except Exception as exc:
         return False, str(exc)
