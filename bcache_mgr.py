@@ -260,6 +260,28 @@ def _mountpoint(name: str) -> str | None:
     return None
 
 
+def _release_old_bcache(paths: list[str]) -> tuple[bool, str]:
+    """解除旧 bcache 占用：先拒绝仍属于运行中缓存集的盘，再 stop 被自动注册的 backing。"""
+    used = _used_bcache_devices()
+    for path in paths:
+        if path in used:
+            return False, f"{path} 属于运行中的缓存集，请先在页面停止/注销后再操作"
+    for path in paths:
+        bdir = f"/sys/block/{os.path.basename(path)}/bcache"
+        for _ in range(20):
+            if not os.path.isdir(bdir):
+                break
+            try:
+                with open(os.path.join(bdir, "stop"), "w", encoding="utf-8") as f:
+                    f.write("1")
+            except Exception as exc:
+                return False, f"停止 {path} 的 bcache 注册失败：{exc}"
+            time.sleep(0.3)
+        if os.path.isdir(bdir):
+            return False, f"{path} 无法解除 bcache 注册（可能仍被挂载/使用）"
+    return True, ""
+
+
 def create_bcache(cache_path: str, backing_path: str) -> tuple[bool, str, str | None]:
     """make-bcache 创建缓存集。返回 (ok, message, bcache_device)。"""
     devs = block_devices()
@@ -270,10 +292,28 @@ def create_bcache(cache_path: str, backing_path: str) -> tuple[bool, str, str | 
         return False, "缓存盘与被加速盘不能是同一块", None
     if by_path[cache_path].get("in_bcache") or by_path[backing_path].get("in_bcache"):
         return False, "所选设备已在 bcache 中使用，不能重复创建", None
+    if by_path[cache_path].get("mounted") or by_path[backing_path].get("mounted"):
+        return False, "所选设备已挂载，请先卸载后再创建", None
     before = set(glob.glob("/dev/bcache[0-9]*"))
-    rc, _, err = _run(["wipefs", "-a", cache_path, backing_path], timeout=60)
-    if rc != 0:
-        return False, (err or "").strip()[-300:] or "清空设备失败", None
+    # 旧盘可能残留 bcache 签名并被 udev 自动注册，导致 wipefs 报 busy。
+    # 先 stop 注册再擦除，并重试，避免与 udev 的自动注册发生竞态。
+    last_err = ""
+    for attempt in range(8):
+        ok, msg = _release_old_bcache([cache_path, backing_path])
+        if not ok:
+            return False, msg, None
+        rc, _, err = _run(["wipefs", "-a", cache_path, backing_path], timeout=60)
+        if rc == 0:
+            # 擦除成功后，若 udev 旧事件又把它注册回去，再清一次
+            ok, msg = _release_old_bcache([cache_path, backing_path])
+            if ok:
+                break
+            last_err = msg
+        else:
+            last_err = (err or "").strip()[-300:] or "清空设备失败"
+        time.sleep(0.4)
+    else:
+        return False, last_err or "清空设备失败（设备持续 busy，可能仍被占用）", None
     rc, _, err = _run(["make-bcache", "-C", cache_path, "-B", backing_path], timeout=120)
     if rc != 0:
         return False, (err or "").strip()[-400:] or "make-bcache 失败", None
@@ -412,9 +452,18 @@ def erase_superblock(dev_path: str) -> tuple[bool, str]:
     """擦除块设备上的 bcache 超级块（wipefs）。调用方必须二次确认。"""
     if not re.fullmatch(r"/dev/(sd[a-z]+|nvme\d+n\d+)$", dev_path):
         return False, "只允许擦除 sdX / nvmeXnY 整块设备"
-    rc, _, err = _run(["wipefs", "-a", dev_path], timeout=60)
-    if rc != 0:
-        return False, (err or "").strip()[-300:] or "擦除失败"
+    last_err = ""
+    for _ in range(8):
+        ok, msg = _release_old_bcache([dev_path])
+        if not ok:
+            return False, msg
+        rc, _, err = _run(["wipefs", "-a", dev_path], timeout=60)
+        if rc == 0:
+            _release_old_bcache([dev_path])
+            return True, f"{dev_path} 的超级块已擦除"
+        last_err = (err or "").strip()[-300:] or "擦除失败"
+        time.sleep(0.4)
+    return False, last_err
     return True, f"{dev_path} 的超级块已擦除"
 
 
@@ -526,6 +575,82 @@ def _super_role(path: str) -> str:
     if "cache device" in low:
         return "cache"
     return ""
+
+
+def _super_cache_state_dirty(path: str) -> bool:
+    rc, out, _ = _run(["bcache-super-show", path], timeout=15)
+    if rc != 0:
+        return False
+    return bool(re.search(r"dev\.data\.cache_state\s+\d+\s+\[dirty\]", out, re.IGNORECASE))
+
+
+def _super_first_sector(path: str) -> int | None:
+    rc, out, _ = _run(["bcache-super-show", path], timeout=15)
+    if rc != 0:
+        return None
+    m = re.search(r"dev\.data\.first_sector\s+(\d+)", out)
+    return int(m.group(1)) if m else None
+
+
+def emergency_status() -> dict:
+    mounts = []
+    try:
+        with open("/proc/mounts", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                src, mp = parts[0], parts[1]
+                if not src.startswith("/dev/loop") or not mp.startswith("/mnt/emergency-"):
+                    continue
+                loop_name = src.replace("/dev/", "")
+                try:
+                    with open(f"/sys/block/{loop_name}/loop/backing_file", encoding="utf-8") as bf:
+                        backing = bf.read().strip()
+                except Exception:
+                    backing = ""
+                mounts.append({"loop": src, "backing": backing, "mountpoint": mp, "readonly": "ro" in parts[3].split(",")})
+    except Exception:
+        pass
+    eligible = [d for d in block_devices() if d.get("bcache_role") == "backing"]
+    return {"mounts": mounts, "eligible_backing": eligible}
+
+
+def emergency_mount(backing_path: str) -> tuple[bool, str, str | None]:
+    if not re.fullmatch(r"/dev/(sd[a-z]+|nvme\d+n\d+)$", backing_path):
+        return False, "只支持整块设备", None
+    first = _super_first_sector(backing_path)
+    if first is None:
+        return False, "该设备不是 bcache backing（没有数据偏移信息）", None
+    for m in emergency_status()["mounts"]:
+        if m["backing"] == backing_path:
+            return True, f"已应急挂载：{m['mountpoint']}", m["mountpoint"]
+    rc, out, err = _run(["losetup", "-f"], timeout=15)
+    if rc != 0:
+        return False, "无法分配 loop 设备", None
+    loop_path = out.strip()
+    offset = first * 512
+    rc, _, err = _run(["losetup", "-o", str(offset), loop_path, backing_path], timeout=20)
+    if rc != 0:
+        return False, f"losetup 失败：{(err or '').strip()[-200:]}", None
+    mountpoint = f"/mnt/emergency-{os.path.basename(backing_path)}"
+    _run(["mkdir", "-p", mountpoint], timeout=20)
+    rc, _, err = _run(["mount", "-o", "ro", loop_path, mountpoint], timeout=60)
+    if rc != 0:
+        _run(["losetup", "-d", loop_path], timeout=20)
+        return False, f"只读挂载失败：{(err or '').strip()[-200:]}", None
+    return True, f"应急数据已挂载（只读）：{mountpoint}", mountpoint
+
+
+def emergency_unmount(backing_path: str) -> tuple[bool, str]:
+    for m in emergency_status()["mounts"]:
+        if m["backing"] == backing_path:
+            rc, _, err = _run(["umount", m["mountpoint"]], timeout=60)
+            if rc != 0:
+                return False, f"卸载失败：{(err or '').strip()[-200:]}"
+            _run(["losetup", "-d", m["loop"]], timeout=20)
+            return True, f"已卸载应急数据：{m['mountpoint']}"
+    return True, f"{backing_path} 没有应急挂载"
 
 
 def set_tunable(name: str, key: str, value) -> tuple[bool, str]:
@@ -747,6 +872,16 @@ def destroy_cache(cache_path: str) -> tuple[bool, str]:
     if cache_path not in by_path:
         return False, "缓存盘不存在于系统可见列表中"
     try:
+        # 0) 硬保护：若 backing 仍标记 dirty 且没有可运行的 bcache0 负责回写，则拒绝
+        running_info = bcache_devices()[0]
+        can_flush = any(
+            d.get("state") and d.get("state") != "no cache"
+            for d in running_info["devices"]
+        )
+        if not can_flush:
+            for d in block_devices():
+                if d.get("bcache_role") == "backing" and _super_cache_state_dirty(d["path"]):
+                    return False, "有脏数据未回写，无法安全销毁（请先恢复 bcache0 并完成回写）"
         # 1) 确保没有脏数据留在缓存上
         for dev in bcache_devices()[0]["devices"]:
             name = dev.get("name")

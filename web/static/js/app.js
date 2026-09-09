@@ -2928,6 +2928,58 @@ async function loadBcache() {
   if (state.isAdmin) {
     devs.forEach(x => loadBcacheTunables(x.name));
   }
+  loadBcacheEmergency();
+}
+
+async function loadBcacheEmergency() {
+  const body = $('#bcache-body');
+  if (!body) return;
+  let data;
+  try {
+    data = await api('/api/bcache/emergency');
+  } catch (e) {
+    return;
+  }
+  const old = document.getElementById('bcache-emergency');
+  if (old) old.remove();
+  const el = document.createElement('div');
+  el.id = 'bcache-emergency';
+  const eligible = data.eligible_backing || [];
+  const mounts = data.mounts || [];
+  const admin = !!state.isAdmin;
+  let html = '<div class="tiny" style="margin-top:14px">应急数据处理（缓存盘丢失时只读读取 backing 数据）</div>';
+  if (admin && eligible.length) {
+    html += '<div class="bcache-ops">' + eligible.map(d =>
+      `<button class="btn sm" data-emg-mount="${esc(d.path)}">只读应急挂载 ${esc(d.path)}</button>`).join('') + '</div>';
+  }
+  if (mounts.length) {
+    html += '<div class="hs-list" style="margin-top:8px">' + mounts.map(m =>
+      `<div class="hs-row"><span class="mono">${esc(m.backing)}</span>
+       <span class="tiny">${esc(m.loop)}</span>
+       <span class="badge ok">${esc(m.mountpoint)} · ${m.readonly ? '只读' : '读写'}</span>
+       ${admin ? `<button class="btn sm" data-emg-umount="${esc(m.backing)}">卸载</button>` : ''}
+      </div>`).join('') + '</div>';
+  } else {
+    html += '<div class="tiny" style="margin-top:6px;color:var(--ink-faint)">当前没有应急只读挂载。检测到可挂载的 backing：' +
+      (eligible.length ? eligible.map(d => d.path).join('、') : '无') + '</div>';
+  }
+  html += '<div class="tiny" style="margin-top:6px;color:var(--ink-faint)">应急模式只读，不会写入 backing，也不要求缓存盘存在。</div>';
+  el.innerHTML = html;
+  body.appendChild(el);
+  el.querySelectorAll('[data-emg-mount]').forEach(b => b.addEventListener('click', async () => {
+    try {
+      const r = await api('/api/bcache/emergency/mount', { method: 'POST', body: { backing_path: b.dataset.emgMount } });
+      toast(r.message || '已挂载', 'ok');
+      await loadBcacheEmergency();
+    } catch (e) { toast(e.message, 'error'); }
+  }));
+  el.querySelectorAll('[data-emg-umount]').forEach(b => b.addEventListener('click', async () => {
+    try {
+      const r = await api('/api/bcache/emergency/unmount', { method: 'POST', body: { backing_path: b.dataset.emgUmount } });
+      toast(r.message || '已卸载', 'ok');
+      await loadBcacheEmergency();
+    } catch (e) { toast(e.message, 'error'); }
+  }));
 }
 
 function appendBcacheControls(body, data, devData) {

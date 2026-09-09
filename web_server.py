@@ -50,7 +50,7 @@ import pam_auth
 PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_DIR = Path(os.environ.get("LSI_DATA_DIR", str(PROJECT_ROOT / "data")))
 
-VERSION = "1.10.5"
+VERSION = "1.10.7"
 AUTH_MODE = os.environ.get("LSI_AUTH_MODE", "pam")
 
 LOCAL_STORCLI = PROJECT_ROOT / "storcli64"
@@ -1853,6 +1853,32 @@ def api_bcache_destroy_cache():
     ok, msg = bcache_mgr.destroy_cache(cache_path)
     if ok:
         lsi_alert.log_event("warning", f"bcache 缓存盘销毁并清空：{cache_path}（{session.get('username', '')}）")
+    return (jsonify(ok=True, message=msg), 200) if ok else (jsonify(ok=False, error=msg), 500)
+
+
+@app.get("/api/bcache/emergency")
+@login_required
+def api_bcache_emergency():
+    return jsonify(bcache_mgr.emergency_status())
+
+
+@app.post("/api/bcache/emergency/mount")
+@admin_required
+def api_bcache_emergency_mount():
+    data = request.get_json(silent=True) or {}
+    backing_path = str(data.get("backing_path", "")).strip()
+    if not re.fullmatch(r"/dev/(sd[a-z]+|nvme\d+n\d+)$", backing_path):
+        return jsonify(ok=False, error="非法 backing 路径"), 400
+    ok, msg, mp = bcache_mgr.emergency_mount(backing_path)
+    return (jsonify(ok=True, message=msg, mountpoint=mp), 200) if ok else (jsonify(ok=False, error=msg), 500)
+
+
+@app.post("/api/bcache/emergency/unmount")
+@admin_required
+def api_bcache_emergency_unmount():
+    data = request.get_json(silent=True) or {}
+    backing_path = str(data.get("backing_path", "")).strip()
+    ok, msg = bcache_mgr.emergency_unmount(backing_path)
     return (jsonify(ok=True, message=msg), 200) if ok else (jsonify(ok=False, error=msg), 500)
 
 
