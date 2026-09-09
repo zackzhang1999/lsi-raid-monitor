@@ -1,10 +1,10 @@
 """服务器本地 PAM 认证。
 
 通过 ctypes 调用系统 libpam，验证用户名/口令；不依赖第三方 Python 包。
-角色映射：root 固定为 admin；也可用环境变量指定管理员用户/组：
+角色映射：默认只有 root 是 admin；可用环境变量显式指定额外管理员：
   LSI_PAM_ADMIN_USERS  - 逗号分隔的用户名（如 root,ops）
-  LSI_PAM_ADMIN_GROUP  - 管理员组名（默认 sudo）
-未命中者视为 viewer（只读）。
+  LSI_PAM_ADMIN_GROUP  - 管理员组名（不设置则只有 root/显式用户是 admin）
+其余系统用户一律视为 viewer（只读）。
 """
 
 from __future__ import annotations
@@ -153,7 +153,7 @@ def user_role(username: str) -> str:
     }
     if username in admin_users:
         return "admin"
-    admin_group = os.environ.get("LSI_PAM_ADMIN_GROUP", "sudo")
+    admin_group = os.environ.get("LSI_PAM_ADMIN_GROUP", "")
     if admin_group and _in_group(username, admin_group):
         return "admin"
     return "viewer"

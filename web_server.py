@@ -48,7 +48,7 @@ import pam_auth
 PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_DIR = Path(os.environ.get("LSI_DATA_DIR", str(PROJECT_ROOT / "data")))
 
-VERSION = "1.5.9"
+VERSION = "1.6.0"
 AUTH_MODE = os.environ.get("LSI_AUTH_MODE", "pam")
 
 LOCAL_STORCLI = PROJECT_ROOT / "storcli64"

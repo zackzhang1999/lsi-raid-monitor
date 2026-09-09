@@ -277,6 +277,7 @@ async function afterLogin() {
   $('#btn-alert-save').disabled = !state.isAdmin;
   $('#btn-alert-test').disabled = !state.isAdmin;
   $('#btn-webhook-test').disabled = !state.isAdmin;
+  $('#btn-hotspare-save').classList.toggle('hidden', !state.isAdmin);
   const name = me.username || 'admin';
   $('#user-name').textContent = name + (state.authRequired ? '' : '（未认证）');
   $('#user-avatar').textContent = (name[0] || '?');
@@ -2188,34 +2189,39 @@ async function loadReplacements() {
   }
   el.innerHTML = candidates.map(d => {
     const cls = d.replace_advice === '立即更换' ? 'crit' : 'warn';
+    const stepsHtml = state.isAdmin
+      ? `<div class="replace-steps">
+          <span class="step">1. 定位灯</span><button class="btn sm" data-step="locate">开启</button>
+          <span class="step">2. 下线旧盘</span><button class="btn sm danger" data-step="offline">下线</button>
+          <span class="step">3. 移除旧盘</span><span class="tiny">物理操作</span>
+          <span class="step">4. 插入新盘</span><span class="tiny">物理操作</span>
+          <span class="step">5. 设为全局热备</span><button class="btn sm" data-step="hotspare">执行</button>
+        </div>`
+      : '<div class="tiny">仅管理员可执行换盘操作</div>';
     return `<div class="replace-item" data-eid="${esc(d.eid)}" data-slot="${esc(d.slot)}">
       <div class="replace-head">
         <span class="replace-label mono">${esc(d.label)}</span>
         <span class="badge ${cls}">${esc(d.replace_advice)}</span>
         <span class="tiny">${esc(d.model || '—')}</span>
       </div>
-      <div class="replace-steps">
-        <span class="step">1. 定位灯</span><button class="btn sm" data-step="locate">开启</button>
-        <span class="step">2. 下线旧盘</span><button class="btn sm danger" data-step="offline">下线</button>
-        <span class="step">3. 移除旧盘</span><span class="tiny">物理操作</span>
-        <span class="step">4. 插入新盘</span><span class="tiny">物理操作</span>
-        <span class="step">5. 设为全局热备</span><button class="btn sm" data-step="hotspare">执行</button>
-      </div>
+      ${stepsHtml}
     </div>`;
   }).join('');
-  el.querySelectorAll('button[data-step]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const item = btn.closest('.replace-item');
-      const eid = Number(item.dataset.eid);
-      const slot = Number(item.dataset.slot);
-      const d = (state.status && state.status.physical_disks || []).find(x => Number(x.eid) === eid && Number(x.slot) === slot);
-      if (!d) { toast('未找到该磁盘', 'error'); return; }
-      const step = btn.dataset.step;
-      if (step === 'locate') diskAction(d, d.locate ? 'locate_stop' : 'locate_start');
-      else if (step === 'offline') diskAction(d, 'offline');
-      else if (step === 'hotspare') diskAction(d, 'hotspare_global');
+  if (state.isAdmin) {
+    el.querySelectorAll('button[data-step]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const item = btn.closest('.replace-item');
+        const eid = Number(item.dataset.eid);
+        const slot = Number(item.dataset.slot);
+        const d = (state.status && state.status.physical_disks || []).find(x => Number(x.eid) === eid && Number(x.slot) === slot);
+        if (!d) { toast('未找到该磁盘', 'error'); return; }
+        const step = btn.dataset.step;
+        if (step === 'locate') diskAction(d, d.locate ? 'locate_stop' : 'locate_start');
+        else if (step === 'offline') diskAction(d, 'offline');
+        else if (step === 'hotspare') diskAction(d, 'hotspare_global');
+      });
     });
-  });
+  }
 }
 
 async function loadHotspare() {
@@ -2231,34 +2237,48 @@ async function loadHotspare() {
   const cfg = data.config || {};
   const opts = [0, 1, 2, 3, 4].map(n => `<option value="${n}"${Number(cfg.desired_global) === n ? ' selected' : ''}>${n} 块</option>`).join('');
   const eligible = data.eligible || [];
-  body.innerHTML = `
-    <div class="field">
-      <label for="hs-desired">期望全局热备盘数量</label>
-      <select class="select" id="hs-desired">${opts}</select>
-    </div>
-    <label class="persist-row" style="margin-top:10px">
-      <input type="checkbox" id="hs-auto" ${cfg.auto_promote ? 'checked' : ''} />
-      <span>自动补位（策略标记，当前为人工确认）</span>
-    </label>
-    <div class="rt-kv" style="margin-top:14px">
-      <div class="item"><div class="v">${data.global_count}</div><div class="k">全局热备</div></div>
-      <div class="item"><div class="v">${data.dedicated_count}</div><div class="k">专用热备</div></div>
-      <div class="item"><div class="v">${eligible.length}</div><div class="k">可设为热备</div></div>
-    </div>
-    ${eligible.length ? `<div class="tiny" style="margin-top:10px">可设为全局热备：</div>
-      <div class="hs-list">${eligible.map(d => `<div class="hs-row">
+  const eligibleHtml = eligible.length
+    ? eligible.map(d => `<div class="hs-row">
         <span class="mono">${esc(d.label)}</span>
         <span class="tiny">${esc(d.model || '')}</span>
-        <button class="btn sm" data-hs="${esc(d.eid)}:${esc(d.slot)}">设为全局热备</button>
-      </div>`).join('')}</div>` : '<div class="tiny" style="margin-top:10px">当前没有 UGood/JBOD 盘可设为热备</div>'}`;
+        ${state.isAdmin ? `<button class="btn sm" data-hs="${esc(d.eid)}:${esc(d.slot)}">设为全局热备</button>` : '<span class="tiny">可配置</span>'}
+      </div>`).join('')
+    : '<div class="tiny" style="margin-top:10px">当前没有 UGood/JBOD 盘可设为热备</div>';
 
-  body.querySelectorAll('button[data-hs]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const [eid, slot] = btn.dataset.hs.split(':').map(Number);
-      const d = (state.status && state.status.physical_disks || []).find(x => Number(x.eid) === eid && Number(x.slot) === slot);
-      if (d) diskAction(d, 'hotspare_global');
+  if (state.isAdmin) {
+    body.innerHTML = `
+      <div class="field">
+        <label for="hs-desired">期望全局热备盘数量</label>
+        <select class="select" id="hs-desired">${opts}</select>
+      </div>
+      <label class="persist-row" style="margin-top:10px">
+        <input type="checkbox" id="hs-auto" ${cfg.auto_promote ? 'checked' : ''} />
+        <span>自动补位（策略标记，当前为人工确认）</span>
+      </label>
+      <div class="rt-kv" style="margin-top:14px">
+        <div class="item"><div class="v">${data.global_count}</div><div class="k">全局热备</div></div>
+        <div class="item"><div class="v">${data.dedicated_count}</div><div class="k">专用热备</div></div>
+        <div class="item"><div class="v">${eligible.length}</div><div class="k">可设为热备</div></div>
+      </div>
+      ${eligible.length ? '<div class="tiny" style="margin-top:10px">可设为全局热备：</div><div class="hs-list">' + eligibleHtml + '</div>' : ''}`;
+    body.querySelectorAll('button[data-hs]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const [eid, slot] = btn.dataset.hs.split(':').map(Number);
+        const d = (state.status && state.status.physical_disks || []).find(x => Number(x.eid) === eid && Number(x.slot) === slot);
+        if (d) diskAction(d, 'hotspare_global');
+      });
     });
-  });
+  } else {
+    body.innerHTML = `
+      <div class="rt-kv">
+        <div class="item"><div class="v">${data.global_count}</div><div class="k">全局热备</div></div>
+        <div class="item"><div class="v">${data.dedicated_count}</div><div class="k">专用热备</div></div>
+        <div class="item"><div class="v">${eligible.length}</div><div class="k">可设为热备</div></div>
+      </div>
+      <div class="tiny" style="margin-top:10px">期望全局热备 ${Number(cfg.desired_global) || 0} 块 · ${cfg.auto_promote ? '已开启' : '未开启'}自动补位</div>
+      ${eligible.length ? '<div class="tiny" style="margin-top:10px">可设为热备的盘：</div><div class="hs-list">' + eligibleHtml + '</div>' : ''}
+      <div class="tiny" style="margin-top:12px">仅管理员可配置热备策略</div>`;
+  }
 }
 
 async function saveHotsparePolicy() {
