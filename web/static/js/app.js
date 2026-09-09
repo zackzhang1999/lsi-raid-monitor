@@ -2993,7 +2993,7 @@ async function loadBcache() {
             return `<div class="stat-mini bucket">
               <span class="stat-mini-k">缓存桶构成</span>
               <span class="stat-mini-metrics">
-                ${row('脏数据（仅 SSD · 待写回）', ci.bucket_dirty)}
+                ${row('脏数据桶占比（GC 标记 · 非待写回量）', ci.bucket_dirty)}
                 ${row('干净数据（与磁盘一致）', ci.bucket_clean)}
                 ${row('空闲（未使用）', ci.bucket_unused)}
                 ${row('元数据（bcache 索引）', ci.bucket_metadata)}
@@ -3001,17 +3001,22 @@ async function loadBcache() {
             </div>`;
           }
           if (x.cap) {
+            const unusedPct = offline ? null : Number(ci.bucket_unused);
+            const cleanPct = offline ? null : Number(ci.bucket_clean);
+            const rowCap = (pct) => (offline || pct == null || isNaN(pct))
+              ? '—'
+              : `${fmtNum(pct)}% · ${capFmt(cacheTotalBytes * pct / 100)}`;
             return `<div class="stat-mini cap">
               <span class="stat-mini-k">缓存容量</span>
               <span class="stat-mini-cap-vals">
-                <span class="used"><b>${offline ? '—' : `${usage}%`}</b><i>占用</i></span>
-                <span class="free"><b>${offline ? '—' : `${avail}%`}</b><i>可用</i></span>
+                <span class="free"><b>${offline ? '—' : `${avail}%`}</b><i>可用·含可回收</i></span>
+                <span class="used"><b>${offline ? '—' : `${usage}%`}</b><i>脏标记·待GC回收</i></span>
               </span>
               <span class="stat-mini-bar">${offline ? '' : `<i style="width:${Math.max(0, Math.min(100, usage))}%"></i>`}</span>
               <span class="stat-mini-metrics">
                 <span><em>总容量</em><b>${capFmt(cacheTotalBytes)}</b></span>
-                <span><em>已用空间</em><b>${offline ? '—' : capFmt(cacheTotalBytes * (usage || 0) / 100)}</b></span>
-                <span><em>可用空间</em><b>${offline ? '—' : capFmt(cacheTotalBytes * (avail || 0) / 100)}</b></span>
+                <span><em>空桶（真空闲）</em><b>${rowCap(unusedPct)}</b></span>
+                <span><em>干净缓存（可回收）</em><b>${rowCap(cleanPct)}</b></span>
               </span>
             </div>`;
           }
@@ -3176,7 +3181,7 @@ function appendBcacheControls(body, data, devData) {
                    <button class="btn sm" data-mount="${esc(n)}">挂载</button>
                    <button class="btn sm" data-detach="${esc(n)}">解绑缓存</button>
                    <button class="btn sm danger" data-erase="${esc(n)}">擦除超级块</button>
-                   <button class="btn sm danger" data-stop="${esc(n)}">停止</button>`}
+                   <button class="btn sm danger" data-stop="${esc(n)}">停用</button>`}
             </div>`
           : '<div class="tiny">仅管理员可管理</div>';
         return `<div class="bcache-mgr" data-name="${esc(n)}">
@@ -3344,9 +3349,9 @@ function appendBcacheControls(body, data, devData) {
   }));
   body.querySelectorAll('[data-stop]').forEach(b => b.addEventListener('click', () => {
     const name = b.dataset.stop;
-    confirmModal(`停止 ${name}`, `<p class="warn-text">停止 ${name} 会使其从系统移除；再次使用需要重新注册/attach。</p>`, '停止', true, async () => {
+    confirmModal(`停用 ${name}`, `<p class="warn-text">停用后 ${name} 会从系统移除；再次使用需要重新注册/attach。</p>`, '停用', true, async () => {
       const r = await api('/api/bcache/stop', { method: 'POST', body: { name } });
-      toast(r.message || '已停止', 'ok');
+      toast(r.message || '已停用', 'ok');
       try { localStorage.setItem('lsi-bcache-stopped', '1'); } catch (e) { /* 忽略 */ }
       await loadBcache();
     });
