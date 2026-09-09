@@ -41,6 +41,8 @@ from flask import (
 import lsi_alert
 import lsi_collectd
 import storage_mgr
+import bcache_mgr
+import bcache_alerts
 import user_mgr
 import db
 import pam_auth
@@ -48,7 +50,7 @@ import pam_auth
 PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_DIR = Path(os.environ.get("LSI_DATA_DIR", str(PROJECT_ROOT / "data")))
 
-VERSION = "1.6.0"
+VERSION = "1.10.0"
 AUTH_MODE = os.environ.get("LSI_AUTH_MODE", "pam")
 
 LOCAL_STORCLI = PROJECT_ROOT / "storcli64"
@@ -262,6 +264,21 @@ def _start_embedded_collector() -> None:
     t.start()
 
 
+def _bcache_alert_loop() -> None:
+    while True:
+        try:
+            if os.environ.get("LSI_DISABLE_BCACHE_ALERT") != "1":
+                bcache_alerts.evaluate()
+        except Exception:
+            pass
+        time.sleep(60)
+
+
+def _start_bcache_alert_loop() -> None:
+    t = threading.Thread(target=_bcache_alert_loop, daemon=True, name="bcache-alert")
+    t.start()
+
+
 # 启动时把历史 CSV 幂等迁移进 SQLite，并按配置执行保留清理
 try:
     db.migrate_from_csv()
@@ -276,6 +293,7 @@ except Exception as exc:  # SQLite 异常不应阻断 Web 服务启动
 
 
 _start_embedded_collector()
+_start_bcache_alert_loop()
 
 
 @app.after_request
@@ -1563,6 +1581,260 @@ def api_nfs_install():
         "warning" if ok else "error",
         f"NFS 服务安装：{msg}（{session.get('username', '')}）",
     )
+    return (jsonify(ok=True, message=msg), 200) if ok else (jsonify(ok=False, error=msg), 500)
+
+
+@app.get("/api/bcache/status")
+@login_required
+def api_bcache_status():
+    return jsonify(bcache_mgr.status())
+
+
+@app.post("/api/bcache/prepare")
+@admin_required
+def api_bcache_prepare():
+    ok, msg = bcache_mgr.prepare()
+    if ok:
+        lsi_alert.log_event("info", f"bcache 环境准备完成（{session.get('username', '')}）")
+    return (jsonify(ok=True, message=msg), 200) if ok else (jsonify(ok=False, error=msg), 500)
+
+
+@app.get("/api/bcache/devices")
+@login_required
+def api_bcache_devices():
+    return jsonify(devices=bcache_mgr.block_devices())
+
+
+@app.post("/api/bcache/create")
+@admin_required
+def api_bcache_create():
+    data = request.get_json(silent=True) or {}
+    cache_path = str(data.get("cache_path", "")).strip()
+    backing_path = str(data.get("backing_path", "")).strip()
+    if not bool(data.get("acknowledge")):
+        return jsonify(ok=False, error="请勾选确认两块设备可被清空"), 400
+    ok, msg, dev = bcache_mgr.create_bcache(cache_path, backing_path)
+    if ok:
+        lsi_alert.log_event("warning", f"bcache 创建：缓存={cache_path} backing={backing_path} → {dev}（{session.get('username', '')}）")
+    return jsonify(ok=ok, message=msg, device=dev) if ok else (jsonify(ok=False, error=msg), 500)
+
+
+@app.post("/api/bcache/mode")
+@admin_required
+def api_bcache_mode():
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", "")).strip()
+    mode = str(data.get("mode", "")).strip()
+    if not re.fullmatch(r"bcache\d+", name):
+        return jsonify(ok=False, error="非法设备名"), 400
+    ok, msg = bcache_mgr.set_mode(name, mode)
+    lsi_alert.log_event("info" if ok else "error", f"bcache {name} 模式切换 {mode}: {msg}")
+    return (jsonify(ok=True, message=msg), 200) if ok else (jsonify(ok=False, error=msg), 500)
+
+
+@app.post("/api/bcache/detach")
+@admin_required
+def api_bcache_detach():
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", "")).strip()
+    if not re.fullmatch(r"bcache\d+", name):
+        return jsonify(ok=False, error="非法设备名"), 400
+    ok, msg = bcache_mgr.detach(name)
+    return (jsonify(ok=True, message=msg), 200) if ok else (jsonify(ok=False, error=msg), 500)
+
+
+@app.post("/api/bcache/stop")
+@admin_required
+def api_bcache_stop():
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", "")).strip()
+    if not re.fullmatch(r"bcache\d+", name):
+        return jsonify(ok=False, error="非法设备名"), 400
+    ok, msg = bcache_mgr.stop(name)
+    return (jsonify(ok=True, message=msg), 200) if ok else (jsonify(ok=False, error=msg), 500)
+
+
+@app.post("/api/bcache/mount")
+@admin_required
+def api_bcache_mount():
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", "")).strip()
+    mountpoint = str(data.get("mountpoint", "")).strip() or None
+    if not re.fullmatch(r"bcache\d+", name):
+        return jsonify(ok=False, error="非法设备名"), 400
+    ok, msg = bcache_mgr.mount_bcache(name, mountpoint)
+    return (jsonify(ok=True, message=msg), 200) if ok else (jsonify(ok=False, error=msg), 500)
+
+
+@app.post("/api/bcache/umount")
+@admin_required
+def api_bcache_umount():
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", "")).strip()
+    if not re.fullmatch(r"bcache\d+", name):
+        return jsonify(ok=False, error="非法设备名"), 400
+    ok, msg = bcache_mgr.umount_bcache(name)
+    return (jsonify(ok=True, message=msg), 200) if ok else (jsonify(ok=False, error=msg), 500)
+
+
+@app.get("/api/bcache/stats")
+@login_required
+def api_bcache_stats():
+    device = str(request.args.get("device", "")).strip()
+    if not re.fullmatch(r"bcache\d+", device):
+        return jsonify(ok=False, error="非法设备名"), 400
+    return jsonify(bcache_mgr.device_stats(device))
+
+
+@app.post("/api/bcache/writeback")
+@admin_required
+def api_bcache_writeback():
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", "")).strip()
+    if not re.fullmatch(r"bcache\d+", name):
+        return jsonify(ok=False, error="非法设备名"), 400
+    ok, msg = bcache_mgr.trigger_writeback(name)
+    return (jsonify(ok=True, message=msg), 200) if ok else (jsonify(ok=False, error=msg), 500)
+
+
+@app.post("/api/bcache/erase")
+@admin_required
+def api_bcache_erase():
+    data = request.get_json(silent=True) or {}
+    dev_path = str(data.get("device_path", "")).strip()
+    confirm = str(data.get("confirm", "")).strip()
+    if not bool(data.get("acknowledge")):
+        return jsonify(ok=False, error="请勾选确认操作风险"), 400
+    if confirm != dev_path:
+        return jsonify(ok=False, error="确认文本与设备路径不一致"), 400
+    ok, msg = bcache_mgr.erase_superblock(dev_path)
+    if ok:
+        lsi_alert.log_event("warning", f"bcache 超级块擦除：{dev_path}（{session.get('username', '')}）")
+    return (jsonify(ok=True, message=msg), 200) if ok else (jsonify(ok=False, error=msg), 500)
+
+
+@app.get("/api/bcache/alerts")
+@login_required
+def api_bcache_alerts_get():
+    return jsonify(config=bcache_alerts.load_config())
+
+
+@app.post("/api/bcache/alerts")
+@admin_required
+def api_bcache_alerts_save():
+    data = request.get_json(silent=True) or {}
+    cfg = bcache_alerts.load_config()
+    try:
+        if "enabled" in data:
+            cfg["enabled"] = bool(data["enabled"])
+        for k, lo, hi in (("cache_available_warn", 1, 100), ("dirty_stuck_minutes", 1, 1440),
+                          ("hit_drop_points", 1, 100)):
+            if k in data:
+                val = int(data[k])
+                if not (lo <= val <= hi):
+                    return jsonify(ok=False, error=f"{k} 超出范围"), 400
+                cfg[k] = val
+        if "backlog_bytes" in data:
+            val = int(data["backlog_bytes"])
+            if val <= 0:
+                return jsonify(ok=False, error="backlog_bytes 必须为正数"), 400
+            cfg["backlog_bytes"] = val
+    except (ValueError, TypeError):
+        return jsonify(ok=False, error="参数必须是整数"), 400
+    bcache_alerts.save_config(cfg)
+    lsi_alert.log_event("info", f"bcache 告警配置已更新（{session.get('username', 'system')}）")
+    return jsonify(ok=True, config=cfg)
+
+
+@app.get("/api/bcache/gc")
+@login_required
+def api_bcache_gc():
+    uuid = str(request.args.get("uuid", "")).strip()
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", uuid):
+        return jsonify(ok=False, error="非法缓存集 UUID"), 400
+    return jsonify(bcache_mgr.gc_status(uuid))
+
+
+@app.post("/api/bcache/gc/trigger")
+@admin_required
+def api_bcache_gc_trigger():
+    data = request.get_json(silent=True) or {}
+    uuid = str(data.get("uuid", "")).strip()
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", uuid):
+        return jsonify(ok=False, error="非法缓存集 UUID"), 400
+    ok, msg = bcache_mgr.trigger_gc(uuid)
+    return (jsonify(ok=True, message=msg), 200) if ok else (jsonify(ok=False, error=msg), 500)
+
+
+@app.post("/api/bcache/cache_unregister")
+@admin_required
+def api_bcache_cache_unregister():
+    data = request.get_json(silent=True) or {}
+    uuid = str(data.get("uuid", "")).strip()
+    confirm = str(data.get("confirm", "")).strip()
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", uuid):
+        return jsonify(ok=False, error="非法缓存集 UUID"), 400
+    if not bool(data.get("acknowledge")):
+        return jsonify(ok=False, error="请勾选风险确认"), 400
+    if confirm != uuid:
+        return jsonify(ok=False, error="确认文本与缓存集 UUID 不一致"), 400
+    ok, msg = bcache_mgr.unregister_cset(uuid)
+    if ok:
+        lsi_alert.log_event("warning", f"bcache 缓存集注销 {uuid}（{session.get('username', '')}）")
+    return (jsonify(ok=True, message=msg), 200) if ok else (jsonify(ok=False, error=msg), 500)
+
+
+@app.get("/api/bcache/tunables")
+@login_required
+def api_bcache_tunables():
+    device = str(request.args.get("device", "")).strip()
+    if not re.fullmatch(r"bcache\d+", device):
+        return jsonify(ok=False, error="非法设备名"), 400
+    return jsonify(bcache_mgr.tunables(device))
+
+
+@app.post("/api/bcache/tune")
+@admin_required
+def api_bcache_tune():
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", "")).strip()
+    settings = data.get("settings")
+    if not re.fullmatch(r"bcache\d+", name):
+        return jsonify(ok=False, error="非法设备名"), 400
+    if not isinstance(settings, dict) or not settings:
+        return jsonify(ok=False, error="settings 不能为空"), 400
+    results = []
+    for key, value in settings.items():
+        ok, msg = bcache_mgr.set_tunable(name, key, value)
+        if not ok:
+            return jsonify(ok=False, error=f"{key}: {msg}"), 400
+        results.append(msg)
+    lsi_alert.log_event("info", f"bcache {name} 比例调节：{', '.join(results)}（{session.get('username', 'system')}）")
+    return jsonify(ok=True, message="；".join(results))
+
+
+@app.post("/api/bcache/reattach")
+@admin_required
+def api_bcache_reattach():
+    data = request.get_json(silent=True) or {}
+    backing_path = str(data.get("backing_path", "")).strip()
+    cset_uuid = str(data.get("cset_uuid", "")).strip()
+    if not re.fullmatch(r"/dev/(sd[a-z]+|nvme\d+n\d+)$", backing_path):
+        return jsonify(ok=False, error="非法 backing 设备路径"), 400
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", cset_uuid):
+        return jsonify(ok=False, error="非法缓存集 UUID"), 400
+    ok, msg, dev = bcache_mgr.reattach(backing_path, cset_uuid)
+    if ok:
+        lsi_alert.log_event("warning", f"bcache 重新绑定 {backing_path} → {cset_uuid}（{session.get('username', '')}）")
+    return jsonify(ok=ok, message=msg, device=dev) if ok else (jsonify(ok=False, error=msg), 500)
+
+
+@app.post("/api/bcache/recover")
+@admin_required
+def api_bcache_recover():
+    ok, msg = bcache_mgr.recover()
+    if ok:
+        lsi_alert.log_event("warning", f"bcache 缓存恢复：{msg}（{session.get('username', '')}）")
     return (jsonify(ok=True, message=msg), 200) if ok else (jsonify(ok=False, error=msg), 500)
 
 

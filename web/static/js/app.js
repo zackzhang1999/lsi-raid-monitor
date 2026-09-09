@@ -119,6 +119,8 @@ const state = {
   ctlLines: 100,
   ctlQuery: '',
   storageLoaded: false,
+  storageExpanded: new Set(),
+  bcacheLoaded: false,
   opsLoaded: false,
   bayCapacity: 'auto',
   bayLayout: {},
@@ -282,6 +284,13 @@ async function afterLogin() {
   $('#user-name').textContent = name + (state.authRequired ? '' : '（未认证）');
   $('#user-avatar').textContent = (name[0] || '?');
   $('#app-version').textContent = me.version ? 'v' + me.version : '';
+  let savedView = 'overview';
+  try {
+    const sv = localStorage.getItem('lsi-view');
+    if (['overview', 'storage', 'logs', 'ops', 'users'].includes(sv)) savedView = sv;
+  } catch (e) { /* 忽略 */ }
+  if (savedView === 'users' && !(me.manage_users && state.isAdmin)) savedView = 'overview';
+  switchView(savedView);
   await loadAll();
   if (state.refreshTimer) clearInterval(state.refreshTimer);
   state.refreshTimer = setInterval(() => loadStatus().catch(() => {}), 60000);
@@ -1583,18 +1592,48 @@ async function loadStorage() {
   tb.innerHTML = '';
   const devices = data.devices || [];
   if (!devices.length) { tb.innerHTML = '<tr><td colspan="5" class="muted">未发现块设备</td></tr>'; return; }
-  devices.forEach(dev => appendDeviceRows(tb, dev, 0));
+  devices.forEach(dev => {
+    const key = dev.path || dev.name;
+    const top = createStorageRow(dev, 0);
+    tb.appendChild(top);
+    const parts = dev.children || [];
+    if (parts.length) {
+      const subRows = parts.map(ch => createStorageRow(ch, 1));
+      subRows.forEach(r => tb.appendChild(r));
+      const show = state.storageExpanded.has(key);
+      subRows.forEach(r => r.classList.toggle('storage-collapsed', !show));
+      top.style.cursor = 'pointer';
+      top.addEventListener('click', (ev) => {
+        if (ev.target.closest('.ops')) return;
+        const isOpen = state.storageExpanded.has(key);
+        if (isOpen) state.storageExpanded.delete(key);
+        else state.storageExpanded.add(key);
+        subRows.forEach(r => {
+          r.classList.toggle('storage-collapsed', isOpen);
+          r.classList.remove('storage-row-anim');
+          void r.offsetWidth;
+          r.classList.add('storage-row-anim');
+        });
+        const caret = top.querySelector('.tree-caret');
+        if (caret) caret.textContent = isOpen ? '▸' : '▾';
+      });
+    }
+  });
   state.storageLoaded = true;
 }
 
-function appendDeviceRows(tb, dev, depth) {
+function createStorageRow(dev, depth) {
   const tr = document.createElement('tr');
+  const key = dev.path || dev.name || ('dev-' + depth);
+  const hasChildren = (dev.children || []).length > 0;
+  const expanded = state.storageExpanded.has(key);
   if (dev.raid_member) tr.className = 'row-disabled';
   const mounted = (dev.mountpoints || []).length > 0;
   const fsText = [dev.fstype, dev.label].filter(Boolean).join(' · ');
   tr.innerHTML = `
     <td><span class="tree-name" style="padding-left:${depth * 20}px">
-      ${depth > 0 ? '└' : ''} ${esc(dev.name || dev.path || '—')}
+      ${hasChildren ? `<span class="tree-caret">${expanded ? '▾' : '▸'}</span>` : `<span class="tree-caret" style="visibility:hidden">▸</span>`}
+      ${depth > 0 ? '' : ''}${esc(dev.name || dev.path || '—')}
       ${dev.raid_member ? '<span class="raid-tag">RAID 成员</span>' : ''}
     </span></td>
     <td class="num">${fmtGB(dev.size)}</td>
@@ -1636,8 +1675,8 @@ function appendDeviceRows(tb, dev, depth) {
   } else {
     ops.innerHTML = '<span class="tiny">—</span>';
   }
-  tb.appendChild(tr);
-  (dev.children || []).forEach(ch => appendDeviceRows(tb, ch, depth + 1));
+  tr.dataset.storageKey = key;
+  return tr;
 }
 
 function mountDevice(dev) {
@@ -1925,6 +1964,7 @@ function arrangeDisks(list, capacity, eid) {
 }
 
 let _dragState = null;
+let _bcacheChart = null;
 
 function onTrayDragStart(ev) {
   _dragState = { eid: ev.currentTarget.dataset.eid, idx: Number(ev.currentTarget.dataset.idx) };
@@ -2333,6 +2373,11 @@ async function loadLife() {
 /* ---------- 视图切换 ---------- */
 function switchView(v) {
   state.view = v;
+  try {
+    if (['overview', 'storage', 'logs', 'ops', 'users'].includes(v)) {
+      localStorage.setItem('lsi-view', v);
+    }
+  } catch (e) { /* 忽略 */ }
   $$('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.view === v));
   ['overview', 'storage', 'logs', 'ops', 'users'].forEach(name => {
     $('#view-' + name).classList.toggle('hidden', name !== v);
@@ -2340,10 +2385,9 @@ function switchView(v) {
   if (v === 'storage' && !state.storageLoaded) loadStorage();
   if (v === 'storage' && !state.fsUsage) loadFsUsage();
   if (v === 'storage' && !state.nfsLoaded) loadNfs();
+  if (v === 'storage' && !state.bcacheLoaded) loadBcache();
   if (v === 'ops' && !state.opsLoaded) loadOps();
   if (v === 'users' && !state.usersLoaded) loadUsers();
-  $('#sidebar').classList.remove('open');
-  $('#sidebar-scrim').classList.remove('show');
 }
 
 /* ---------- UI 绑定 ---------- */
@@ -2360,19 +2404,6 @@ function bindUI() {
   $('#security-banner').addEventListener('click', gotoCreateUser);
   $('#security-banner').addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); gotoCreateUser(); }
-  });
-  $('#btn-sidebar').addEventListener('click', () => {
-    const sb = $('#sidebar');
-    if (window.innerWidth <= 860) {
-      sb.classList.toggle('open');
-      $('#sidebar-scrim').classList.toggle('show', sb.classList.contains('open'));
-    } else {
-      $('#app').classList.toggle('sb-collapsed');
-    }
-  });
-  $('#sidebar-scrim').addEventListener('click', () => {
-    $('#sidebar').classList.remove('open');
-    $('#sidebar-scrim').classList.remove('show');
   });
 
   // 主题切换
@@ -2530,6 +2561,7 @@ function bindUI() {
   });
   $('#btn-nfs-refresh').addEventListener('click', loadNfs);
   $('#btn-nfs-install').addEventListener('click', installNfs);
+  $('#btn-bcache-prepare').addEventListener('click', prepareBcache);
   $('#nfs-form').addEventListener('submit', (ev) => { ev.preventDefault(); addNfs(); });
   $('#user-form').addEventListener('submit', createUser);
 
@@ -2828,6 +2860,597 @@ async function installNfs() {
   } finally {
     btnLoading(btn, false);
   }
+}
+
+async function loadBcache() {
+  const body = $('#bcache-body');
+  body.innerHTML = '<div class="loading-line">加载中…</div>';
+  let data;
+  let devData;
+  try {
+    const r = await Promise.all([
+      api('/api/bcache/status'),
+      api('/api/bcache/devices'),
+    ]);
+    data = r[0];
+    devData = r[1];
+  } catch (e) {
+    body.innerHTML = `<div class="muted">加载失败：${esc(e.message)}</div>`;
+    return;
+  }
+  state.bcacheLoaded = true;
+  const btn = $('#btn-bcache-prepare');
+  const ready = !!(data.available && data.module_loaded);
+  btn.classList.toggle('hidden', !state.isAdmin || ready);
+  const csets = data.cache_sets || [];
+  const devs = data.devices || [];
+  const okBadge = '<span class="badge ok">就绪</span>';
+  const noBadge = '<span class="badge">未就绪</span>';
+  const cacheOffline = csets.some(c => c.cache_offline);
+  body.innerHTML = `
+    <div class="rt-kv" style="margin-top:0">
+      <div class="item"><div class="v">${data.available ? '有' : '无'}</div><div class="k">bcache-tools</div></div>
+      <div class="item"><div class="v">${data.module_loaded ? '已加载' : '未加载'}</div><div class="k">内核模块</div></div>
+      <div class="item"><div class="v">${csets.length}</div><div class="k">缓存集</div></div>
+      <div class="item"><div class="v">${devs.length}</div><div class="k">bcache 设备</div></div>
+    </div>
+    <div class="banner" style="margin-top:14px;${ready ? 'border-color:rgba(53,196,139,.3);background:var(--ok-bg);' : ''}">
+      ${ready ? okBadge + ' <span>bcache 环境已就绪。</span>' : noBadge + ' <span style="flex:1">尚未安装 bcache-tools 或未加载内核模块，管理员可点击右上角“准备环境”。</span>'}
+    </div>
+    ${cacheOffline ? `<div class="banner" style="margin-top:10px;border-color:color-mix(in srgb, var(--crit) 45%, transparent);background:var(--crit-bg)">
+      <span class="badge crit">缓存盘离线</span><span>检测到缓存盘已不在系统中（bcache 已降级为 no cache）。请检查缓存盘连接，恢复后可重新注册并绑定。</span>
+    </div>` : ''}
+    ${csets.length ? `<div class="tiny" style="margin-top:14px">缓存集统计：</div>
+      ${csets.map(c => {
+        const offline = !!c.cache_offline;
+        const hit = offline ? null : (Number(c.cache_hit_ratio) || 0);
+        const avail = offline ? null : Number(c.cache_available_percent);
+        const usage = avail != null && avail >= 0 ? (100 - avail) : null;
+        const ci = c.cache_info || {};
+        const cards = [
+          { k: '命中率', v: offline ? '—' : `${hit}%`, s: offline ? '缓存盘不在线' : `Hits ${esc(c.cache_hits)} · Miss ${esc(c.cache_misses)}` },
+          { k: '缓存可用', v: offline ? '—' : `${esc(avail)}%`, s: offline ? '缓存盘不在线' : '缓存可用比例' },
+          { k: '缓存占用', v: offline ? '—' : `${esc(usage)}%`, s: offline ? '缓存盘不在线' : '已占用缓存' },
+          { k: '直通命中/未命中', v: offline ? '—' : `${esc(c.cache_bypass_hits)} / ${esc(c.cache_bypass_misses)}`, s: offline ? '缓存盘不在线' : '绕过缓存的 IO' },
+          { k: '总桶', v: offline ? '—' : `${esc(ci.nbuckets || '—')}`, s: offline ? '缓存盘不在线' : `桶大小 ${esc(ci.bucket_size || '—')}` },
+          { k: '桶状态', v: offline ? '—' : `C ${esc(ci.bucket_clean || 0)}% · D ${esc(ci.bucket_dirty || 0)}%`, s: offline ? '缓存盘不在线' : `Unused ${esc(ci.bucket_unused || 0)}% · Meta ${esc(ci.bucket_metadata || 0)}%` },
+        ];
+        return `<div class="stat-mini-grid">${cards.map(x => `<div class="stat-mini">
+          <span class="stat-mini-k">${esc(x.k)}</span>
+          <span class="stat-mini-v">${x.v}</span>
+          <span class="stat-mini-s">${x.s}</span>
+        </div>`).join('')}</div>`;
+      }).join('')}` : ''}`;
+  appendBcacheControls(body, data, devData);
+  if (devs.length) renderBcacheTrend(devs[0].name);
+  if (csets.length) renderBcacheTopology(csets, devs);
+  loadBcacheAlertSettings();
+  if (state.isAdmin) {
+    devs.forEach(x => loadBcacheTunables(x.name));
+  }
+}
+
+function appendBcacheControls(body, data, devData) {
+  const admin = !!state.isAdmin;
+  const devs = data.devices || [];
+  const blockDevs = (devData && devData.devices) || [];
+  const isBlank = d => !d.mounted && !d.in_bcache && String(d.fstype || '').toLowerCase() !== 'bcache';
+  const freeCache = blockDevs.filter(d => isBlank(d) && !d.has_partitions && (Number(d.rota) === 0 || /nvme/i.test(d.device)));
+  const freeBacking = blockDevs.filter(isBlank);
+  const ready = !!(data.available && data.module_loaded);
+  const fmtSize = (b) => {
+    if (b == null || !Number(b)) return '';
+    const g = Number(b) / 1073741824;
+    return g >= 1 ? g.toFixed(1) + 'G' : Math.round(Number(b) / 1048576) + 'M';
+  };
+  const curMode = (raw) => {
+    const m = String(raw || '').match(/\[(\w+)\]/);
+    return m ? m[1] : 'writethrough';
+  };
+  const modeOpts = ['writethrough', 'writeback', 'writearound', 'none']
+    .map(m => `<option value="${m}">${m}</option>`).join('');
+
+  let html = '';
+
+  if (admin && ready) {
+    if (freeCache.length && freeBacking.length) {
+      const cacheOpts = freeCache.map(d =>
+        `<option value="${esc(d.path)}">${esc(d.device)} · ${fmtSize(d.size)} · ${esc(d.model || d.tran || 'SSD')}</option>`).join('');
+      const backOpts = freeBacking.map(d =>
+        `<option value="${esc(d.path)}">${esc(d.device)} · ${fmtSize(d.size)}${d.has_partitions ? ' · 含分区(将被清空)' : ''}</option>`).join('');
+      html += `
+        <div class="field" style="margin-top:14px">
+          <label>新建 bcache（缓存盘 + 被加速盘）</label>
+          <div class="replace-steps" style="flex-wrap:wrap">
+            <select class="select" id="bcache-cache">${cacheOpts}</select>
+            <select class="select" id="bcache-backing">${backOpts || '<option value="">无可用盘</option>'}</select>
+            <button class="btn sm danger" id="btn-bcache-create">创建缓存</button>
+          </div>
+          <label class="check-row" style="margin-top:8px"><input type="checkbox" id="bcache-ack" />
+            <span>确认两块设备上的现有数据都可以被清空</span></label>
+        </div>`;
+    } else {
+      const csetList = data.cache_sets || [];
+      const degraded = csetList.some(c => c.cache_offline) || devs.some(x => /no cache/i.test(String(x.state || '')));
+      const bcCands = blockDevs.filter(d => !d.in_bcache && String(d.fstype || '').toLowerCase() === 'bcache');
+      const cacheCands = bcCands.filter(d => d.bcache_role === 'cache');
+      const backingCands = bcCands.filter(d => d.bcache_role !== 'cache');
+      let showReattach = false;
+      try { showReattach = localStorage.getItem('lsi-bcache-stopped') === '1'; } catch (e) { /* 忽略 */ }
+      if (showReattach && csetList.length && backingCands.length) {
+        html += '<div class="tiny" style="margin-top:12px">检测到可重新绑定的 backing 设备：</div><div class="hs-list">' +
+          backingCands.map(d => `<div class="hs-row">
+            <span class="mono">${esc(d.path)}</span>
+            <span class="tiny">${esc(d.model || '')}</span>
+            <button class="btn sm" data-reattach="${esc(d.path)}" data-cset="${esc(csetList[0].uuid)}">重新注册并绑定</button>
+          </div>`).join('') + '</div>';
+      } else {
+        if (degraded && csetList.length && cacheCands.length) {
+          html += '<div class="tiny" style="margin-top:12px">检测到缓存盘已恢复，可重新接入：</div><div class="bcache-ops"><button class="btn sm primary" data-bcache-recover>恢复缓存</button></div>';
+        } else {
+          html += '<div class="tiny" style="margin-top:12px">暂无可用空白缓存盘/被加速盘（已被 bcache 使用或已挂载的设备不会出现在这里）。</div>';
+        }
+      }
+    }
+  }
+
+  if (devs.length) {
+    html += '<div class="tiny" style="margin-top:14px">bcache 设备管理：</div><div class="hs-list">' +
+      devs.map(x => {
+        const n = x.name;
+        const mc = curMode(x.cache_mode);
+        const stCls = x.state === 'clean' ? 'ok' : (/no cache|no_cache/i.test(String(x.state || '')) ? 'warn' : '');
+        const modeSel = `<select class="select" data-mode-for="${esc(n)}" data-current="${esc(mc)}">${modeOpts.replace(`value="${mc}"`, `value="${mc}" selected`)}</select>`;
+        const ops = admin
+          ? `<div class="bcache-ops">
+              ${modeSel}
+              <button class="btn sm" data-mode-save="${esc(n)}">切换模式</button>
+              <button class="btn sm" data-writeback="${esc(n)}">手动回写</button>
+              ${x.mounted
+                ? `<button class="btn sm" data-umount="${esc(n)}">卸载</button>`
+                : `<input class="input" data-mount-input="${esc(n)}" value="/mnt/${esc(n)}" style="width:150px" />
+                   <button class="btn sm" data-mount="${esc(n)}">挂载</button>
+                   <button class="btn sm" data-detach="${esc(n)}">解绑缓存</button>
+                   <button class="btn sm danger" data-erase="${esc(n)}">擦除超级块</button>
+                   <button class="btn sm danger" data-stop="${esc(n)}">停止</button>`}
+            </div>`
+          : '<div class="tiny">仅管理员可管理</div>';
+        return `<div class="bcache-mgr" data-name="${esc(n)}">
+          <div class="hs-row">
+            <span class="mono">${esc(x.device)}</span>
+            <span class="tiny">${esc(x.label || '')}</span>
+            <span class="badge ${stCls}">${esc(x.state || '—')}</span>
+            ${x.mounted ? `<span class="badge ok">已挂载 ${esc(x.mounted)}</span>` : '<span class="badge">未挂载</span>'}
+            ${x.dirty_data ? `<span class="tiny">脏数据 ${esc(x.dirty_data)}</span>` : ''}
+          </div>
+          ${ops}
+          ${admin ? `<div class="bcache-tune" data-tune-for="${esc(n)}"></div>` : ''}
+        </div>`;
+      }).join('') + '</div>';
+  }
+
+  const csets = data.cache_sets || [];
+  if (admin && csets.length) {
+    html += csets.map(c => {
+      const uuid = c.uuid || '';
+      return `<div class="bcache-mgr" data-gc-uuid="${esc(uuid)}">
+        <div class="tiny">缓存集 ${esc(uuid.slice(0, 8))}… · GC / 缓存盘下线</div>
+        <div class="bcache-ops">
+          <button class="btn sm" data-gc-view="${esc(uuid)}">查看 GC 状态</button>
+          <button class="btn sm" data-gc-run="${esc(uuid)}">触发 GC</button>
+          <button class="btn sm danger" data-cache-off="${esc(uuid)}">注销缓存集</button>
+        </div>
+        <pre class="smart-pre hidden" data-gc-pre="${esc(uuid)}"></pre>
+      </div>`;
+    }).join('');
+  }
+
+  if (!admin) {
+    html += '<div class="tiny" style="margin-top:12px;color:var(--ink-faint)">仅管理员可创建/切换/解绑 bcache。</div>';
+  }
+  body.insertAdjacentHTML('beforeend', html);
+
+  const createBtn = $('#btn-bcache-create');
+  if (createBtn) {
+    createBtn.addEventListener('click', () => {
+      if (!$('#bcache-ack').checked) { toast('请先勾选确认清空设备', 'error'); return; }
+      const cachePath = $('#bcache-cache').value;
+      const backingPath = $('#bcache-backing').value;
+      if (!cachePath || !backingPath) { toast('请选择缓存盘和被加速盘', 'error'); return; }
+      confirmModal('创建 bcache 缓存',
+        `<p>缓存盘：<strong class="mono">${esc(cachePath)}</strong><br/>被加速盘：<strong class="mono">${esc(backingPath)}</strong></p>
+         <p class="warn-text">两块设备上的分区和数据都会被清空，且不可恢复。请再次确认盘位无误。</p>`,
+        '确认创建', true, async () => {
+          createBtn.disabled = true;
+          try {
+            const r = await api('/api/bcache/create', { method: 'POST', body: { cache_path: cachePath, backing_path: backingPath, acknowledge: true } });
+            toast(r.message || 'bcache 已创建', 'ok');
+            await loadBcache();
+          } catch (e) { toast(e.message, 'error'); }
+          finally { createBtn.disabled = false; }
+        });
+    });
+  }
+
+  body.querySelectorAll('[data-reattach]').forEach(b => b.addEventListener('click', async () => {
+    const path = b.dataset.reattach;
+    const cset = b.dataset.cset;
+    try {
+      const r = await api('/api/bcache/reattach', { method: 'POST', body: { backing_path: path, cset_uuid: cset } });
+      toast(r.message || '已重新绑定', 'ok');
+      try { localStorage.setItem('lsi-bcache-stopped', '0'); } catch (e) { /* 忽略 */ }
+      await loadBcache();
+    } catch (e) { toast(e.message, 'error'); }
+  }));
+  const recoverBtn = $('#bcache-body').querySelector('[data-bcache-recover]');
+  if (recoverBtn) {
+    recoverBtn.addEventListener('click', async () => {
+      try {
+        const r = await api('/api/bcache/recover', { method: 'POST' });
+        toast(r.message || '缓存已恢复', 'ok');
+        await loadBcache();
+      } catch (e) { toast(e.message, 'error'); }
+    });
+  }
+
+  body.querySelectorAll('[data-mode-save]').forEach(b => {
+    b.addEventListener('click', () => {
+      const name = b.dataset.modeSave;
+      const sel = body.querySelector(`[data-mode-for="${name}"]`);
+      const mode = sel.value;
+      const current = sel.dataset.current || '';
+      let warn = '';
+      if (current === 'writeback' && mode !== 'writeback') {
+        warn = '<p class="warn-text">当前是 writeback（回写）模式，切换前会先触发脏数据回写，期间请勿断电。</p>';
+      } else if (mode === 'writeback') {
+        warn = '<p class="warn-text">writeback 回写模式下异常断电可能丢数据。</p>';
+      }
+      confirmModal(`切换 ${name} 缓存模式`,
+        `<p>将 ${name} 从 <strong>${esc(current)}</strong> 切换到 <strong>${esc(mode)}</strong>。${warn}</p>
+         <p class="warn-text">确认切换吗？</p>`,
+        '确认切换', true, async () => {
+          const r = await api('/api/bcache/mode', { method: 'POST', body: { name, mode } });
+          toast(r.message || '已切换', 'ok');
+          await loadBcache();
+        });
+    });
+  });
+  body.querySelectorAll('[data-writeback]').forEach(b => b.addEventListener('click', async () => {
+    const name = b.dataset.writeback;
+    try {
+      const r = await api('/api/bcache/writeback', { method: 'POST', body: { name } });
+      toast(r.message || '已触发回写', 'ok');
+      await loadBcache();
+    } catch (e) { toast(e.message, 'error'); }
+  }));
+  body.querySelectorAll('[data-erase]').forEach(b => b.addEventListener('click', () => {
+    const name = b.dataset.erase;
+    confirmModal(`擦除 ${name} 超级块`,
+      `<p class="warn-text">此操作会 wipefs 对应设备的 bcache 超级块，通常用于彻底移除旧缓存/backing 配置。</p>
+       <div class="field"><label for="erase-dev">要擦除的设备路径</label>
+       <input class="input mono" id="erase-dev" placeholder="/dev/sdX" autocomplete="off" /></div>
+       <label class="check-row"><input type="checkbox" id="erase-ack2" />
+       <span>我已知晓该设备上的 bcache 配置将被擦除且不可恢复</span></label>`,
+      '执行擦除', true, async () => {
+        const devPath = ($('#erase-dev').value || '').trim();
+        if (!/^\/dev\/(sd[a-z]+|nvme\d+n\d+)$/.test(devPath)) throw new Error('请输入有效的整块设备路径，如 /dev/sdc');
+        if (!$('#erase-ack2').checked) throw new Error('请勾选风险确认');
+        const r = await api('/api/bcache/erase', { method: 'POST', body: { device_path: devPath, confirm: devPath, acknowledge: true } });
+        toast(r.message || '已擦除', 'ok');
+        await loadBcache();
+      });
+  }));
+  body.querySelectorAll('[data-mount]').forEach(b => b.addEventListener('click', async () => {
+    const name = b.dataset.mount;
+    const input = body.querySelector(`[data-mount-input="${name}"]`);
+    const mountpoint = input ? input.value.trim() : '';
+    try {
+      const r = await api('/api/bcache/mount', { method: 'POST', body: { name, mountpoint } });
+      toast(r.message || '已挂载', 'ok');
+      await loadBcache();
+    } catch (e) { toast(e.message, 'error'); }
+  }));
+  body.querySelectorAll('[data-umount]').forEach(b => b.addEventListener('click', async () => {
+    try {
+      const r = await api('/api/bcache/umount', { method: 'POST', body: { name: b.dataset.umount } });
+      toast(r.message || '已卸载', 'ok');
+      await loadBcache();
+    } catch (e) { toast(e.message, 'error'); }
+  }));
+  body.querySelectorAll('[data-detach]').forEach(b => b.addEventListener('click', () => {
+    const name = b.dataset.detach;
+    confirmModal(`解绑 ${name}`, '<p>将缓存集与 backing 解绑，解绑后不再加速，可重新 attach。</p>', '解绑', false, async () => {
+      const r = await api('/api/bcache/detach', { method: 'POST', body: { name } });
+      toast(r.message || '已解绑', 'ok');
+      await loadBcache();
+    });
+  }));
+  body.querySelectorAll('[data-stop]').forEach(b => b.addEventListener('click', () => {
+    const name = b.dataset.stop;
+    confirmModal(`停止 ${name}`, `<p class="warn-text">停止 ${name} 会使其从系统移除；再次使用需要重新注册/attach。</p>`, '停止', true, async () => {
+      const r = await api('/api/bcache/stop', { method: 'POST', body: { name } });
+      toast(r.message || '已停止', 'ok');
+      try { localStorage.setItem('lsi-bcache-stopped', '1'); } catch (e) { /* 忽略 */ }
+      await loadBcache();
+    });
+  }));
+  body.querySelectorAll('[data-gc-view]').forEach(b => b.addEventListener('click', async () => {
+    const uuid = b.dataset.gcView;
+    const pre = body.querySelector(`[data-gc-pre="${uuid}"]`);
+    try {
+      const r = await api('/api/bcache/gc?uuid=' + encodeURIComponent(uuid));
+      pre.classList.remove('hidden');
+      pre.textContent = JSON.stringify(r, null, 2);
+    } catch (e) {
+      toast(e.message, 'error');
+    }
+  }));
+  body.querySelectorAll('[data-gc-run]').forEach(b => b.addEventListener('click', async () => {
+    try {
+      const r = await api('/api/bcache/gc/trigger', { method: 'POST', body: { uuid: b.dataset.gcRun } });
+      toast(r.message || '已触发 GC', 'ok');
+    } catch (e) { toast(e.message, 'error'); }
+  }));
+  body.querySelectorAll('[data-cache-off]').forEach(b => b.addEventListener('click', () => {
+    const uuid = b.dataset.cacheOff;
+    confirmModal('注销 bcache 缓存集',
+      `<p>将注销缓存集并下线缓存盘（相当于删除该缓存的 bcache 归属）。<br/>
+       <span class="mono">${esc(uuid)}</span></p>
+       <div class="field"><label>输入缓存集 UUID 确认</label>
+       <input class="input mono" id="cache-off-confirm" placeholder="${esc(uuid)}" autocomplete="off" /></div>
+       <label class="check-row"><input type="checkbox" id="cache-off-ack" />
+       <span>我已知晓注销后该缓存盘不再参与加速</span></label>`,
+      '注销', true, async () => {
+        const val = ($('#cache-off-confirm').value || '').trim();
+        if (val !== uuid) throw new Error('UUID 不一致，请重新输入');
+        if (!$('#cache-off-ack').checked) throw new Error('请勾选风险确认');
+        const r = await api('/api/bcache/cache_unregister', { method: 'POST', body: { uuid, confirm: val, acknowledge: true } });
+        toast(r.message || '已注销', 'ok');
+        await loadBcache();
+      });
+  }));
+}
+
+async function prepareBcache() {
+  const btn = $('#btn-bcache-prepare');
+  btnLoading(btn, true);
+  try {
+    const r = await api('/api/bcache/prepare', { method: 'POST' });
+    if (r && r.ok === false) throw new Error(r.error || '准备失败');
+    toast(r.message || 'bcache 环境已就绪', 'ok');
+    await loadBcache();
+  } catch (e) {
+    toast(e.message, 'error');
+  } finally {
+    btnLoading(btn, false);
+  }
+}
+
+async function renderBcacheTrend(devName) {
+  if (typeof Chart === 'undefined' || !devName) return;
+  let s;
+  try {
+    s = await api('/api/bcache/stats?device=' + encodeURIComponent(devName));
+  } catch (e) {
+    return;
+  }
+  const body = $('#bcache-body');
+  if (!body) return;
+  if (_bcacheChart) { _bcacheChart.destroy(); _bcacheChart = null; }
+  const old = document.getElementById('bcache-trend-wrap');
+  if (old) old.remove();
+  const wrap = document.createElement('div');
+  wrap.id = 'bcache-trend-wrap';
+  const order = ['five_minute', 'hour', 'day', 'total'];
+  const labels = ['最近5分钟', '最近1小时', '最近1天', '累计'];
+  const stats = s.stats || {};
+  const pick = (p, k) => {
+    const v = Number((stats[p] && stats[p][k]));
+    return isFinite(v) ? v : 0;
+  };
+  const hit = order.map(p => pick(p, 'cache_hit_ratio'));
+  const hits = order.map(p => pick(p, 'cache_hits'));
+  const misses = order.map(p => pick(p, 'cache_misses'));
+  const ioCount = order.map((p, i) => hits[i] + misses[i]
+    + pick(p, 'cache_bypass_hits') + pick(p, 'cache_bypass_misses'));
+  wrap.innerHTML = `
+    <div class="tiny" style="margin-top:14px">命中率 / IO 趋势（${esc(s.device)}）</div>
+    ${s.cache_info && s.cache_info.device ? `<div class="tiny" style="margin:2px 0 6px;color:var(--ink-faint)">缓存盘 ${esc(s.cache_info.device)} · discard=${esc(s.cache_info.discard !== null ? s.cache_info.discard : 'N/A')} · metadata_written=${esc(s.cache_info.metadata_written || 'N/A')}</div>` : ''}
+    <div style="position:relative;height:190px"><canvas id="bcache-trend-canvas"></canvas></div>`;
+  body.appendChild(wrap);
+  const ctx = document.getElementById('bcache-trend-canvas');
+  _bcacheChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: '命中率 (%)',
+          data: hit,
+          borderColor: '#35c48b',
+          backgroundColor: '#35c48b',
+          yAxisID: 'y0',
+          tension: 0.3,
+          borderWidth: 2,
+          pointRadius: 3,
+        },
+        {
+          label: '命中+未命中+直通 (IO)',
+          data: ioCount,
+          borderColor: '#4f8cff',
+          backgroundColor: '#4f8cff',
+          yAxisID: 'y1',
+          tension: 0.3,
+          borderWidth: 2,
+          pointRadius: 3,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 600 },
+      scales: {
+        y0: {
+          position: 'left',
+          min: 0,
+          max: 100,
+          title: { display: true, text: '命中率 %' },
+          ticks: { color: '#7f8b9a' },
+        },
+        y1: {
+          position: 'right',
+          min: 0,
+          title: { display: true, text: 'IO 次数' },
+          grid: { drawOnChartArea: false },
+          ticks: { color: '#7f8b9a' },
+        },
+      },
+      plugins: {
+        legend: { labels: { color: '#9aa5b2' } },
+      },
+    },
+  });
+}
+
+async function renderBcacheTopology(csets, devs) {
+  const body = $('#bcache-body');
+  if (!body || !csets.length || !devs.length) return;
+  const old = document.getElementById('bcache-topology-wrap');
+  if (old) old.remove();
+  const cset = csets[0];
+  let stats = {};
+  try {
+    stats = await api('/api/bcache/stats?device=' + encodeURIComponent(devs[0].name));
+  } catch (e) { /* 忽略 */ }
+  const cacheInfo = cset.cache_info || stats.cache_info || {};
+  const cacheDev = cacheInfo.device || '—';
+  const backing = stats.backing_device ? '/dev/' + stats.backing_device : '—';
+  const d = devs[0];
+  const avail = Number(cset.cache_available_percent);
+  const used = avail >= 0 ? (100 - avail) : null;
+  const uuid = cset.uuid || '';
+  const wrap = document.createElement('div');
+  wrap.id = 'bcache-topology-wrap';
+  wrap.innerHTML = `
+    <div class="tiny" style="margin-top:14px">bcache 拓扑</div>
+    <div class="bc-topo-line">
+      <div class="bc-node"><span class="bc-node-k">缓存盘</span><span class="bc-node-v mono">${esc(cacheDev)}</span><span class="bc-node-s">discard ${esc(cacheInfo.discard || '—')}</span></div>
+      <span class="bc-link">→</span>
+      <div class="bc-node bc-node-set"><span class="bc-node-k">缓存集</span><span class="bc-node-v mono">${esc((uuid || '').slice(0, 8))}…</span><span class="bc-node-s">可用 ${esc(avail)}%${used != null ? ` · 占用 ${used}%` : ''}</span></div>
+      <span class="bc-link">→</span>
+      <div class="bc-node"><span class="bc-node-k">backing</span><span class="bc-node-v mono">${esc(backing)}</span></div>
+      <span class="bc-link">→</span>
+      <div class="bc-node bc-node-dev"><span class="bc-node-k">加速设备</span><span class="bc-node-v mono">${esc(d.device)}</span><span class="bc-node-s">${esc(d.mounted ? '已挂载' : '未挂载')} · dirty ${esc(d.dirty_data || '0')}</span></div>
+    </div>`;
+  body.appendChild(wrap);
+}
+
+async function loadBcacheAlertSettings() {
+  const body = $('#bcache-body');
+  if (!body) return;
+  let cfg;
+  try {
+    cfg = await api('/api/bcache/alerts');
+  } catch (e) {
+    return;
+  }
+  const old = document.getElementById('bcache-alert-settings');
+  if (old) old.remove();
+  const c = cfg.config || {};
+  const el = document.createElement('div');
+  el.id = 'bcache-alert-settings';
+  const admin = !!state.isAdmin;
+  el.innerHTML = `
+    <div class="tiny" style="margin-top:14px">bcache 告警设置：</div>
+    ${admin ? `<div class="bcache-ops" style="flex-wrap:wrap">
+      <label class="check-row"><input type="checkbox" id="bc-alert-enabled" ${c.enabled ? 'checked' : ''} /> 启用巡检告警</label>
+      <span class="tiny">可用率低于</span><input class="input" id="bc-avail" type="number" min="1" max="100" value="${esc(c.cache_available_warn)}" style="width:72px"><span class="tiny">%</span>
+      <span class="tiny">脏数据滞留</span><input class="input" id="bc-stuck" type="number" min="1" value="${esc(c.dirty_stuck_minutes)}" style="width:72px"><span class="tiny">分钟</span>
+      <span class="tiny">命中率骤降</span><input class="input" id="bc-drop" type="number" min="1" max="100" value="${esc(c.hit_drop_points)}" style="width:72px"><span class="tiny">点</span>
+      <span class="tiny">积压阈值(MB)</span><input class="input" id="bc-backlog" type="number" min="1" value="${Math.round(Number(c.backlog_bytes) / 1048576)}" style="width:84px">
+      <button class="btn sm primary" id="btn-bc-alert-save">保存</button>
+    </div>` : `<div class="tiny">巡检间隔 60 秒，告警会走系统邮件/Webhook。当前阈值：可用率 < ${esc(c.cache_available_warn)}% · 脏数据滞留 ${esc(c.dirty_stuck_minutes)} 分钟 · 命中率骤降 ≥ ${esc(c.hit_drop_points)} 点 · 积压 > ${(Number(c.backlog_bytes) / 1048576).toFixed(0)}MB</div>`}`;
+  body.appendChild(el);
+  if (!admin) return;
+  $('#btn-bc-alert-save').addEventListener('click', async () => {
+    try {
+      await api('/api/bcache/alerts', {
+        method: 'POST',
+        body: {
+          enabled: $('#bc-alert-enabled').checked,
+          cache_available_warn: Number($('#bc-avail').value),
+          dirty_stuck_minutes: Number($('#bc-stuck').value),
+          hit_drop_points: Number($('#bc-drop').value),
+          backlog_bytes: Number($('#bc-backlog').value) * 1048576,
+        },
+      });
+      toast('bcache 告警设置已保存', 'ok');
+      await loadBcacheAlertSettings();
+    } catch (e) { toast(e.message, 'error'); }
+  });
+}
+
+function _sizeToMb(text) {
+  const t = String(text || '').trim();
+  if (t === '0' || t === '') return 0;
+  const m = t.match(/^(\d+(?:\.\d+)?)\s*([kKmMgG])$/);
+  if (!m) return null;
+  const mult = { k: 1 / 1024, m: 1, g: 1024 }[m[2].toLowerCase()];
+  return Math.round(Number(m[1]) * mult);
+}
+
+async function loadBcacheTunables(name) {
+  const el = $('#bcache-body') && $('#bcache-body').querySelector(`[data-tune-for="${name}"]`);
+  if (!el) return;
+  let t;
+  try {
+    t = await api('/api/bcache/tunables?device=' + encodeURIComponent(name));
+  } catch (e) {
+    return;
+  }
+  const pct = Number(t.writeback_percent);
+  const rate = _sizeToMb(t.writeback_rate);
+  const seq = _sizeToMb(t.sequential_cutoff);
+  const delay = Number(t.writeback_delay);
+  const meta = t.writeback_metadata === '1';
+  const polCur = (String(t.readahead_cache_policy || 'all').match(/\[([^\]]+)\]/) || [])[1] || 'all';
+  el.innerHTML = `
+    <div class="tiny" style="margin:10px 0 4px">缓存比例调节</div>
+    <div class="bcache-ops" style="flex-wrap:wrap">
+      <span class="tiny">脏数据驻留</span><input class="input" id="bc-wp" type="number" min="0" max="100" value="${esc(isFinite(pct) ? pct : 10)}" style="width:62px"><span class="tiny">%</span>
+      <span class="tiny">回写速率</span><input class="input" id="bc-rate" type="number" min="0" value="${esc(rate == null ? 0 : rate)}" style="width:84px"><span class="tiny">MB/s (0=不限)</span>
+      <span class="tiny">回写延迟</span><input class="input" id="bc-delay" type="number" min="0" value="${esc(isFinite(delay) ? delay : 0)}" style="width:62px"><span class="tiny">秒</span>
+      <label class="check-row"><input type="checkbox" id="bc-meta" ${meta ? 'checked' : ''} /> metadata 回写</label>
+      <span class="tiny">顺序缓存阈值</span><input class="input" id="bc-seq" type="number" min="0" value="${esc(seq == null ? 0 : seq)}" style="width:84px"><span class="tiny">MB (0=关闭)</span>
+      <span class="tiny">readahead</span><select class="select" id="bc-policy">
+        <option value="all"${polCur === 'all' ? ' selected' : ''}>all</option>
+        <option value="meta-only"${polCur === 'meta-only' ? ' selected' : ''}>meta-only</option>
+      </select>
+      <button class="btn sm primary" id="btn-bc-tune-save">保存</button>
+    </div>`;
+  el.querySelector('#btn-bc-tune-save').addEventListener('click', async () => {
+    try {
+      const rateMb = Number(el.querySelector('#bc-rate').value) || 0;
+      const seqMb = Number(el.querySelector('#bc-seq').value) || 0;
+      await api('/api/bcache/tune', {
+        method: 'POST',
+        body: {
+          name,
+          settings: {
+            writeback_percent: Number(el.querySelector('#bc-wp').value),
+            writeback_rate: rateMb * 1048576,
+            writeback_delay: Number(el.querySelector('#bc-delay').value),
+            writeback_metadata: el.querySelector('#bc-meta').checked ? 1 : 0,
+            sequential_cutoff: seqMb * 1048576,
+            readahead_cache_policy: el.querySelector('#bc-policy').value,
+          },
+        },
+      });
+      toast('缓存比例已保存', 'ok');
+      await loadBcacheTunables(name);
+    } catch (e) { toast(e.message, 'error'); }
+  });
 }
 
 function removeNfs(r) {

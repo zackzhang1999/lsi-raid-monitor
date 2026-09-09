@@ -132,14 +132,12 @@
         <span class="foot-meta" id="app-version"></span>
       </div>
     </aside>
-    <div class="sidebar-scrim" id="sidebar-scrim"></div>
 
     <main class="main">
       <span id="content-main" tabindex="-1" class="main-anchor"></span>
       <!-- 顶栏 -->
       <header class="topbar">
         <div class="topbar-left">
-          <button class="icon-btn" id="btn-sidebar" title="折叠/展开侧边栏">☰</button>
           <span class="host-name" id="tb-host">—</span>
           <span class="tb-sep"></span>
           <span class="badge" id="tb-health">—</span>
@@ -177,7 +175,7 @@
 
       <section class="content">
         <!-- ============ 监控概览 ============ -->
-        <div class="view" id="view-overview">
+        <div class="view hidden" id="view-overview">
           <div class="grid grid-hero">
             <!-- 综合健康评分 -->
             <div class="card">
@@ -441,6 +439,17 @@
 
         <!-- ============ 文件管理 ============ -->
         <div class="view hidden" id="view-storage">
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Bcache</div>
+                <strong>SSD / NVMe 缓存加速</strong>
+              </div>
+              <button class="btn sm hidden" id="btn-bcache-prepare" type="button">准备环境</button>
+            </div>
+            <div id="bcache-body" class="loading-line">加载中…</div>
+          </div>
+
           <!-- 文件系统使用率 -->
           <div class="card">
             <div class="card-head">
@@ -533,6 +542,7 @@
               </div>
             </form>
           </div>
+
         </div>
 
         <!-- ============ 日志中心 ============ -->
