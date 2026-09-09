@@ -3027,6 +3027,7 @@ async function loadBcache() {
           </div>`;
         }).join('')}</div>`;
       }).join('')}` : ''}`;
+  renderBcacheGcHint(csets, devs);
   appendBcacheControls(body, data, devData);
   if (devs.length) {
     renderBcacheTrend(devs[0].name);
@@ -3040,6 +3041,61 @@ async function loadBcache() {
     devs.forEach(x => loadBcacheTunables(x.name));
   }
   loadBcacheEmergency();
+}
+
+async function renderBcacheGcHint(csets, devs) {
+  const body = $('#bcache-body');
+  if (!body || !csets.length || !devs.length) return;
+  const old = document.getElementById('bcache-gc-hint');
+  if (old) old.remove();
+  const c = csets[0];
+  const dev = devs[0];
+  const ci = c.cache_info || {};
+  const dirtyPct = Number(ci.bucket_dirty);
+  const rawDirty = String(dev.dirty_data || '').trim().toLowerCase();
+  const dm = rawDirty.match(/^([0-9.]+)\s*([kmgt]?)$/);
+  if (!(dirtyPct > 0) || !dm) return;
+  const unit = { k: 1024, m: 1048576, g: 1073741824, t: 1099511627776 }[dm[2] || ''] || 1;
+  const dirtyBytes = Number(dm[1]) * unit;
+  if (!Number.isFinite(dirtyBytes) || dirtyBytes > 0) return;
+  const grid = body.querySelector('.stat-mini-grid');
+  if (!grid) return;
+  const wrap = document.createElement('div');
+  wrap.id = 'bcache-gc-hint';
+  wrap.innerHTML = '<div class="banner" style="margin-top:10px"><span class="badge warn">桶标记待刷新</span><span style="flex:1">检测中…</span></div>';
+  grid.after(wrap);
+  const fmtDur = (s) => {
+    const v = Number(s);
+    if (s == null || s === '' || !Number.isFinite(v)) return '—';
+    if (v < 60) return `${Math.round(v)} 秒`;
+    if (v < 3600) return `${Math.round(v / 60)} 分钟`;
+    return `${(v / 3600).toFixed(1)} 小时`;
+  };
+  let gc = {};
+  try {
+    gc = await api('/api/bcache/gc?uuid=' + encodeURIComponent(c.uuid));
+  } catch (e) { /* 提示仍展示，GC 统计缺失时用占位 */ }
+  const last = gc.btree_gc_last_sec;
+  const freq = gc.btree_gc_average_frequency_sec;
+  const hint = `脏标记 ${dirtyPct}% 尚未刷新，实际脏数据 ${esc(dev.dirty_data)}（已写回完成）。距上次 GC ${fmtDur(last)}，历史平均约每 ${fmtDur(freq)} 触发一次。`;
+  const btn = state.isAdmin
+    ? '<button class="btn sm primary" type="button">立即刷新标记</button>'
+    : '';
+  wrap.innerHTML = `<div class="banner" style="margin-top:10px">
+    <span class="badge warn">桶标记待刷新</span>
+    <span style="flex:1">${hint}</span>
+    ${btn}
+  </div>`;
+  const refreshBtn = wrap.querySelector('button');
+  if (refreshBtn) {
+    refreshBtn.addEventListener('click', async () => {
+      try {
+        const r = await api('/api/bcache/gc/trigger', { method: 'POST', body: { uuid: c.uuid } });
+        toast(r.message || '已触发 GC', 'ok');
+        await loadBcache();
+      } catch (e) { toast(e.message, 'error'); }
+    });
+  }
 }
 
 async function loadBcacheEmergency() {
