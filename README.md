@@ -4,8 +4,11 @@
 
 UI 基于 google-design 设计体系（DM Sans / JetBrains Mono，浅色主色 `#4285f4`，深色 accent `#fc2c50`），支持明暗主题切换。
 
-<img width="3813" height="1899" alt="001" src="https://github.com/user-attachments/assets/68d031eb-41d7-471b-90de-355d99f2ca3c" />
-<img width="3819" height="1824" alt="002" src="https://github.com/user-attachments/assets/1f48f036-62d2-4651-9cdb-343a31b6366e" />
+<img width="3590" height="2248" alt="image" src="https://github.com/user-attachments/assets/2a5d7ec2-f46b-47e4-9cc2-6fa2943cae5f" />
+<img width="3002" height="2170" alt="image" src="https://github.com/user-attachments/assets/3540e3d4-0085-4107-b4d2-bb02fb5fd6d8" />
+<img width="3562" height="2360" alt="image" src="https://github.com/user-attachments/assets/83c432b6-a48d-42ae-9816-27f96335768b" />
+<img width="3538" height="2262" alt="image" src="https://github.com/user-attachments/assets/519c031b-a46a-44d3-aa19-4fe8d1c24968" />
+
 
 ---
 
