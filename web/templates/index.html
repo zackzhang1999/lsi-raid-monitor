@@ -492,7 +492,10 @@
               </div>
               <button class="btn sm" id="btn-nfs-refresh">刷新</button>
             </div>
-            <div class="banner hidden" id="nfs-unavailable">未检测到 exportfs，请先安装 NFS 服务（nfs-utils / nfs-kernel-server）</div>
+            <div class="banner hidden" id="nfs-unavailable">
+              <span style="flex:1">未检测到 exportfs，请先安装 NFS 服务</span>
+              <button class="btn sm primary" id="btn-nfs-install" type="button">安装 NFS</button>
+            </div>
             <div class="table-wrap">
               <table class="data" id="nfs-table">
                 <thead><tr>
@@ -639,6 +642,39 @@
                 </tr></thead>
                 <tbody><tr><td colspan="12" class="muted">加载中…</td></tr></tbody>
               </table>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Replacement</div>
+                <strong>换盘工作流</strong>
+              </div>
+              <span class="tiny">针对预警/高危磁盘的更换指引</span>
+            </div>
+            <div id="replace-list" class="loading-line">加载中…</div>
+          </div>
+
+          <div class="grid grid-2">
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <div class="eyebrow">Hot spare</div>
+                  <strong>热备策略</strong>
+                </div>
+                <button class="btn sm" id="btn-hotspare-save">保存</button>
+              </div>
+              <div id="hotspare-body" class="loading-line">加载中…</div>
+            </div>
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <div class="eyebrow">Lifetime</div>
+                  <strong>磁盘寿命</strong>
+                </div>
+              </div>
+              <div id="life-body" class="loading-line">加载中…</div>
             </div>
           </div>
 

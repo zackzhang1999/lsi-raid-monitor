@@ -1416,6 +1416,50 @@ table.data .admin-col.col-hidden { display: none; }
 .vd-disks-row > td { background: var(--surface-2); }
 .vd-sub { padding: 8px 2px 2px; }
 .vd-sub table.data td { padding: 7px 9px; }
+.migrate-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 160px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.op-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 150px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.op-name {
+  font-weight: 600;
+  color: var(--foreground);
+  white-space: nowrap;
+}
+.migrate-bar {
+  flex: 0 0 72px;
+  height: 6px;
+  border-radius: 99px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+.migrate-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 99px;
+  background: var(--primary);
+  transition: width 0.4s ease;
+}
+.migrate-pct {
+  font-weight: 700;
+  color: var(--primary);
+  font-variant-numeric: tabular-nums;
+}
+.migrate-eta {
+  color: var(--ink-faint);
+  white-space: nowrap;
+}
 
 /* ---------- SMART ---------- */
 .smart-attrs th, .smart-attrs td { font-family: var(--font-mono); font-size: 11px; }
@@ -2073,6 +2117,64 @@ table.data tr.attr-bad td { color: var(--crit); font-weight: 700; }
   gap: 12px;
   margin-bottom: 14px;
 }
+
+/* ---------- 运维中心：换盘/热备/寿命 ---------- */
+.replace-item {
+  padding: 12px 2px;
+  border-top: 1px solid var(--border);
+}
+.replace-item:first-child { border-top: none; }
+.replace-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.replace-label { font-weight: 700; color: var(--foreground); }
+.replace-steps {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+.step { font-size: 11.5px; color: var(--ink-soft); white-space: nowrap; }
+.hs-list { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.hs-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+.life-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) minmax(90px, 1.2fr) 44px auto;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 2px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+}
+.life-row:first-child { border-top: none; }
+.life-label { font-weight: 700; color: var(--foreground); }
+.life-sub { color: var(--ink-soft); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.life-meter {
+  height: 6px;
+  border-radius: 99px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+.life-meter i {
+  display: block;
+  height: 100%;
+  border-radius: 99px;
+  background: linear-gradient(90deg, var(--ok), var(--warn) 70%, var(--crit));
+}
+.life-pct { font-family: var(--font-mono); font-size: 11px; color: var(--ink-soft); text-align: right; }
 
 /* ---------- 响应式 ---------- */
 @media (max-width: 1280px) {

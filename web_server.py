@@ -48,7 +48,7 @@ import pam_auth
 PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_DIR = Path(os.environ.get("LSI_DATA_DIR", str(PROJECT_ROOT / "data")))
 
-VERSION = "1.5.3"
+VERSION = "1.5.9"
 AUTH_MODE = os.environ.get("LSI_AUTH_MODE", "pam")
 
 LOCAL_STORCLI = PROJECT_ROOT / "storcli64"
@@ -97,6 +97,7 @@ def _smart_base_device() -> str:
     return "/dev/sda"
 
 COLLECTION_CONFIG_FILE = BASE_DIR / "collection_config.json"
+HOTSPARE_CONFIG_FILE = BASE_DIR / "hotspare_config.json"
 COLLECTD = PROJECT_ROOT / "lsi_collectd.py"
 VALID_INTERVALS = (1, 5, 15, 30, 60)
 
@@ -478,6 +479,38 @@ def _predict_disk(row: dict, hist_rows: list, temp_warn: int, temp_crit: int) ->
     return {"level": level, "reasons": reasons}
 
 
+def _disk_life(d: dict) -> dict:
+    """基于通电时长与 SMART 磨损的寿命估算，结果用于展示，不替代预测结论。"""
+    poh = _to_int(d.get("power_on_hours"), 0)
+    try:
+        design_hours = int(os.environ.get("LSI_DISK_LIFE_HOURS", "43800"))
+    except ValueError:
+        design_hours = 43800
+    design_hours = max(1, design_hours)
+    used = min(100, round(poh / design_hours * 100)) if poh > 0 else 0
+    remaining = max(0, 100 - used)
+    level = (d.get("prediction") or {}).get("level", "ok")
+    stage = "normal"
+    if level == "crit" or remaining <= 0:
+        stage = "critical"
+    elif level == "warn" or used >= 80:
+        stage = "aged"
+    elif used >= 60:
+        stage = "watch"
+    return {
+        "power_on_hours": poh,
+        "design_life_hours": design_hours,
+        "used_percent": used,
+        "remaining_percent": remaining,
+        "stage": stage,
+    }
+
+
+def _is_hotspare(state: str) -> bool:
+    s = str(state or "").strip().upper()
+    return s in ("GHS", "DHS", "UGHS", "UGOOD+HS") or s.endswith("HS")
+
+
 def build_status() -> dict:
     now = time.time()
     if _status_cache["data"] is not None and now - _status_cache["ts"] < 15:
@@ -849,6 +882,7 @@ def api_disk_ledger():
                 "predict_level": level,
                 "predict_reasons": pred.get("reasons", []),
                 "replace_advice": advice,
+                "life": _disk_life(d),
                 "first_seen": datetime.fromtimestamp(first_seen).strftime("%Y-%m-%d %H:%M") if first_seen else None,
                 "last_seen": datetime.fromtimestamp(last_seen).strftime("%Y-%m-%d %H:%M") if last_seen else None,
                 "sample_count": count,
@@ -910,6 +944,64 @@ def api_report_summary():
             for d in lifetime_top
         ],
     )
+
+
+def _load_hotspare_policy() -> dict:
+    cfg = {"desired_global": 1, "auto_promote": False}
+    try:
+        if HOTSPARE_CONFIG_FILE.exists():
+            data = json.loads(HOTSPARE_CONFIG_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                if "desired_global" in data:
+                    cfg["desired_global"] = max(0, min(24, int(data["desired_global"])))
+                cfg["auto_promote"] = bool(data.get("auto_promote", False))
+    except Exception:
+        pass
+    return cfg
+
+
+@app.get("/api/hotspare_policy")
+@login_required
+def api_hotspare_policy_get():
+    cfg = _load_hotspare_policy()
+    st = build_status()
+    disks = st.get("physical_disks", [])
+    ghs = sum(1 for d in disks if str(d.get("state", "")).strip().upper() == "GHS")
+    dhs = sum(1 for d in disks if str(d.get("state", "")).strip().upper() == "DHS")
+    eligible = [
+        {
+            "eid": d.get("eid"),
+            "slot": d.get("slot"),
+            "label": d.get("label"),
+            "model": d.get("model"),
+        }
+        for d in disks
+        if str(d.get("state", "")).strip().upper() in ("UGOOD", "JBOD")
+    ]
+    return jsonify(
+        config=cfg,
+        global_count=ghs,
+        dedicated_count=dhs,
+        eligible=eligible,
+    )
+
+
+@app.post("/api/hotspare_policy")
+@admin_required
+def api_hotspare_policy_save():
+    data = request.get_json(silent=True) or {}
+    cfg = _load_hotspare_policy()
+    if "desired_global" in data:
+        try:
+            cfg["desired_global"] = max(0, min(24, int(data["desired_global"])))
+        except (ValueError, TypeError):
+            return jsonify(ok=False, error="desired_global 必须是整数"), 400
+    if "auto_promote" in data:
+        cfg["auto_promote"] = bool(data["auto_promote"])
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    HOTSPARE_CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    lsi_alert.log_event("info", f"热备策略已更新（{session.get('username', 'system')}）")
+    return jsonify(ok=True, config=cfg)
 
 
 @app.get("/api/history")
@@ -1461,6 +1553,17 @@ def api_nfs_remove():
         f"NFS 移除共享 {path} → {host}: {msg}（{session.get('username', '')}）",
     )
     return (jsonify(ok=True), 200) if ok else (jsonify(ok=False, error=msg), 500)
+
+
+@app.post("/api/nfs/install")
+@admin_required
+def api_nfs_install():
+    ok, msg = storage_mgr.install_nfs()
+    lsi_alert.log_event(
+        "warning" if ok else "error",
+        f"NFS 服务安装：{msg}（{session.get('username', '')}）",
+    )
+    return (jsonify(ok=True, message=msg), 200) if ok else (jsonify(ok=False, error=msg), 500)
 
 
 # ---- 用户管理 API ----
@@ -2093,6 +2196,47 @@ def _fill_vd_disks_by_dg(vds: list[dict]):
         pass
 
 
+def _vd_migrate_status() -> dict[int, dict]:
+    """读取各 VD 的迁移/扩容进度（Progress%、Status、ETA）。"""
+    out: dict[int, dict] = {}
+    try:
+        ok, text = _run_storcli_text(f"{CONTROLLER}/vall show migrate", timeout=60)
+        if not ok:
+            return out
+        for line in text.splitlines():
+            m = re.match(r"^\s*(\d+)\s+(\S+)\s+(\d+)\s+(.+?)\s*$", line)
+            if not m:
+                continue
+            tail = m.group(4).strip()
+            status = tail
+            eta = ""
+            for kw in ("In progress", "Completed", "Not in progress", "Aborted", "Paused"):
+                if tail.startswith(kw):
+                    status = kw
+                    eta = tail[len(kw):].strip()
+                    break
+            out[int(m.group(1))] = {
+                "operation": m.group(2),
+                "progress": int(m.group(3)),
+                "status": status,
+                "eta": eta,
+            }
+    except Exception:
+        pass
+    return out
+
+
+def _decode_write_cache(code: str) -> str:
+    c = str(code or "").upper()
+    if "AWB" in c:
+        return "Always Write Back"
+    if "WT" in c:
+        return "Write Through"
+    if "WB" in c:
+        return "Write Back"
+    return code or "—"
+
+
 @app.get("/api/vd_detail")
 @login_required
 def api_vd_detail():
@@ -2118,6 +2262,7 @@ def api_vd_detail():
             vd_num = int(m.group(1))
             props = resp.get(f"VD{vd_num} Properties") or {}
             pds = resp.get(f"PDs for VD {vd_num}") or []
+            cache_code = summary.get("Cache", "")
             vds.append(
                 {
                     "vd": vd_num,
@@ -2130,7 +2275,9 @@ def api_vd_detail():
                     "name": summary.get("Name", ""),
                     "current_operation": props.get("Active Operations", "None"),
                     "os_device": props.get("OS Drive Name", ""),
-                    "write_cache": props.get("Write Cache(initial setting)", ""),
+                    "write_cache": _decode_write_cache(cache_code),
+                    "write_cache_raw": cache_code,
+                    "write_cache_initial": props.get("Write Cache(initial setting)", ""),
                     "disks": [
                         {
                             "slot": p.get("EID:Slt", ""),
@@ -2151,6 +2298,13 @@ def api_vd_detail():
         missing = [v for v in vds if not v["disks"]]
         if missing:
             _fill_vd_disks_by_dg(missing)
+        migrates = _vd_migrate_status()
+        for v in vds:
+            mg = migrates.get(v["vd"])
+            v["migrate_operation"] = mg.get("operation") if mg else None
+            v["migrate_progress"] = mg.get("progress") if mg else None
+            v["migrate_status"] = mg.get("status") if mg else None
+            v["migrate_eta"] = mg.get("eta") if mg else None
         return jsonify(vds=sorted(vds, key=lambda v: v["vd"]))
     except Exception as e:
         return jsonify(ok=False, error=f"解析失败: {e}"), 500
@@ -2342,6 +2496,7 @@ RAID_LEVEL_RULES = {
     "10": (4, "even"),
     "50": (6, "mult3"),
 }
+STORCLI_RAID_TYPES = ("r0", "r1", "r5", "r6", "r10", "r50", "r60")
 
 
 @app.post("/api/raid/create")
@@ -2420,6 +2575,55 @@ def api_raid_create():
         _refresh_after_action()
         return jsonify(ok=True)
     lsi_alert.log_event("error", f"创建阵列失败 RAID{level} drives={','.join(specs)} — {msg}")
+    return jsonify(ok=False, error=msg), 500
+
+
+@app.post("/api/raid_expand")
+@admin_required
+def api_raid_expand():
+    """在线扩容：向已有虚拟磁盘动态加入 UGood 盘（storcli start migrate option=add）。"""
+    data = request.get_json(silent=True) or {}
+    vd = _to_int(data.get("vd"))
+    raid = str(data.get("raid", "")).strip().lower()
+    drives = data.get("drives")
+    if vd is None or raid not in STORCLI_RAID_TYPES:
+        return jsonify(ok=False, error="参数非法"), 400
+    if not isinstance(drives, list) or not (1 <= len(drives) <= 32):
+        return jsonify(ok=False, error="请选择要加入阵列的磁盘"), 400
+
+    status = build_status()
+    pd_map = {(d["eid"], d["slot"]): d for d in status["physical_disks"]}
+    specs = []
+    for dr in drives:
+        eid = _to_int(dr.get("eid") if isinstance(dr, dict) else None)
+        slot = _to_int(dr.get("slot") if isinstance(dr, dict) else None)
+        if eid is None or slot is None:
+            return jsonify(ok=False, error="磁盘参数非法"), 400
+        pd = pd_map.get((eid, slot))
+        if not pd:
+            return jsonify(ok=False, error=f"磁盘 E{eid}:S{slot} 不存在"), 400
+        state = pd.get("state", "")
+        if state == "JBOD":
+            ok, msg = _run_storcli(f"{CONTROLLER}/e{eid}/s{slot} set good force")
+            if not ok:
+                return jsonify(ok=False, error=f"磁盘 E{eid}:S{slot} JBOD 转 UGood 失败: {msg}"), 500
+        elif state != "UGood":
+            return jsonify(ok=False, error=f"磁盘 E{eid}:S{slot} 状态为 {state or '未知'}，仅 UGood 盘可加入扩容"), 400
+        specs.append(f"{eid}:{slot}")
+
+    if len(set(specs)) != len(specs):
+        return jsonify(ok=False, error="磁盘列表有重复"), 400
+
+    cmd = f"{CONTROLLER}/v{vd} start migrate type={raid} option=add drives={','.join(specs)}"
+    ok, msg = _run_storcli(cmd, timeout=90)
+    if ok:
+        lsi_alert.log_event(
+            "warning",
+            f"动态扩容 VD{vd}：加入 {','.join(specs)}（目标 RAID {raid}）（{session.get('username', '')}）",
+        )
+        _refresh_after_action()
+        return jsonify(ok=True)
+    lsi_alert.log_event("error", f"动态扩容失败 VD{vd} — {msg}")
     return jsonify(ok=False, error=msg), 500
 
 

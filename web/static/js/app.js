@@ -618,6 +618,40 @@ async function loadVdDetail() {
   if (state.status) renderMaintenance(state.status); // VD 列表就绪后重绘维护卡的 VD 下拉
 }
 
+function opLabel(op) {
+  const map = {
+    'Migrate': '迁移/扩容',
+    'Reconstruction': '重建',
+    'Consistency Check': '一致性检查',
+    'Initialization': '初始化',
+    'Copyback': '回拷',
+    'Erase': '安全擦除',
+  };
+  return map[op] || op || '—';
+}
+
+function currentOpDisplay(v) {
+  const mg = v.migrate_progress != null && v.migrate_progress > 0;
+  if (mg) {
+    const name = opLabel(v.migrate_operation || 'Migrate');
+    return `<span class="op-cell">
+      <span class="op-name">${esc(name)}</span>
+      <span class="migrate-bar"><i style="width:${v.migrate_progress}%"></i></span>
+      <span class="migrate-pct">${v.migrate_progress}%</span>
+      ${v.migrate_eta ? `<span class="migrate-eta">${esc(v.migrate_eta)}</span>` : ''}
+    </span>`;
+  }
+  const raw = String(v.current_operation || 'None');
+  if (!raw || raw === 'None') return '<span class="muted">—</span>';
+  const m = raw.match(/^([^(]+?)\s*(?:\((\d+)%\))?/);
+  const name = opLabel((m && m[1] || raw).trim());
+  const pct = m && m[2] ? m[2] : null;
+  return `<span class="op-cell">
+    <span class="op-name">${esc(name)}</span>
+    ${pct != null ? `<span class="migrate-pct">${pct}%</span>` : ''}
+  </span>`;
+}
+
 function renderVirtualDisks() {
   const vds = state.vds || [];
   const tb = $('#vd-table tbody');
@@ -632,6 +666,7 @@ function renderVirtualDisks() {
     const tr = document.createElement('tr');
     tr.className = 'vd-row';
     tr.title = expanded ? '点击收起成员磁盘' : '点击展开成员磁盘';
+    const opHtml = currentOpDisplay(v);
     tr.innerHTML = `
       <td class="num"><span class="vd-caret">${expanded ? '▾' : '▸'}</span>${esc(v.dg_vd || '—')} <span class="tiny">(${disks.length} 盘)</span></td>
       <td>${esc(v.name || '—')}</td>
@@ -639,8 +674,8 @@ function renderVirtualDisks() {
       <td class="num">${esc(v.size || '—')}</td>
       <td>${stateBadge(v.state)}</td>
       <td class="num">${esc(v.os_device || '—')}</td>
-      <td class="num">${esc(v.write_cache || '—')}</td>
-      <td class="num">${esc(v.current_operation || 'None')}</td>
+      <td class="num" title="当前 Cache: ${esc(v.write_cache_raw || '—')} · 初始设置: ${esc(v.write_cache_initial || '—')}">${esc(v.write_cache || '—')}</td>
+      <td>${opHtml}</td>
       <td class="ops admin-col ${hideOps ? 'col-hidden' : ''}"></td>`;
     tr.addEventListener('click', () => {
       if (state.vdExpanded.has(key)) state.vdExpanded.delete(key);
@@ -658,11 +693,13 @@ function renderVirtualDisks() {
         <option value="init_stop">初始化停止</option>
         <option value="cc_start">CC 开始</option>
         <option value="cc_stop">CC 停止</option>
+        <option value="expand">容量扩容（加盘）</option>
         <option value="vd_delete">删除</option>`;
       sel.addEventListener('change', () => {
         const action = sel.value;
         sel.value = '';
-        if (action) vdAction(v, action);
+        if (action === 'expand') expandVd(v);
+        else if (action) vdAction(v, action);
       });
       ops.appendChild(sel);
     }
@@ -713,6 +750,53 @@ function vdAction(v, key) {
     `虚拟盘 ${label}：${a.desc}`,
     a.danger
   );
+}
+
+function expandVd(v) {
+  const raid = RAID_TYPE_MAP[String(v.type || '').toUpperCase()] || 'r5';
+  const eligible = (state.status && state.status.physical_disks || [])
+    .filter(d => d.state === 'UGood');
+  if (!eligible.length) {
+    toast('没有可加入阵列的 UGood 盘', 'error');
+    return;
+  }
+  const opts = eligible.map(d =>
+    `<option value="${esc(d.eid)}:${esc(d.slot)}">${esc(d.label)} · ${esc(d.model || '')}</option>`
+  ).join('');
+  showModal({
+    title: `VD ${v.vd} 动态扩容`,
+    body: `<p>目标阵列：<strong class="mono">${esc(v.dg_vd || ('VD ' + v.vd))}</strong> · ${esc(v.type || '')}</p>
+      <p>向该阵列在线加入一块 UGood 盘（同级别容量扩容）：</p>
+      <div class="field"><label for="expand-drive">选择磁盘</label>
+        <select class="select" id="expand-drive">${opts}</select></div>
+      <p class="warn-text">扩容会执行在线迁移，耗时较长；期间请勿断电、拔盘或重启。</p>`,
+    actions: [
+      { label: '取消', handler: closeModal },
+      {
+        label: '开始扩容',
+        cls: 'primary',
+        handler: async (btn) => {
+          const [eid, slot] = $('#expand-drive').value.split(':').map(Number);
+          btnLoading(btn, true);
+          try {
+            const r = await api('/api/raid_expand', {
+              method: 'POST',
+              body: { vd: v.vd, raid, drives: [{ eid, slot }] },
+            });
+            if (r && r.ok === false) throw new Error(r.error || '扩容失败');
+            toast('动态扩容已启动', 'ok');
+            closeModal();
+            await loadVdDetail();
+            await loadStatus();
+          } catch (e) {
+            toast(e.message, 'error');
+          } finally {
+            btnLoading(btn, false);
+          }
+        },
+      },
+    ],
+  });
 }
 
 /* ---------- 物理磁盘 ---------- */
@@ -969,6 +1053,10 @@ const RAID_LEVEL_RULES = {
   '6': { min: 4, desc: '至少 4 块盘' },
   '10': { min: 4, even: true, desc: '至少 4 块且为偶数' },
   '50': { min: 6, mult: 3, desc: '至少 6 块且为 3 的倍数' },
+};
+const RAID_TYPE_MAP = {
+  RAID0: 'r0', RAID1: 'r1', RAID5: 'r5', RAID6: 'r6',
+  RAID10: 'r10', RAID50: 'r50', RAID60: 'r60',
 };
 
 function raidLevelError(level, n) {
@@ -1736,7 +1824,14 @@ function levelBadge(level) {
 
 async function loadOps() {
   state.opsLoaded = true;
-  await Promise.allSettled([renderEnclosures(), loadLedger(), loadReport()]);
+  await Promise.allSettled([
+    renderEnclosures(),
+    loadLedger(),
+    loadReport(),
+    loadReplacements(),
+    loadHotspare(),
+    loadLife(),
+  ]);
 }
 
 function diskVisualTone(d) {
@@ -2076,6 +2171,145 @@ async function loadReport() {
     : '<div class="muted">暂无通电时长数据</div>';
 }
 
+async function loadReplacements() {
+  const el = $('#replace-list');
+  el.innerHTML = '<div class="loading-line">加载中…</div>';
+  let data;
+  try {
+    data = await api('/api/disk_ledger');
+  } catch (e) {
+    el.innerHTML = `<div class="muted">加载失败：${esc(e.message)}</div>`;
+    return;
+  }
+  const candidates = (data.disks || []).filter(d => d.predict_level === 'warn' || d.predict_level === 'crit');
+  if (!candidates.length) {
+    el.innerHTML = '<div class="muted">当前没有需要更换的磁盘</div>';
+    return;
+  }
+  el.innerHTML = candidates.map(d => {
+    const cls = d.replace_advice === '立即更换' ? 'crit' : 'warn';
+    return `<div class="replace-item" data-eid="${esc(d.eid)}" data-slot="${esc(d.slot)}">
+      <div class="replace-head">
+        <span class="replace-label mono">${esc(d.label)}</span>
+        <span class="badge ${cls}">${esc(d.replace_advice)}</span>
+        <span class="tiny">${esc(d.model || '—')}</span>
+      </div>
+      <div class="replace-steps">
+        <span class="step">1. 定位灯</span><button class="btn sm" data-step="locate">开启</button>
+        <span class="step">2. 下线旧盘</span><button class="btn sm danger" data-step="offline">下线</button>
+        <span class="step">3. 移除旧盘</span><span class="tiny">物理操作</span>
+        <span class="step">4. 插入新盘</span><span class="tiny">物理操作</span>
+        <span class="step">5. 设为全局热备</span><button class="btn sm" data-step="hotspare">执行</button>
+      </div>
+    </div>`;
+  }).join('');
+  el.querySelectorAll('button[data-step]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const item = btn.closest('.replace-item');
+      const eid = Number(item.dataset.eid);
+      const slot = Number(item.dataset.slot);
+      const d = (state.status && state.status.physical_disks || []).find(x => Number(x.eid) === eid && Number(x.slot) === slot);
+      if (!d) { toast('未找到该磁盘', 'error'); return; }
+      const step = btn.dataset.step;
+      if (step === 'locate') diskAction(d, d.locate ? 'locate_stop' : 'locate_start');
+      else if (step === 'offline') diskAction(d, 'offline');
+      else if (step === 'hotspare') diskAction(d, 'hotspare_global');
+    });
+  });
+}
+
+async function loadHotspare() {
+  const body = $('#hotspare-body');
+  body.innerHTML = '<div class="loading-line">加载中…</div>';
+  let data;
+  try {
+    data = await api('/api/hotspare_policy');
+  } catch (e) {
+    body.innerHTML = `<div class="muted">加载失败：${esc(e.message)}</div>`;
+    return;
+  }
+  const cfg = data.config || {};
+  const opts = [0, 1, 2, 3, 4].map(n => `<option value="${n}"${Number(cfg.desired_global) === n ? ' selected' : ''}>${n} 块</option>`).join('');
+  const eligible = data.eligible || [];
+  body.innerHTML = `
+    <div class="field">
+      <label for="hs-desired">期望全局热备盘数量</label>
+      <select class="select" id="hs-desired">${opts}</select>
+    </div>
+    <label class="persist-row" style="margin-top:10px">
+      <input type="checkbox" id="hs-auto" ${cfg.auto_promote ? 'checked' : ''} />
+      <span>自动补位（策略标记，当前为人工确认）</span>
+    </label>
+    <div class="rt-kv" style="margin-top:14px">
+      <div class="item"><div class="v">${data.global_count}</div><div class="k">全局热备</div></div>
+      <div class="item"><div class="v">${data.dedicated_count}</div><div class="k">专用热备</div></div>
+      <div class="item"><div class="v">${eligible.length}</div><div class="k">可设为热备</div></div>
+    </div>
+    ${eligible.length ? `<div class="tiny" style="margin-top:10px">可设为全局热备：</div>
+      <div class="hs-list">${eligible.map(d => `<div class="hs-row">
+        <span class="mono">${esc(d.label)}</span>
+        <span class="tiny">${esc(d.model || '')}</span>
+        <button class="btn sm" data-hs="${esc(d.eid)}:${esc(d.slot)}">设为全局热备</button>
+      </div>`).join('')}</div>` : '<div class="tiny" style="margin-top:10px">当前没有 UGood/JBOD 盘可设为热备</div>'}`;
+
+  body.querySelectorAll('button[data-hs]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const [eid, slot] = btn.dataset.hs.split(':').map(Number);
+      const d = (state.status && state.status.physical_disks || []).find(x => Number(x.eid) === eid && Number(x.slot) === slot);
+      if (d) diskAction(d, 'hotspare_global');
+    });
+  });
+}
+
+async function saveHotsparePolicy() {
+  const btn = $('#btn-hotspare-save');
+  btnLoading(btn, true);
+  try {
+    await api('/api/hotspare_policy', {
+      method: 'POST',
+      body: {
+        desired_global: Number($('#hs-desired').value),
+        auto_promote: $('#hs-auto').checked,
+      },
+    });
+    toast('热备策略已保存', 'ok');
+    await loadHotspare();
+  } catch (e) {
+    toast(e.message, 'error');
+  } finally {
+    btnLoading(btn, false);
+  }
+}
+
+async function loadLife() {
+  const body = $('#life-body');
+  body.innerHTML = '<div class="loading-line">加载中…</div>';
+  let data;
+  try {
+    data = await api('/api/disk_ledger');
+  } catch (e) {
+    body.innerHTML = `<div class="muted">加载失败：${esc(e.message)}</div>`;
+    return;
+  }
+  const rows = data.disks || [];
+  if (!rows.length) {
+    body.innerHTML = '<div class="muted">暂无磁盘寿命数据</div>';
+    return;
+  }
+  const stageText = { normal: '正常', watch: '关注', aged: '老化', critical: '临界' };
+  body.innerHTML = rows.map(r => {
+    const life = r.life || {};
+    const cls = life.stage === 'critical' ? 'crit' : life.stage === 'aged' ? 'warn' : life.stage === 'watch' ? 'info' : '';
+    return `<div class="life-row">
+      <span class="life-label mono">${esc(r.label)}</span>
+      <span class="life-sub">${esc(r.model || '—')}</span>
+      <span class="life-meter"><i style="width:${esc(life.used_percent || 0)}%"></i></span>
+      <span class="life-pct mono">${esc(life.remaining_percent != null ? life.remaining_percent : '—')}%</span>
+      <span class="badge ${cls}">${stageText[life.stage] || '正常'}</span>
+    </div>`;
+  }).join('');
+}
+
 /* ---------- 视图切换 ---------- */
 function switchView(v) {
   state.view = v;
@@ -2253,11 +2487,19 @@ function bindUI() {
   // 存储 / 用户
   $('#btn-storage-refresh').addEventListener('click', () => { loadStorage(); loadFsUsage(); });
   $('#btn-fs-refresh').addEventListener('click', loadFsUsage);
-  $('#btn-ledger-refresh').addEventListener('click', () => { renderEnclosures(); loadLedger(); loadReport(); });
+  $('#btn-ledger-refresh').addEventListener('click', () => {
+    renderEnclosures();
+    loadLedger();
+    loadReport();
+    loadReplacements();
+    loadHotspare();
+    loadLife();
+  });
   $('#bay-capacity').addEventListener('change', (ev) => {
     state.bayCapacity = ev.target.value;
     renderEnclosures();
   });
+  $('#btn-hotspare-save').addEventListener('click', saveHotsparePolicy);
   $$('#alarm-actions [data-alarm]').forEach(b =>
     b.addEventListener('click', () => alarmAction(b.dataset.alarm)));
   $$('#jbod-actions [data-jbod]').forEach(b =>
@@ -2267,6 +2509,7 @@ function bindUI() {
     renderFsTable();
   });
   $('#btn-nfs-refresh').addEventListener('click', loadNfs);
+  $('#btn-nfs-install').addEventListener('click', installNfs);
   $('#nfs-form').addEventListener('submit', (ev) => { ev.preventDefault(); addNfs(); });
   $('#user-form').addEventListener('submit', createUser);
 
@@ -2523,6 +2766,7 @@ async function loadNfs() {
   catch (e) { tb.innerHTML = `<tr><td colspan="4" class="muted">加载失败：${esc(e.message)}</td></tr>`; return; }
   state.nfsLoaded = true;
   $('#nfs-unavailable').classList.toggle('hidden', !!data.available);
+  $('#btn-nfs-install').classList.toggle('hidden', !state.isAdmin);
   $('#nfs-form').classList.toggle('hidden', !state.isAdmin || !data.available);
   $$('#nfs-table .admin-col').forEach(el => el.classList.toggle('col-hidden', !state.isAdmin));
 
@@ -2549,6 +2793,21 @@ async function loadNfs() {
     }
     tb.appendChild(tr);
   });
+}
+
+async function installNfs() {
+  const btn = $('#btn-nfs-install');
+  btnLoading(btn, true);
+  try {
+    const r = await api('/api/nfs/install', { method: 'POST' });
+    if (r && r.ok === false) throw new Error(r.error || '安装失败');
+    toast(r.message || 'NFS 服务已安装', 'ok');
+    await loadNfs();
+  } catch (e) {
+    toast(e.message, 'error');
+  } finally {
+    btnLoading(btn, false);
+  }
 }
 
 function removeNfs(r) {

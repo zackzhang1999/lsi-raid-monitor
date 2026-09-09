@@ -223,6 +223,57 @@ def nfs_available() -> bool:
     return shutil.which("exportfs") is not None
 
 
+def _detect_os_family() -> str:
+    try:
+        ids: list[str] = []
+        with open("/etc/os-release", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("ID="):
+                    ids.append(line.split("=", 1)[1].strip().strip('"').lower())
+                elif line.startswith("ID_LIKE="):
+                    ids.extend(x.strip().strip('"').lower() for x in line.split("=", 1)[1].split())
+        joined = " ".join(ids)
+        if any(k in joined for k in ("debian", "ubuntu")):
+            return "debian"
+        if any(k in joined for k in ("rhel", "fedora", "centos", "rocky", "almalinux", "suse")):
+            return "rhel"
+    except Exception:
+        pass
+    return ""
+
+
+def install_nfs() -> tuple[bool, str]:
+    """安装并启用 NFS 服务（exportfs / nfs-server）。"""
+    family = _detect_os_family()
+    if not family:
+        return False, "无法识别系统发行版，请手动安装 NFS 服务"
+    sudo = [] if os.geteuid() == 0 else ["sudo"]
+    if family == "debian":
+        steps = [
+            sudo + ["apt-get", "update", "-y"],
+            sudo + ["apt-get", "install", "-y", "nfs-kernel-server"],
+            sudo + ["systemctl", "enable", "--now", "nfs-kernel-server"],
+        ]
+    else:
+        steps = [
+            sudo + ["dnf", "install", "-y", "nfs-utils"],
+            sudo + ["systemctl", "enable", "--now", "nfs-server"],
+        ]
+    last_err = ""
+    for cmd in steps:
+        rc, out, err = _run(cmd, timeout=600)
+        if rc != 0:
+            last_err = (err or out).strip()[-400:] or "命令执行失败"
+            # systemctl enable/start 失败不阻断，只要 exportfs 可用即可
+            if "systemctl" in cmd:
+                continue
+            return False, last_err
+    if not nfs_available():
+        return False, f"安装完成但仍未找到 exportfs：{last_err}"
+    return True, "NFS 服务已安装并启动"
+
+
 def _parse_exports_line(line: str) -> dict | None:
     tokens = line.split()
     if not tokens:
