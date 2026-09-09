@@ -30,6 +30,14 @@ def _to_int(value, default: int = 0) -> int:
         return default
 
 
+def _ssd_service_ratio(hits: int, misses: int, bypass_hits: int, bypass_misses: int) -> int:
+    """SSD 服务率：常规命中 + 直通/旁路命中，都视为由缓存盘服务。"""
+    total = hits + misses + bypass_hits + bypass_misses
+    if total <= 0:
+        return 0
+    return round((hits + bypass_hits) * 100 / total)
+
+
 def _run(cmd: list[str], timeout: int = 120) -> tuple[int, str, str]:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -102,6 +110,27 @@ def prepare() -> tuple[bool, str]:
     return True, "bcache 工具与内核模块已就绪"
 
 
+def _read_period_stats(base: str) -> dict:
+    """读取缓存集 stats_total/day/hour/five_minute 四组 IO 计数与命中率。"""
+    out: dict[str, dict] = {}
+    for period in ("total", "day", "hour", "five_minute"):
+        pdir = os.path.join(base, f"stats_{period}")
+        if not os.path.isdir(pdir):
+            continue
+        hits = _to_int(_read(os.path.join(pdir, "cache_hits")))
+        misses = _to_int(_read(os.path.join(pdir, "cache_misses")))
+        bypass_hits = _to_int(_read(os.path.join(pdir, "cache_bypass_hits")))
+        bypass_misses = _to_int(_read(os.path.join(pdir, "cache_bypass_misses")))
+        out[period] = {
+            "cache_hits": hits,
+            "cache_misses": misses,
+            "cache_bypass_hits": bypass_hits,
+            "cache_bypass_misses": bypass_misses,
+            "cache_hit_ratio": _ssd_service_ratio(hits, misses, bypass_hits, bypass_misses),
+        }
+    return out
+
+
 def bcache_devices() -> list[dict]:
     """读取 /sys 下的 bcache 设备与缓存集信息（只读）。"""
     csets = []
@@ -109,15 +138,18 @@ def bcache_devices() -> list[dict]:
         for name in sorted(os.listdir("/sys/fs/bcache")):
             if re.fullmatch(r"[0-9a-fA-F-]{36}", name):
                 base = os.path.join("/sys/fs/bcache", name)
+                period_stats = _read_period_stats(base)
+                total = period_stats.get("total") or {}
                 info = {
                     "uuid": name,
-                    "cache_hits": _to_int(_read(os.path.join(base, "stats_total", "cache_hits"))),
-                    "cache_misses": _to_int(_read(os.path.join(base, "stats_total", "cache_misses"))),
-                    "cache_hit_ratio": _to_int(_read(os.path.join(base, "stats_total", "cache_hit_ratio"))),
-                    "cache_bypass_hits": _to_int(_read(os.path.join(base, "stats_total", "cache_bypass_hits"))),
-                    "cache_bypass_misses": _to_int(_read(os.path.join(base, "stats_total", "cache_bypass_misses"))),
+                    "cache_hits": total.get("cache_hits", 0),
+                    "cache_misses": total.get("cache_misses", 0),
+                    "cache_hit_ratio": total.get("cache_hit_ratio", 0),
+                    "cache_bypass_hits": total.get("cache_bypass_hits", 0),
+                    "cache_bypass_misses": total.get("cache_bypass_misses", 0),
                     "cache_available_percent": _to_int(_read(os.path.join(base, "cache_available_percent"))),
                     "root_usage_percent": _to_int(_read(os.path.join(base, "root_usage_percent"))),
+                    "period_stats": period_stats,
                 }
                 cache_info: dict = {}
                 cache_link = os.path.join(base, "cache0")
@@ -404,6 +436,15 @@ def device_stats(name: str) -> dict:
         try:
             for fn in os.listdir(d):
                 entry[fn] = _read(os.path.join(d, fn))
+        except Exception:
+            pass
+        # 命中率统一为 SSD 服务率口径（常规命中 + 直通/旁路命中）
+        try:
+            hits = _to_int(entry.get("cache_hits"))
+            misses = _to_int(entry.get("cache_misses"))
+            bypass_hits = _to_int(entry.get("cache_bypass_hits"))
+            bypass_misses = _to_int(entry.get("cache_bypass_misses"))
+            entry["cache_hit_ratio"] = _ssd_service_ratio(hits, misses, bypass_hits, bypass_misses)
         except Exception:
             pass
         stats[period] = entry

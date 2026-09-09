@@ -50,7 +50,7 @@ import pam_auth
 PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_DIR = Path(os.environ.get("LSI_DATA_DIR", str(PROJECT_ROOT / "data")))
 
-VERSION = "1.10.7"
+VERSION = "1.10.19"
 AUTH_MODE = os.environ.get("LSI_AUTH_MODE", "pam")
 
 LOCAL_STORCLI = PROJECT_ROOT / "storcli64"
@@ -279,6 +279,65 @@ def _start_bcache_alert_loop() -> None:
     t.start()
 
 
+def _sample_bcache_trend() -> None:
+    """每分钟把各 bcache 设备的 hour/day 两档 cache_hit_ratio 写入 SQLite。"""
+    try:
+        info = bcache_mgr.status()
+        devices = info.get("devices") or []
+    except Exception:
+        return
+    if not devices:
+        return
+
+    def ratio_of(period_stats, period):
+        try:
+            return int((period_stats.get(period) or {}).get("cache_hit_ratio", -1))
+        except (TypeError, ValueError):
+            return -1
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = []
+    for d in devices:
+        name = d.get("name", "")
+        if not name:
+            continue
+        try:
+            stats = bcache_mgr.device_stats(name)
+        except Exception:
+            continue
+        period_stats = stats.get("stats") or {}
+        hour_ratio = ratio_of(period_stats, "hour")
+        day_ratio = ratio_of(period_stats, "day")
+        if hour_ratio < 0 or day_ratio < 0:
+            continue
+        rows.append({
+            "timestamp": ts,
+            "device": name,
+            "hour_hit_ratio": hour_ratio,
+            "day_hit_ratio": day_ratio,
+        })
+    if rows:
+        try:
+            db.insert_rows("bcache_trend", rows, src="live")
+        except Exception:
+            pass
+
+
+def _bcache_trend_loop() -> None:
+    while True:
+        try:
+            if os.environ.get("LSI_DISABLE_BCACHE_TREND") != "1":
+                _sample_bcache_trend()
+        except Exception:
+            pass
+        time.sleep(60)
+
+
+def _start_bcache_trend_loop() -> None:
+    t = threading.Thread(target=_bcache_trend_loop, daemon=True, name="bcache-trend")
+    t.start()
+
+
 # 启动时把历史 CSV 幂等迁移进 SQLite，并按配置执行保留清理
 try:
     db.migrate_from_csv()
@@ -294,6 +353,7 @@ except Exception as exc:  # SQLite 异常不应阻断 Web 服务启动
 
 _start_embedded_collector()
 _start_bcache_alert_loop()
+_start_bcache_trend_loop()
 
 
 @app.after_request
@@ -1684,6 +1744,36 @@ def api_bcache_stats():
     if not re.fullmatch(r"bcache\d+", device):
         return jsonify(ok=False, error="非法设备名"), 400
     return jsonify(bcache_mgr.device_stats(device))
+
+
+@app.get("/api/bcache/trend")
+@login_required
+def api_bcache_trend():
+    device = str(request.args.get("device", "")).strip()
+    if not re.fullmatch(r"bcache\d+", device):
+        return jsonify(ok=False, error="非法设备名"), 400
+    try:
+        hours = max(1, min(72, int(request.args.get("hours", "26"))))
+    except (TypeError, ValueError):
+        hours = 26
+    since = int(time.time()) - hours * 3600
+    points = []
+    try:
+        for row in db.history("bcache_trend", since):
+            if str(row.get("device", "")) != device:
+                continue
+            try:
+                points.append({
+                    "ts": int(row["_ts_epoch"]) * 1000,
+                    "hour": int(row["hour_hit_ratio"]),
+                    "day": int(row["day_hit_ratio"]),
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
+    except Exception:
+        points = []
+    points.sort(key=lambda p: p["ts"])
+    return jsonify(device=device, hours=hours, points=points)
 
 
 @app.post("/api/bcache/writeback")

@@ -2199,38 +2199,142 @@ table.data tr.attr-bad td { color: var(--crit); font-weight: 700; }
 .bc-link { align-self: center; color: var(--ink-faint); }
 .stat-mini-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(128px, 1fr));
-  gap: 8px;
-  margin-top: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin-top: 10px;
 }
 .stat-mini {
   display: flex;
   flex-direction: column;
-  gap: 3px;
-  padding: 9px 11px;
+  justify-content: space-between;
+  gap: 5px;
+  padding: 12px 14px;
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 12px;
   background: var(--surface);
 }
 .stat-mini-k {
-  font-size: 9px;
+  font-size: 9.5px;
   letter-spacing: 0.07em;
   text-transform: uppercase;
   color: var(--ink-faint);
 }
 .stat-mini-v {
   font-family: var(--font-mono);
-  font-size: 15px;
-  font-weight: 600;
+  font-size: 17px;
+  font-weight: 650;
   color: var(--foreground);
   font-variant-numeric: tabular-nums;
 }
 .stat-mini-s {
-  font-size: 9.5px;
+  font-size: 10px;
   color: var(--ink-faint);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.stat-mini-metrics {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.stat-mini-metrics > span {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+.stat-mini-metrics em {
+  font-style: normal;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-faint);
+  white-space: nowrap;
+}
+.stat-mini-metrics b {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--foreground);
+  font-variant-numeric: tabular-nums;
+}
+.stat-mini.bucket .stat-mini-metrics em {
+  white-space: normal;
+  line-height: 1.35;
+  text-align: left;
+}
+.stat-mini-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 3px;
+}
+.stat-mini-picker button {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 3px 4px;
+  font-size: 9px;
+  line-height: 1;
+  color: var(--ink-faint);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: color .18s ease, background-color .18s ease, border-color .18s ease;
+}
+.stat-mini-picker button:hover {
+  color: var(--foreground);
+  border-color: var(--border-strong);
+}
+.stat-mini-picker button.active {
+  color: var(--primary);
+  font-weight: 600;
+  background: var(--primary-soft);
+  border-color: color-mix(in srgb, var(--primary) 45%, transparent);
+}
+.stat-mini.cap {
+  min-height: 92px;
+}
+.stat-mini-cap-vals {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+}
+.stat-mini-cap-vals > span {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+}
+.stat-mini-cap-vals b {
+  font-family: var(--font-mono);
+  font-size: 17px;
+  font-weight: 650;
+  line-height: 1;
+  color: var(--foreground);
+  font-variant-numeric: tabular-nums;
+}
+.stat-mini-cap-vals .free b {
+  color: var(--accent);
+}
+.stat-mini-cap-vals i {
+  font-style: normal;
+  font-size: 9.5px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+.stat-mini-bar {
+  height: 3px;
+  border-radius: 3px;
+  background: var(--border-strong);
+  overflow: hidden;
+}
+.stat-mini-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--primary);
 }
 .bc-topo-card {
   margin-top: 8px;

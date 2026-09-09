@@ -128,6 +128,8 @@ const state = {
   nfsLoaded: false,
   refreshTimer: null,
   realtimeTimer: null,
+  bcacheTrendDevice: null,
+  bcacheTrendTimer: null,
   raidSel: new Set(), // 勾选用于创建阵列的磁盘，键为 "eid:slot"
 };
 
@@ -1965,6 +1967,25 @@ function arrangeDisks(list, capacity, eid) {
 
 let _dragState = null;
 let _bcacheChart = null;
+let _bcacheCsetPeriodStats = {};
+
+function switchBcacheHitPeriod(uuid, period, btn) {
+  const card = btn.closest('.stat-mini');
+  if (!card) return;
+  card.querySelectorAll('[data-hit-period]').forEach(b => b.classList.toggle('active', b === btn));
+  const ps = (_bcacheCsetPeriodStats[uuid] || {})[period] || {};
+  const setNum = (key, v) => {
+    const el = card.querySelector(`[data-hit-key="${key}"]`);
+    if (!el) return;
+    el.textContent = v == null || v === '' ? '—' : String(v);
+  };
+  const ratio = ps.cache_hit_ratio;
+  const ratioEl = card.querySelector('[data-hit-key="ratio"]');
+  if (ratioEl) ratioEl.textContent = ratio == null ? '—' : `${ratio}%`;
+  setNum('cache_hits', ps.cache_hits);
+  setNum('cache_bypass_hits', ps.cache_bypass_hits);
+  setNum('cache_miss', (Number(ps.cache_bypass_misses) || 0) + (Number(ps.cache_misses) || 0));
+}
 
 function onTrayDragStart(ev) {
   _dragState = { eid: ev.currentTarget.dataset.eid, idx: Number(ev.currentTarget.dataset.idx) };
@@ -2902,27 +2923,112 @@ async function loadBcache() {
     </div>` : ''}
     ${csets.length ? `<div class="tiny" style="margin-top:14px">缓存集统计：</div>
       ${csets.map(c => {
+        const uuid = c.uuid || '';
         const offline = !!c.cache_offline;
-        const hit = offline ? null : (Number(c.cache_hit_ratio) || 0);
+        const periodStats = c.period_stats || {};
+        _bcacheCsetPeriodStats[uuid] = periodStats;
+        const totalStats = periodStats.total || {
+          cache_hits: c.cache_hits,
+          cache_misses: c.cache_misses,
+          cache_bypass_hits: c.cache_bypass_hits,
+          cache_bypass_misses: c.cache_bypass_misses,
+          cache_hit_ratio: c.cache_hit_ratio,
+        };
+        const fmtNum = v => v == null || v === '' ? '—' : v;
+        const missOf = st => (Number(st.cache_bypass_misses) || 0) + (Number(st.cache_misses) || 0);
+        const ci = c.cache_info || {};
+        const parseSize = (t) => {
+          const m = String(t || '').trim().toLowerCase().match(/^([0-9.]+)\s*([kmgt]?)$/);
+          if (!m) return 0;
+          const unit = { k: 1024, m: 1024 ** 2, g: 1024 ** 3, t: 1024 ** 4 }[m[2] || ''] || 1;
+          return Number(m[1]) * unit;
+        };
+        const cacheTotalBytes = (Number(ci.nbuckets) || 0) * parseSize(ci.bucket_size);
+        const capFmt = bytes => bytes > 0 ? `≈${fmtBytes(bytes)}B` : '—';
         const avail = offline ? null : Number(c.cache_available_percent);
         const usage = avail != null && avail >= 0 ? (100 - avail) : null;
-        const ci = c.cache_info || {};
         const cards = [
-          { k: '命中率', v: offline ? '—' : `${hit}%`, s: offline ? '缓存盘不在线' : `Hits ${esc(c.cache_hits)} · Miss ${esc(c.cache_misses)}` },
-          { k: '缓存可用', v: offline ? '—' : `${esc(avail)}%`, s: offline ? '缓存盘不在线' : '缓存可用比例' },
-          { k: '缓存占用', v: offline ? '—' : `${esc(usage)}%`, s: offline ? '缓存盘不在线' : '已占用缓存' },
-          { k: '直通命中/未命中', v: offline ? '—' : `${esc(c.cache_bypass_hits)} / ${esc(c.cache_bypass_misses)}`, s: offline ? '缓存盘不在线' : '绕过缓存的 IO' },
-          { k: '总桶', v: offline ? '—' : `${esc(ci.nbuckets || '—')}`, s: offline ? '缓存盘不在线' : `桶大小 ${esc(ci.bucket_size || '—')}` },
-          { k: '桶状态', v: offline ? '—' : `C ${esc(ci.bucket_clean || 0)}% · D ${esc(ci.bucket_dirty || 0)}%`, s: offline ? '缓存盘不在线' : `Unused ${esc(ci.bucket_unused || 0)}% · Meta ${esc(ci.bucket_metadata || 0)}%` },
+          { cap: true },
+          { hitCard: true },
+          { specCard: true },
+          { bucketCard: true },
         ];
-        return `<div class="stat-mini-grid">${cards.map(x => `<div class="stat-mini">
-          <span class="stat-mini-k">${esc(x.k)}</span>
-          <span class="stat-mini-v">${x.v}</span>
-          <span class="stat-mini-s">${x.s}</span>
-        </div>`).join('')}</div>`;
+        return `<div class="stat-mini-grid">${cards.map(x => {
+          if (x.hitCard) {
+            return `<div class="stat-mini">
+              <span class="stat-mini-k">缓存命中率</span>
+              <span class="stat-mini-v" data-hit-key="ratio">${offline ? '—' : (totalStats.cache_hit_ratio == null ? '—' : `${totalStats.cache_hit_ratio}%`)}</span>
+              <span class="stat-mini-metrics">
+                <span><em>cache_hits</em><b data-hit-key="cache_hits">${offline ? '—' : fmtNum(totalStats.cache_hits)}</b></span>
+                <span><em>cache_bypass_hits</em><b data-hit-key="cache_bypass_hits">${offline ? '—' : fmtNum(totalStats.cache_bypass_hits)}</b></span>
+                <span><em>cache_miss</em><b data-hit-key="cache_miss">${offline ? '—' : fmtNum(missOf(totalStats))}</b></span>
+              </span>
+              <span class="stat-mini-picker">
+                <button type="button" class="active" data-hit-period="total" onclick="switchBcacheHitPeriod('${esc(uuid)}','total',this)">累计</button>
+                <button type="button" data-hit-period="five_minute" onclick="switchBcacheHitPeriod('${esc(uuid)}','five_minute',this)">5分钟</button>
+                <button type="button" data-hit-period="hour" onclick="switchBcacheHitPeriod('${esc(uuid)}','hour',this)">1小时</button>
+                <button type="button" data-hit-period="day" onclick="switchBcacheHitPeriod('${esc(uuid)}','day',this)">1天</button>
+              </span>
+            </div>`;
+          }
+          if (x.specCard) {
+            const nb = Number(ci.nbuckets);
+            const nbText = Number.isFinite(nb) && nb > 0 ? nb.toLocaleString('zh-CN') : '—';
+            const bucketText = ci.bucket_size ? String(ci.bucket_size).replace(/k$/i, ' KB') : '—';
+            const capText = capFmt(cacheTotalBytes);
+            const discard = ci.discard == null ? '—' : (String(ci.discard) === '1' ? '开启' : (String(ci.discard) === '0' ? '关闭' : String(ci.discard)));
+            const row = (label, val) => `<span><em>${label}</em><b>${offline ? '—' : val}</b></span>`;
+            return `<div class="stat-mini">
+              <span class="stat-mini-k">缓存盘规格</span>
+              <span class="stat-mini-metrics">
+                ${row('总桶数', nbText)}
+                ${row('每桶容量', bucketText)}
+                ${row('理论容量', capText)}
+                ${row('discard（TRIM）', discard)}
+              </span>
+            </div>`;
+          }
+          if (x.bucketCard) {
+            const row = (label, val) => `<span><em>${label}</em><b>${offline ? '—' : `${fmtNum(val)}%`}</b></span>`;
+            return `<div class="stat-mini bucket">
+              <span class="stat-mini-k">缓存桶构成</span>
+              <span class="stat-mini-metrics">
+                ${row('脏数据（仅 SSD · 待写回）', ci.bucket_dirty)}
+                ${row('干净数据（与磁盘一致）', ci.bucket_clean)}
+                ${row('空闲（未使用）', ci.bucket_unused)}
+                ${row('元数据（bcache 索引）', ci.bucket_metadata)}
+              </span>
+            </div>`;
+          }
+          if (x.cap) {
+            return `<div class="stat-mini cap">
+              <span class="stat-mini-k">缓存容量</span>
+              <span class="stat-mini-cap-vals">
+                <span class="used"><b>${offline ? '—' : `${usage}%`}</b><i>占用</i></span>
+                <span class="free"><b>${offline ? '—' : `${avail}%`}</b><i>可用</i></span>
+              </span>
+              <span class="stat-mini-bar">${offline ? '' : `<i style="width:${Math.max(0, Math.min(100, usage))}%"></i>`}</span>
+              <span class="stat-mini-metrics">
+                <span><em>总容量</em><b>${capFmt(cacheTotalBytes)}</b></span>
+                <span><em>已用空间</em><b>${offline ? '—' : capFmt(cacheTotalBytes * (usage || 0) / 100)}</b></span>
+                <span><em>可用空间</em><b>${offline ? '—' : capFmt(cacheTotalBytes * (avail || 0) / 100)}</b></span>
+              </span>
+            </div>`;
+          }
+          return `<div class="stat-mini">
+            <span class="stat-mini-k">${esc(x.k)}</span>
+            <span class="stat-mini-v">${x.v}</span>
+            <span class="stat-mini-s">${x.s}</span>
+          </div>`;
+        }).join('')}</div>`;
       }).join('')}` : ''}`;
   appendBcacheControls(body, data, devData);
-  if (devs.length) renderBcacheTrend(devs[0].name);
+  if (devs.length) {
+    renderBcacheTrend(devs[0].name);
+  } else {
+    state.bcacheTrendDevice = null;
+    clearBcacheTrend();
+  }
   if (csets.length) renderBcacheTopology(csets, devs);
   loadBcacheAlertSettings();
   if (state.isAdmin) {
@@ -3315,38 +3421,58 @@ async function prepareBcache() {
   }
 }
 
-async function renderBcacheTrend(devName) {
-  if (typeof Chart === 'undefined' || !devName) return;
-  let s;
-  try {
-    s = await api('/api/bcache/stats?device=' + encodeURIComponent(devName));
-  } catch (e) {
-    return;
-  }
-  const body = $('#bcache-body');
-  if (!body) return;
+function clearBcacheTrend() {
   if (_bcacheChart) { _bcacheChart.destroy(); _bcacheChart = null; }
   const old = document.getElementById('bcache-trend-wrap');
   if (old) old.remove();
+}
+
+async function renderBcacheTrend(devName) {
+  if (typeof Chart === 'undefined' || !devName) return;
+  const body = $('#bcache-body');
+  if (!body) return;
+  let s;
+  try {
+    s = await api('/api/bcache/trend?device=' + encodeURIComponent(devName) + '&hours=26');
+  } catch (e) {
+    return;
+  }
+  const points = (s && s.points) || [];
+  clearBcacheTrend();
   const wrap = document.createElement('div');
   wrap.id = 'bcache-trend-wrap';
-  const order = ['five_minute', 'hour', 'day', 'total'];
-  const labels = ['最近5分钟', '最近1小时', '最近1天', '累计'];
-  const stats = s.stats || {};
-  const pick = (p, k) => {
-    const v = Number((stats[p] && stats[p][k]));
-    return isFinite(v) ? v : 0;
-  };
-  const hit = order.map(p => pick(p, 'cache_hit_ratio'));
-  const hits = order.map(p => pick(p, 'cache_hits'));
-  const misses = order.map(p => pick(p, 'cache_misses'));
-  const ioCount = order.map((p, i) => hits[i] + misses[i]
-    + pick(p, 'cache_bypass_hits') + pick(p, 'cache_bypass_misses'));
+  const step = Math.max(1, Math.ceil(points.length / 320));
+  const labels = [];
+  const hourData = [];
+  const dayData = [];
+  const span = points.length ? (points[points.length - 1].ts - points[0].ts) : 0;
+  const withDate = span > 3 * 3600 * 1000;
+  for (let i = 0; i < points.length; i += step) {
+    const p = points[i];
+    const d = new Date(p.ts);
+    const pad = n => String(n).padStart(2, '0');
+    labels.push(withDate
+      ? `${d.getMonth() + 1}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+      : `${pad(d.getHours())}:${pad(d.getMinutes())}`);
+    hourData.push(p.hour);
+    dayData.push(p.day);
+  }
+  const statusNote = points.length < 2
+    ? '正在积累采样数据（每分钟 1 点），稍候即可看到 hour / day 两条趋势'
+    : `${points.length} 个采样点 · 每分钟采样 · hour=近1小时窗口 · day=近1天窗口`;
   wrap.innerHTML = `
-    <div class="tiny" style="margin-top:14px">命中率 / IO 趋势（${esc(s.device)}）</div>
-    ${s.cache_info && s.cache_info.device ? `<div class="tiny" style="margin:2px 0 6px;color:var(--ink-faint)">缓存盘 ${esc(s.cache_info.device)} · discard=${esc(s.cache_info.discard !== null ? s.cache_info.discard : 'N/A')} · metadata_written=${esc(s.cache_info.metadata_written || 'N/A')}</div>` : ''}
-    <div style="position:relative;height:190px"><canvas id="bcache-trend-canvas"></canvas></div>`;
+    <div class="tiny" style="margin-top:14px">cache_hit_ratio 趋势（${esc(s.device || devName)}）</div>
+    <div class="tiny" style="margin:2px 0 6px;color:var(--ink-faint)">${esc(statusNote)}</div>
+    <div style="position:relative;height:210px"><canvas id="bcache-trend-canvas"></canvas></div>`;
   body.appendChild(wrap);
+  state.bcacheTrendDevice = devName;
+  if (!state.bcacheTrendTimer) {
+    state.bcacheTrendTimer = setInterval(() => {
+      const view = $('#view-storage');
+      if (!state.bcacheTrendDevice || (view && view.classList.contains('hidden'))) return;
+      renderBcacheTrend(state.bcacheTrendDevice);
+    }, 60000);
+  }
   const ctx = document.getElementById('bcache-trend-canvas');
   _bcacheChart = new Chart(ctx, {
     type: 'line',
@@ -3354,24 +3480,24 @@ async function renderBcacheTrend(devName) {
       labels,
       datasets: [
         {
-          label: '命中率 (%)',
-          data: hit,
+          label: 'hour · cache_hit_ratio (%)',
+          data: hourData,
           borderColor: '#35c48b',
           backgroundColor: '#35c48b',
-          yAxisID: 'y0',
           tension: 0.3,
           borderWidth: 2,
-          pointRadius: 3,
+          pointRadius: points.length < 30 ? 2 : 0,
+          pointHitRadius: 6,
         },
         {
-          label: '命中+未命中+直通 (IO)',
-          data: ioCount,
+          label: 'day · cache_hit_ratio (%)',
+          data: dayData,
           borderColor: '#4f8cff',
           backgroundColor: '#4f8cff',
-          yAxisID: 'y1',
           tension: 0.3,
           borderWidth: 2,
-          pointRadius: 3,
+          pointRadius: points.length < 30 ? 2 : 0,
+          pointHitRadius: 6,
         },
       ],
     },
@@ -3379,24 +3505,27 @@ async function renderBcacheTrend(devName) {
       responsive: true,
       maintainAspectRatio: false,
       animation: { duration: 600 },
+      interaction: { mode: 'index', intersect: false },
       scales: {
-        y0: {
-          position: 'left',
+        y: {
           min: 0,
           max: 100,
-          title: { display: true, text: '命中率 %' },
+          title: { display: true, text: 'cache_hit_ratio %' },
           ticks: { color: '#7f8b9a' },
+          grid: { color: 'rgba(127,139,154,.14)' },
         },
-        y1: {
-          position: 'right',
-          min: 0,
-          title: { display: true, text: 'IO 次数' },
-          grid: { drawOnChartArea: false },
-          ticks: { color: '#7f8b9a' },
+        x: {
+          ticks: { color: '#7f8b9a', maxTicksLimit: 10 },
+          grid: { display: false },
         },
       },
       plugins: {
         legend: { labels: { color: '#9aa5b2' } },
+        tooltip: {
+          callbacks: {
+            label: ctx => `${ctx.dataset.label}: ${ctx.parsed.y}%`,
+          },
+        },
       },
     },
   });
@@ -3456,10 +3585,10 @@ async function loadBcacheAlertSettings() {
       <label class="check-row"><input type="checkbox" id="bc-alert-enabled" ${c.enabled ? 'checked' : ''} /> 启用巡检告警</label>
       <span class="tiny">可用率低于</span><input class="input" id="bc-avail" type="number" min="1" max="100" value="${esc(c.cache_available_warn)}" style="width:72px"><span class="tiny">%</span>
       <span class="tiny">脏数据滞留</span><input class="input" id="bc-stuck" type="number" min="1" value="${esc(c.dirty_stuck_minutes)}" style="width:72px"><span class="tiny">分钟</span>
-      <span class="tiny">命中率骤降</span><input class="input" id="bc-drop" type="number" min="1" max="100" value="${esc(c.hit_drop_points)}" style="width:72px"><span class="tiny">点</span>
+      <span class="tiny">SSD 服务率骤降</span><input class="input" id="bc-drop" type="number" min="1" max="100" value="${esc(c.hit_drop_points)}" style="width:72px"><span class="tiny">点</span>
       <span class="tiny">积压阈值(MB)</span><input class="input" id="bc-backlog" type="number" min="1" value="${Math.round(Number(c.backlog_bytes) / 1048576)}" style="width:84px">
       <button class="btn sm primary" id="btn-bc-alert-save">保存</button>
-    </div>` : `<div class="tiny">巡检间隔 60 秒，告警会走系统邮件/Webhook。当前阈值：可用率 < ${esc(c.cache_available_warn)}% · 脏数据滞留 ${esc(c.dirty_stuck_minutes)} 分钟 · 命中率骤降 ≥ ${esc(c.hit_drop_points)} 点 · 积压 > ${(Number(c.backlog_bytes) / 1048576).toFixed(0)}MB</div>`}`;
+    </div>` : `<div class="tiny">巡检间隔 60 秒，告警会走系统邮件/Webhook。当前阈值：可用率 < ${esc(c.cache_available_warn)}% · 脏数据滞留 ${esc(c.dirty_stuck_minutes)} 分钟 · SSD 服务率骤降 ≥ ${esc(c.hit_drop_points)} 点 · 积压 > ${(Number(c.backlog_bytes) / 1048576).toFixed(0)}MB</div>`}`;
   body.appendChild(el);
   if (!admin) return;
   $('#btn-bc-alert-save').addEventListener('click', async () => {

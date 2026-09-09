@@ -3,7 +3,7 @@
 每分钟读取 bcache 状态并评估：
   - cache_available_percent 低于阈值
   - dirty_data 长时间不下降（回写卡住）
-  - 命中率骤降（五分钟窗口对比上次）
+  - SSD 服务率骤降（五分钟窗口对比上次）
   - 缓存盘掉线
   - 回写积压（backlog）超过阈值
 
@@ -29,7 +29,7 @@ DEFAULT_CONFIG = {
     "enabled": True,
     "cache_available_warn": 20,       # 缓存可用比例低于该值时告警
     "dirty_stuck_minutes": 10,        # dirty_data 持续不下降超过该分钟数告警
-    "hit_drop_points": 20,            # 五分钟命中率相对上次下降超过该点数告警
+    "hit_drop_points": 20,            # SSD 服务率相对上次下降超过该点数告警
     "backlog_bytes": 536870912,       # 脏数据积压超过 512MB 告警
 }
 
@@ -137,8 +137,8 @@ def evaluate():
         if prev_hit is not None and hit is not None and prev_hit - hit >= int(cfg["hit_drop_points"]):
             if not prev.get("hit_alerted"):
                 lsi_alert._alert(
-                    "bcache 命中率骤降",
-                    f"缓存集 {key} 命中率由 {prev_hit}% 降至 {hit}%，疑似缓存未命中增加。",
+                    "bcache SSD 服务率骤降",
+                    f"缓存集 {key} SSD 服务率由 {prev_hit}% 降至 {hit}%，疑似缓存未命中增加。",
                     "warning",
                 )
                 cur["hit_alerted"] = True
