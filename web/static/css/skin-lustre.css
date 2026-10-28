@@ -1,0 +1,286 @@
+/* DataMax-LSI · LustrePilot skin
+   参考 http://127.0.0.1:4175 的设计语言：
+   暖纸底色 + 深林绿侧栏 + 酸性黄绿强调 + 深色主按钮。
+   只覆盖视觉令牌与外壳组件，不改任何布局结构与功能。 */
+
+:root {
+  --canvas: #f1f0eb;
+  --canvas-deep: #ecebe5;
+  --surface: #fbfaf7;
+  --surface-2: #f6f5f0;
+  --surface-3: #ecebe5;
+  --surface-glass: rgba(241, 240, 235, 0.92);
+  --sidebar: #111816;
+  --sidebar-2: rgba(255, 255, 255, 0.045);
+
+  --foreground: #17201e;
+  --card-foreground: #17201e;
+  --popover: #fbfaf7;
+  --popover-foreground: #17201e;
+
+  --primary: #111816;
+  --primary-hover: #25332e;
+  --primary-soft: rgba(217, 240, 123, 0.38);
+  --primary-foreground: #f7faf8;
+
+  --secondary: #ecebe5;
+  --secondary-foreground: #34413e;
+  --muted: #ecebe5;
+  --muted-foreground: #34413e;
+  --accent: #ecebe5;
+  --accent-foreground: #218a78;
+
+  --border: rgba(23, 32, 30, 0.11);
+  --border-strong: rgba(23, 32, 30, 0.2);
+  --input: rgba(23, 32, 30, 0.16);
+  --ring: #8ea63a;
+
+  --ok: #218a78;
+  --ok-bg: #e1f2ec;
+  --warn: #a66916;
+  --warn-bg: #f7ecd8;
+  --crit: #b64b3e;
+  --crit-bg: #f5e5e1;
+
+  --ink-soft: #34413e;
+  --ink-faint: #68736f;
+  --sidebar-border: rgba(255, 255, 255, 0.06);
+  --shadow-color: rgba(17, 24, 22, 0.17);
+  --shadow-color-2: rgba(17, 24, 22, 0.04);
+
+  --radius: 14px;
+  --radius-sm: 9px;
+  --radius-md: 11px;
+  --radius-xl: 18px;
+  --sidebar-w: 246px;
+  --topbar-h: 62px;
+
+  --font-sans: "SF Pro Text", "SF Pro Display", "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", system-ui, sans-serif;
+  --acid: #d9f07b;
+  --violet: #7469d8;
+  --teal: #218a78;
+  --coral: #b64b3e;
+}
+
+body {
+  background: var(--canvas);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-size: 13.5px;
+  font-feature-settings: "tnum" 1;
+}
+
+/* 深林绿侧栏 —— 整个设计里最有辨识度的一块 */
+.sidebar {
+  background:
+    linear-gradient(180deg, rgba(217, 240, 123, 0.025), transparent 24%),
+    #111816;
+  border-right: 1px solid var(--sidebar-border);
+  color: #e7ece8;
+}
+.brand-mark {
+  background: var(--acid);
+  color: #111816;
+  border: 0;
+  border-radius: 10px;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.2);
+}
+.brand-copy h1 { color: #f4f8f5; }
+.brand-copy p { color: #8e9a95; }
+
+.nav-btn {
+  height: 39px;
+  color: #aeb9b4;
+  border-radius: 8px;
+  font-size: 12.5px;
+}
+.nav-btn:hover {
+  color: #eef3f0;
+  background: rgba(255, 255, 255, 0.045);
+}
+.nav-btn.active {
+  color: #f4f8f5;
+  background: rgba(255, 255, 255, 0.085);
+  border-color: transparent;
+}
+.nav-btn.active .glyph svg { color: var(--acid); }
+.nav-btn.active::before {
+  left: -14px;
+  top: 9.5px;
+  bottom: auto;
+  width: 3px;
+  height: 20px;
+  background: var(--acid);
+  border-radius: 0 3px 3px 0;
+  box-shadow: none;
+}
+
+.sidebar-foot { border-top: 1px solid rgba(255, 255, 255, 0.06); }
+.foot-line, .foot-meta { color: #7f8b87; }
+
+/* 顶栏：暖纸 + 模糊，和参考界面一致 */
+.topbar {
+  background: rgba(241, 240, 235, 0.92);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  border-bottom: 1px solid var(--border);
+}
+
+/* 面板与控件 */
+.card {
+  border-radius: var(--radius);
+  background: var(--surface);
+  border-color: var(--border);
+}
+.card .card { background: var(--surface-2); }
+
+.btn { border-radius: 7px; font-weight: 590; }
+.btn.primary {
+  background: #111816;
+  border-color: #111816;
+  color: #f7faf8;
+  box-shadow: 0 2px 7px rgba(17, 24, 22, 0.14);
+}
+.btn.primary:hover {
+  background: #25332e;
+  border-color: #25332e;
+  box-shadow: 0 4px 12px rgba(17, 24, 22, 0.17);
+}
+.btn.sm { border-radius: 6px; }
+
+.badge.info { background: rgba(217, 240, 123, 0.42); color: #3d4a12; }
+.badge.ok { background: var(--ok-bg); color: var(--ok); }
+
+::selection { background: var(--acid); color: #17201e; }
+html { caret-color: var(--teal); }
+
+/* 焦点环用酸性黄绿的深一档，保证在暖纸上有足够对比 */
+.input:focus-visible, .select:focus-visible,
+.btn:focus-visible, .icon-btn:focus-visible, .nav-btn:focus-visible,
+.chip:focus-visible, .topo-cell:focus-visible, .policy-item input:focus-visible {
+  outline: 2px solid #8ea63a;
+  outline-offset: 1px;
+}
+
+/* 深色主题保持同一套语义，只是把纸换成夜林 */
+.dark {
+  --canvas: #0c1210;
+  --canvas-deep: #080d0b;
+  --surface: #121a17;
+  --surface-2: #17211d;
+  --surface-3: #1d2924;
+  --foreground: #e9efec;
+  --card-foreground: #e9efec;
+  --popover: #17211d;
+  --popover-foreground: #e9efec;
+  --primary: #d9f07b;
+  --primary-hover: #e6f79b;
+  --primary-soft: rgba(217, 240, 123, 0.16);
+  --primary-foreground: #141b10;
+  --muted-foreground: #a8b4af;
+  --ink-soft: #a8b4af;
+  --ink-faint: #7b8782;
+  --border: rgba(255, 255, 255, 0.09);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --sidebar: #080d0b;
+  --sidebar-border: rgba(255, 255, 255, 0.06);
+  --ok: #4ecdb0;
+  --ok-bg: rgba(78, 205, 176, 0.12);
+  --warn: #e0b26a;
+  --warn-bg: rgba(224, 178, 106, 0.12);
+  --crit: #e08a7d;
+  --crit-bg: rgba(224, 138, 125, 0.12);
+}
+
+/* ---------- 仪表：改用参考界面的细平条语言 ----------
+   参考界面里没有圆环，全部是 3–5px 的扁平横条 + 大号数字。
+   这里把健康评分的圆环压细、子项条拉平成同一套语汇，避免"圆环+胶囊条"
+   两种仪表并存。 */
+.ring-box svg circle { stroke-width: 3 !important; }
+.ring-center .score {
+  font-size: 38px;
+  font-weight: 640;
+  letter-spacing: -0.02em;
+}
+
+/* 子项条：6px 胶囊 → 4px 平条 */
+.sub-score { animation: none !important; }
+.sub-score .bar {
+  height: 4px;
+  border-radius: 2px;
+  background: #e8e7e1;
+}
+.sub-score .bar i { border-radius: 2px; }
+
+/* 健康分布条同一套 */
+.health-bar {
+  height: 4px;
+  border-radius: 2px;
+  background: #e8e7e1;
+}
+.health-bar i { border-radius: 2px; }
+
+/* 进度类条统一细平：任务进度、备份进度、桶占比 */
+.bench-bar, .bench-bar i { border-radius: 2px; }
+
+/* ---------- 页内标签 ----------
+   每页卡片按组折叠成标签，避免一路滚动到底。视觉沿用参考界面的
+   细线 + 酸性黄绿下划，不做背景块。 */
+.subtabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+.subtab {
+  position: relative;
+  height: 34px;
+  padding: 0 12px;
+  border: 0;
+  background: transparent;
+  color: var(--ink-faint);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 550;
+  cursor: pointer;
+  transition: color 140ms ease;
+}
+.subtab:hover { color: var(--foreground); }
+.subtab.active { color: var(--foreground); }
+.subtab.active::after {
+  content: "";
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: -1px;
+  height: 2px;
+  background: #8ea63a;
+  border-radius: 2px;
+}
+.subpanel { display: none; flex-direction: column; gap: 14px; }
+.subpanel.active { display: flex; }
+
+/* 概览页本身是 12 列栅格：标签面板必须自己再开一套 12 列，
+   否则里面的卡片会全部挤在单列里。 */
+@media (min-width: 1920px) {
+  #view-overview .subtabs { grid-column: 1 / -1; }
+  #view-overview .subpanel {
+    grid-column: 1 / -1;
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+    gap: 26px;
+  }
+  #view-overview .subpanel.active { display: grid; }
+  /* 原来的 grid-hero / grid-stats / grid-2 在面板内继续用 contents 拆开 */
+  #view-overview .subpanel > .grid-hero,
+  #view-overview .subpanel > .grid-stats,
+  #view-overview .subpanel > .grid-2 { display: contents; }
+  /* 面板内的配比：两栏 hero 各占 6，四张状态卡各占 3，单卡整行 */
+  #view-overview .subpanel .grid-hero > .card { grid-column: span 6; }
+  #view-overview .subpanel .grid-stats > .card { grid-column: span 3; }
+  /* grid-2（巡读 / 一致性检查）同样要两分，否则会掉进单列、
+     和上面的温度趋势卡对不齐——"维护与趋势"标签就是这么散的。 */
+  #view-overview .subpanel .grid-2 > .card { grid-column: span 6; }
+  #view-overview .subpanel > .card { grid-column: span 12; }
+}

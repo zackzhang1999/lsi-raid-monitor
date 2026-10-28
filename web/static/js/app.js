@@ -35,6 +35,34 @@ function fmtDayClock(ms) {
 }
 
 /* ---------- Toast ---------- */
+
+/* ---------- 统一状态块 ----------
+   产品里最常见的三个混淆：没有数据 / 加载失败 / 没权限。用一个组件把
+   它们分开，而不是都渲染成一行灰字。 */
+const STATE_ICONS = {
+  empty: '<svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2"/><path d="M3.5 10h17M8 5v14"/></svg>',
+  error: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 8v5M12 16.2v.1"/></svg>',
+  denied: '<svg viewBox="0 0 24 24"><rect x="4.5" y="10.5" width="15" height="9.5" rx="2"/><path d="M8 10.5V7.8a4 4 0 0 1 8 0v2.7"/></svg>',
+  loading: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 3.5a8.5 8.5 0 0 1 8.5 8.5"/></svg>',
+};
+
+function stateBlock(kind, title, desc, actionHtml, compact) {
+  const cls = 'state ' + (kind || 'empty') + (compact ? ' compact' : '');
+  return `<div class="${cls}">${STATE_ICONS[kind] || STATE_ICONS.empty}`
+    + `<div class="t">${esc(title || '')}</div>`
+    + (desc ? `<div class="d">${esc(desc)}</div>` : '')
+    + (actionHtml ? `<div class="a">${actionHtml}</div>` : '')
+    + '</div>';
+}
+
+function stateFromError(e) {
+  const msg = String((e && e.message) || e || '未知错误');
+  if (/未登录|会话|权限|401|403/.test(msg)) {
+    return stateBlock('denied', '没有访问权限', msg);
+  }
+  return stateBlock('error', '加载失败', msg);
+}
+
 function toast(msg, type) {
   const root = $('#toast-root');
   const el = document.createElement('div');
@@ -51,6 +79,15 @@ async function api(path, opts) {
   if (o.body && typeof o.body !== 'string') {
     o.headers = Object.assign({ 'Content-Type': 'application/json' }, o.headers || {});
     o.body = JSON.stringify(o.body);
+  } else if (
+    typeof o.body === 'string' &&
+    /^\s*[[{]/.test(o.body) &&
+    !(o.headers && o.headers['Content-Type'])
+  ) {
+    // 已经有调用点直接传 JSON 字符串。不补这个头的话，后端 get_json()
+    // 拿到 None，接口照样返回 200 但什么都没生效——静默失败最难查，
+    // 所以在公共入口上兜住，而不是指望每个调用点都记得。
+    o.headers = Object.assign({ 'Content-Type': 'application/json' }, o.headers || {});
   }
   const res = await fetch(path, o);
   if (res.status === 401) {
@@ -59,12 +96,53 @@ async function api(path, opts) {
   }
   let data = null;
   try { data = await res.json(); } catch (e) { /* 非 JSON */ }
+  // 402：功能被授权门禁挡住。统一给出说明与升级入口，
+  // 而不是让各个调用点各自处理一句看不出所以然的报错。
+  if (res.status === 402) {
+    showUpgradePrompt(data || {});
+    throw new Error((data && data.error) || '需要更高版本授权');
+  }
   if (!res.ok) {
     const msg = data && (data.error || data.message) ? (data.error || data.message) : ('请求失败 (' + res.status + ')');
     if (res.status === 403) toast(msg, 'error');
     throw new Error(msg);
   }
   return data;
+}
+
+let _upgradeShown = 0;
+
+function showUpgradePrompt(info) {
+  // 同一功能的重复失败不反复弹窗（例如页面轮询）
+  const key = info.feature || info.error || 'unknown';
+  const now = Date.now();
+  if (state.upgradePromptKey === key && now - _upgradeShown < 30000) return;
+  state.upgradePromptKey = key;
+  _upgradeShown = now;
+  const editionName = { pro: '专业版', enterprise: '企业版' }[info.requires] || '更高版本';
+  const cur = state.license || {};
+  showModal({
+    title: '需要更高版本授权',
+    body: `<p>${esc(info.error || '当前版本不包含该功能')}</p>
+      <dl class="kv" style="margin-top:12px">
+        <dt>当前版本</dt><dd>${esc(cur.edition_name || '未知')}</dd>
+        <dt>所需版本</dt><dd>${esc(editionName)}</dd>
+      </dl>
+      <p class="tiny" style="margin-top:10px">在「监控概览 → 授权」中可查看授权状态并安装离线授权文件。</p>`,
+    actions: [
+      { label: '关闭', handler: closeModal },
+      {
+        label: '查看授权',
+        cls: 'primary',
+        handler: async () => {
+          closeModal();
+          switchView('overview');
+          const c = $('#card-license');
+          if (c && c.scrollIntoView) c.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        },
+      },
+    ],
+  });
 }
 function btnLoading(btn, on) {
   if (!btn) return;
@@ -103,6 +181,8 @@ const state = {
   view: 'overview',
   hours: 24,
   chartType: 'temp',
+  perfHours: 24,
+  perfMetric: 'iops',
   evLevel: 'all',
   evPage: 1,
   evTotal: 0,
@@ -134,6 +214,46 @@ const state = {
 };
 
 const HEALTH_TEXT = { ok: '正常', warn: '警告', crit: '严重', unknown: '未知' };
+/* 控制器健康状态来自 storcli（Optimal/Dgrd/…），与上面聚合健康
+   的中文映射是两套词表，不能混用。 */
+const CTRL_HEALTH_TEXT = {
+  Optimal: '正常',
+  Opt: '正常',
+  OK: '正常',
+  Degraded: '降级',
+  Dgrd: '降级',
+  Failed: '故障',
+  Offline: '离线',
+  Offln: '离线',
+  'Need Attention': '需关注',
+  NdAtn: '需关注',
+  Missing: '缺失',
+  Msng: '缺失',
+  Rebuild: '重建中',
+  'N/A': '不可用',
+};
+
+function ctrlHealthText(h) {
+  const s = String(h || '').trim();
+  if (!s) return '未知';
+  return CTRL_HEALTH_TEXT[s] || s;
+}
+
+/* 控制器列表：优先用后端返回的 controllers[]，旧接口退化到单控制器 */
+function ctrlListOf(st) {
+  const list = (st && Array.isArray(st.controllers)) ? st.controllers.slice() : [];
+  if (list.length) return list.sort((a, b) => Number(a.ctrl) - Number(b.ctrl));
+  const c = (st && st.controller) || {};
+  return [{
+    ctrl: 0,
+    model: c.model || '',
+    fw: c.fw || '',
+    health: c.health || '',
+    roc_temp: c.roc_temp,
+    bbu_state: c.bbu_state || '',
+  }];
+}
+
 const BADGE_OK_STATES = ['onln', 'optl', 'optimal', 'ok', 'online', 'good', 'ugood', 'jbod', 'ghs', 'dhs'];
 const BADGE_CRIT_STATES = ['ubad', 'failed', 'fail', 'degraded', 'dead', 'offline', 'offlin', 'offln', 'missing'];
 
@@ -249,6 +369,13 @@ function hideLogin() {
 async function boot() {
   initTheme();
   bindUI();
+  bindConsoleUI();
+  bindLicenseUI();
+  bindHostsUI();
+  bindBackupUI();
+  bindConfigUI();
+  bindRecoveryUI();
+  bindFleetAlertUI();
   try {
     const me = await api('/api/me');
     state.me = me;
@@ -268,13 +395,23 @@ async function boot() {
 
 async function afterLogin() {
   const me = state.me || {};
-  state.isAdmin = !me.auth_required || me.role === 'admin';
+  // 权限按矩阵下发，前端不再自己推断"是不是管理员"。
+  // 后端每一处都会独立校验，前端只负责别把用不了的按钮摆出来。
+  state.perms = Array.isArray(me.perms) ? me.perms : ['view'];
+  state.canConfigure = state.perms.includes('configure');
+  state.canOperate = state.perms.includes('operate');
+  state.canAudit = state.perms.includes('audit');
+  state.roleLabel = me.role_label || '';
+  state.isAdmin = state.canConfigure; // 既有代码里的 isAdmin 语义就是"可变更配置"
+  buildRoleInfo(me.rbac);
   hideLogin();
   // 角色相关可见性
   $('#nav-users').classList.toggle('hidden', !(me.manage_users && state.isAdmin));
   // 未创建管理员账号时的安全提示横幅
   $('#security-banner').classList.toggle('hidden', state.authRequired);
   $('#btn-collect').classList.toggle('hidden', !state.isAdmin);
+  $('#btn-host-add').classList.toggle('hidden', !state.isAdmin);
+  $('#btn-token-rotate').classList.toggle('hidden', !state.isAdmin);
   $('#btn-vd-import').classList.toggle('hidden', !state.isAdmin); // 是否有外来配置由 loadStatus 动态控制
   $('#btn-logout').classList.toggle('hidden', !state.authRequired);
   $('#sel-interval').disabled = !state.isAdmin;
@@ -283,7 +420,10 @@ async function afterLogin() {
   $('#btn-webhook-test').disabled = !state.isAdmin;
   $('#btn-hotspare-save').classList.toggle('hidden', !state.isAdmin);
   const name = me.username || 'admin';
-  $('#user-name').textContent = name + (state.authRequired ? '' : '（未认证）');
+  // 用户名旁直接标出角色：一个页面同时开着两种权限的会话时，
+  // "我现在能用哪些按钮"不该靠记忆。
+  $('#user-name').textContent =
+    name + (state.roleLabel ? `（${state.roleLabel}）` : '') + (state.authRequired ? '' : ' 未认证');
   $('#user-avatar').textContent = (name[0] || '?');
   $('#app-version').textContent = me.version ? 'v' + me.version : '';
   let savedView = 'overview';
@@ -306,17 +446,238 @@ async function loadAll() {
   await Promise.allSettled([
     loadStatus(), loadAlertConfig(), loadCollectionConfig(), loadHistory(),
     loadEvents(), loadRealtime(), loadFsUsage(), loadVdDetail(), loadCtlEvents(),
-    loadAlarm(), loadJbod(),
+    loadAlarm(), loadJbod(), loadAlertCenter(), loadDiskHealth(),
+    loadLicense(),
   ]);
+  // 顶栏计数依赖事件流，放在状态之后刷新，避免与 loadStatus 抢 state
+  refreshConsoleBadges().catch(() => {});
 }
 
 /* ---------- 状态数据 ---------- */
+
+/* ---------- 告警中心 ---------- */
+let _alertStatus = 'open';
+let _alertData = { alerts: [], counts: {}, silences: [] };
+
+async function loadAlertCenter() {
+  const box = $('#alert-list');
+  if (!box) return;
+  try {
+    _alertData = await api(`/api/alerts?status=${encodeURIComponent(_alertStatus)}`);
+  } catch (e) {
+    box.innerHTML = stateFromError(e);
+    return;
+  }
+  renderSilenceBanner(_alertData.silences || []);
+
+  const counts = _alertData.counts || {};
+  const badge = $('#alert-count-badge');
+  if (badge) {
+    const n = Number(counts.active || 0);
+    badge.textContent = n > 99 ? '99+' : String(n);
+    badge.className = 'badge ' + (n > 0 ? 'crit' : 'hidden');
+  }
+
+  const rows = _alertData.alerts || [];
+  if (!rows.length) {
+    box.innerHTML = '<div class="muted">当前没有需要处理的告警</div>';
+    return;
+  }
+  box.innerHTML = rows
+    .map(a => {
+      const lv = String(a.level || 'warning');
+      const tone = lv === 'error' ? 'crit' : lv === 'warning' ? 'warn' : 'info';
+      const text = { crit: '错误', warn: '警告', info: '信息' }[tone] || lv;
+      const acked = a.status === 'acknowledged';
+      const resolved = a.status === 'resolved';
+      return `<div class="alert-row ${resolved ? 'resolved' : acked ? 'acked' : ''}">
+        <span class="badge ${resolved ? 'ok' : tone}">${resolved ? '已恢复' : text}</span>
+        <span class="alert-main">
+          <span class="alert-title">${esc(a.title || a.key)}${Number(a.count) > 1 ? ` <span class="tiny">×${esc(a.count)}</span>` : ''}</span>
+          <span class="alert-detail">${esc(a.detail || '')}</span>
+        </span>
+        <span class="alert-time mono" title="首次 ${esc(a.first_seen || '')} · 最近 ${esc(a.last_seen || '')}">${esc((a.last_seen || '').slice(5))}</span>
+        <span class="alert-ops">
+          ${resolved ? '' : acked
+            ? `<span class="tiny" title="${esc(a.acknowledged_by || '')} 于 ${esc(a.acknowledged_at || '')} 确认">已确认</span>`
+            : state.canOperate
+              ? `<button class="btn sm" data-ack="${esc(a.id)}">确认</button>`
+              : ''}
+          ${state.canOperate ? `<button class="btn sm ghost" data-silence="${esc(a.key)}" title="为该项开启维护窗口">静默</button>` : ''}
+        </span>
+      </div>`;
+    })
+    .join('');
+
+  $$('#alert-list [data-ack]').forEach(b =>
+    b.addEventListener('click', async () => {
+      btnLoading(b, true);
+      try {
+        await api(`/api/alerts/${b.dataset.ack}/ack`, { method: 'POST' });
+        toast('告警已确认', 'ok');
+        await loadAlertCenter();
+      } catch (e) {
+        toast(e.message, 'error');
+        btnLoading(b, false);
+      }
+    })
+  );
+  $$('#alert-list [data-silence]').forEach(b =>
+    b.addEventListener('click', () => openSilenceModal(b.dataset.silence))
+  );
+}
+
+function renderSilenceBanner(silences) {
+  const box = $('#silence-banner');
+  if (!box) return;
+  if (!silences.length) {
+    box.classList.add('hidden');
+    box.innerHTML = '';
+    return;
+  }
+  box.classList.remove('hidden');
+  box.innerHTML = silences
+    .map(
+      s => `<div class="silence-item">
+        <span class="silence-scope mono">${esc(s.scope)}</span>
+        <span class="tiny">维护窗口至 ${esc(s.ends_at)}</span>
+        ${s.reason ? `<span class="tiny">· ${esc(s.reason)}</span>` : ''}
+        ${state.isAdmin ? `<button class="btn sm ghost" data-unsilence="${esc(s.id)}">结束</button>` : ''}
+      </div>`
+    )
+    .join('');
+  $$('#silence-banner [data-unsilence]').forEach(b =>
+    b.addEventListener('click', async () => {
+      try {
+        await api(`/api/alerts/silence/${b.dataset.unsilence}/remove`, { method: 'POST' });
+        toast('维护窗口已结束', 'ok');
+        await loadAlertCenter();
+      } catch (e) {
+        toast(e.message, 'error');
+      }
+    })
+  );
+}
+
+function openSilenceModal(scope) {
+  const target = scope || 'all';
+  showModal({
+    title: '开启维护窗口',
+    body: `<p>静默期间相关告警<strong>照常记录</strong>，但不发送邮件与 Webhook。</p>
+      <div class="field"><label for="sil-scope">作用范围</label>
+        <input class="input mono" id="sil-scope" value="${esc(target)}" />
+        <span class="hint" style="color:var(--ink-faint)">all = 全部；disk:C1:E134:S0 = 单盘；controller:C1 = 整张卡（含其磁盘）</span></div>
+      <div class="field"><label for="sil-minutes">时长（分钟）</label>
+        <input class="input" id="sil-minutes" type="number" min="1" max="43200" value="60" /></div>
+      <div class="field"><label for="sil-reason">原因（选填）</label>
+        <input class="input" id="sil-reason" placeholder="如：更换背板" /></div>`,
+    actions: [
+      { label: '取消', handler: closeModal },
+      {
+        label: '开启静默',
+        cls: 'primary',
+        handler: async btn => {
+          btnLoading(btn, true);
+          try {
+            await api('/api/alerts/silence', {
+              method: 'POST',
+              body: {
+                scope: $('#sil-scope').value.trim() || 'all',
+                minutes: Number($('#sil-minutes').value) || 60,
+                reason: $('#sil-reason').value.trim(),
+              },
+            });
+            toast('维护窗口已开启', 'ok');
+            closeModal();
+            await loadAlertCenter();
+          } catch (e) {
+            toast(e.message, 'error');
+            btnLoading(btn, false);
+          }
+        },
+      },
+    ],
+  });
+}
+
+/* 跨控制器一致性：固件/型号不一致属于"整机级"问题，
+   不在单块盘的告警范围内，但会直接影响可维护性与厂商支持。 */
+function renderConsistency(st) {
+  const box = $('#alert-consistency');
+  if (!box) return;
+  const issues = (st && st.consistency && st.consistency.issues) || [];
+  if (!issues.length) {
+    box.classList.add('hidden');
+    box.innerHTML = '';
+    return;
+  }
+  box.classList.remove('hidden');
+  box.innerHTML = issues
+    .map(
+      i => `<div class="consistency-item ${esc(i.level || 'info')}">
+        <span class="consistency-title">${esc(i.title)}</span>
+        <span class="consistency-detail mono">${esc(i.detail)}</span>
+        <span class="consistency-hint">${esc(i.hint)}</span>
+      </div>`
+    )
+    .join('');
+}
+
+/* ---------- 磁盘健康 TOP ---------- */
+let _healthMetric = 'wear';
+
+async function loadDiskHealth() {
+  const box = $('#health-top');
+  if (!box) return;
+  let d;
+  try {
+    d = await api('/api/report/summary');
+  } catch (e) {
+    box.innerHTML = stateFromError(e);
+    return;
+  }
+  const rows = _healthMetric === 'wear' ? d.wear_top || [] : d.lifetime_top || [];
+  if (!rows.length) {
+    box.innerHTML = stateBlock('empty', '没有物理磁盘', '控制器没有报告任何物理盘；刚插入的盘通常要等下一轮采集。');
+    return;
+  }
+  const maxWear = Math.max(1, ...(d.wear_top || []).map(r => Number(r.wear_score) || 0));
+  box.innerHTML = rows
+    .map(r => {
+      const label = r.full_label || r.label || '—';
+      if (_healthMetric === 'wear') {
+        const score = Number(r.wear_score) || 0;
+        const pct = Math.max(2, Math.round((score / maxWear) * 100));
+        const lv = r.predict_level || 'ok';
+        const tone = lv === 'crit' ? 'crit' : lv === 'warn' ? 'warn' : 'ok';
+        return `<div class="health-row">
+          <span class="health-label mono">${esc(label)}</span>
+          <span class="health-bar"><i class="${tone}" style="width:${pct}%"></i></span>
+          <span class="health-meta mono" title="重映射 / 待定 / 无法纠正">${num0(r.reallocated)}/${num0(r.pending)}/${num0(r.uncorrectable)}</span>
+        </div>`;
+      }
+      const life = r.life || {};
+      const pct = Number(life.used_percent) || 0;
+      const tone = pct >= 90 ? 'crit' : pct >= 70 ? 'warn' : 'ok';
+      return `<div class="health-row">
+        <span class="health-label mono">${esc(label)}</span>
+        <span class="health-bar"><i class="${tone}" style="width:${Math.max(2, pct)}%"></i></span>
+        <span class="health-meta mono">${esc(r.power_on_days != null ? r.power_on_days + ' 天' : '—')} · ${pct}%</span>
+      </div>`;
+    })
+    .join('');
+}
+
 async function loadStatus() {
   const st = await api('/api/status');
   state.status = st;
   renderTopbar(st);
   renderHealth(st);
   renderStatCards(st);
+  // 一致性结论来自 /api/status，必须在这里渲染：
+  // loadAlertCenter 与 loadStatus 是并发发起的，它读 state.status 时
+  // 很可能还是 null，导致面板空白。
+  renderConsistency(st);
   renderTopology(st);
   renderMaintenance(st);
   renderPhysicalDisks(st);
@@ -336,6 +697,7 @@ function renderTopbar(st) {
   const h = st.health || 'unknown';
   $('#tb-health').className = 'badge ' + (h === 'unknown' ? '' : h);
   $('#tb-health').textContent = HEALTH_TEXT[h] || h;
+  renderTopbarControllers(st);
   const up = $('#tb-updated');
   if (st.timestamp) {
     const d = toDate(st.timestamp);
@@ -347,6 +709,46 @@ function renderTopbar(st) {
     up.textContent = '';
     up.style.color = '';
   }
+}
+
+/* 控制器健康色：Optimal/Opt 视为正常，其余按 stateTone 判定 */
+function ctrlHealthTone(health) {
+  const t = stateTone(String(health || ''));
+  if (t === 'crit') return 'crit';
+  if (t === 'warn') return 'warn';
+  const s = String(health || '').trim();
+  if (!s || s === 'N/A') return 'unknown';
+  return 'ok';
+}
+
+/* 多控制器并列展示：每张卡一个状态条，不必进二级页面就能看到
+   第二张卡是否健康。只有一张卡时不显示，避免占位噪音。 */
+function renderTopbarControllers(st) {
+  const box = $('#tb-ctrls');
+  if (!box) return;
+  const ctrls = Array.isArray(st.controllers) ? st.controllers : [];
+  if (ctrls.length < 2) {
+    box.innerHTML = '';
+    box.classList.add('hidden');
+    return;
+  }
+  box.classList.remove('hidden');
+  box.innerHTML = ctrls.map(c => {
+    const tone = ctrlHealthTone(c.health);
+    const state = ctrlHealthText(c.health);
+    const tip = [
+      c.model || 'Controller',
+      c.fw ? 'FW ' + c.fw : '',
+      c.roc_temp != null ? 'ROC ' + c.roc_temp + '°C' : '',
+      (c.num_disks || 0) + ' 盘 / ' + (c.num_vds || 0) + ' 阵列',
+    ].filter(Boolean).join(' · ');
+    return `<span class="ctrl-chip ${tone}" title="${esc(tip)}">
+      <span class="ctrl-chip-id">C${esc(c.ctrl)}</span>
+      <span class="ctrl-chip-state">${esc(state)}</span>
+      ${c.roc_temp != null ? `<span class="ctrl-chip-temp">${esc(c.roc_temp)}°</span>` : ''}
+      <span class="ctrl-chip-count">${esc(c.num_disks || 0)}盘</span>
+    </span>`;
+  }).join('');
 }
 
 /* ---------- 综合健康评分 ---------- */
@@ -432,10 +834,39 @@ const ALARM_STATE_MAP = [
   ['ON', ['打开', 'ok']],
 ];
 
+/* 控制器级设置（蜂鸣器 / JBOD）的目标选择。
+   多卡机器上这些设置是每张卡各自的，必须让用户明确选一张卡，
+   否则改动会落到"默认那张"上而用户不知道操作了哪张。 */
+function ctrlSelectValue(selId) {
+  const sel = $(selId);
+  if (!sel || sel.classList.contains('hidden')) return null;
+  const v = Number(sel.value);
+  return Number.isFinite(v) ? v : null;
+}
+
+function fillCtrlSelect(selId, ctrls) {
+  const sel = $(selId);
+  if (!sel) return;
+  if (!ctrls || ctrls.length < 2) {
+    sel.classList.add('hidden');
+    sel.innerHTML = '';
+    return;
+  }
+  const prev = sel.value;
+  sel.classList.remove('hidden');
+  sel.innerHTML = ctrls
+    .map(c => `<option value="${esc(c.ctrl)}">C${esc(c.ctrl)}</option>`)
+    .join('');
+  if (prev && ctrls.some(c => String(c.ctrl) === String(prev))) sel.value = prev;
+}
+
 async function loadAlarm() {
   const badge = $('#alarm-badge');
   let data;
-  try { data = await api('/api/controller_alarm'); }
+  const ctrls = state.status ? ctrlListOf(state.status) : [];
+  fillCtrlSelect('#alarm-ctrl', ctrls);
+  const sel = ctrlSelectValue('#alarm-ctrl');
+  try { data = await api('/api/controller_alarm' + (sel != null ? `?ctrl=${sel}` : '')); }
   catch (e) { badge.textContent = '—'; return; }
   const raw = String(data.alarm || '').toUpperCase();
   const hit = ALARM_STATE_MAP.find(([k]) => raw.includes(k));
@@ -452,9 +883,12 @@ function alarmAction(mode) {
   }[mode];
   const label = { on: '打开', silence: '临时关闭', off: '永久关闭' }[mode];
   confirmModal(`阵列卡报警${label}`, `<p>${esc(desc)}</p>`, label, mode === 'off', async () => {
-    const r = await api('/api/controller_alarm', { method: 'POST', body: { mode } });
+    const sel = ctrlSelectValue('#alarm-ctrl');
+    const body = { mode };
+    if (sel != null) body.ctrl = sel;
+    const r = await api('/api/controller_alarm', { method: 'POST', body });
     if (r && r.ok === false) throw new Error(r.error || '操作失败');
-    toast(`阵列卡报警已${label}`, 'ok');
+    toast(`阵列卡报警已${label}${sel != null ? `（C${sel}）` : ''}`, 'ok');
     await loadAlarm();
   });
 }
@@ -463,7 +897,10 @@ function alarmAction(mode) {
 async function loadJbod() {
   const badge = $('#jbod-badge');
   let data;
-  try { data = await api('/api/controller_jbod'); }
+  const ctrls = state.status ? ctrlListOf(state.status) : [];
+  fillCtrlSelect('#jbod-ctrl', ctrls);
+  const sel = ctrlSelectValue('#jbod-ctrl');
+  try { data = await api('/api/controller_jbod' + (sel != null ? `?ctrl=${sel}` : '')); }
   catch (e) { badge.textContent = '—'; return; }
   const raw = String(data.jbod || '').toUpperCase();
   const on = raw === 'ON';
@@ -479,9 +916,12 @@ function jbodAction(mode) {
     : '关闭 JBOD 模式后，新插入的未配置磁盘将保持 UGood 状态，不再自动暴露给操作系统，需配置 RAID 后才能使用。已在线的 JBOD 盘不受此开关影响。';
   const label = on ? '打开' : '关闭';
   confirmModal(`JBOD 模式${label}`, `<p>${esc(desc)}</p>`, label, !on, async () => {
-    const r = await api('/api/controller_jbod', { method: 'POST', body: { mode } });
+    const sel = ctrlSelectValue('#jbod-ctrl');
+    const body = { mode };
+    if (sel != null) body.ctrl = sel;
+    const r = await api('/api/controller_jbod', { method: 'POST', body });
     if (r && r.ok === false) throw new Error(r.error || '操作失败');
-    toast(`JBOD 模式已${label}`, 'ok');
+    toast(`JBOD 模式已${label}${sel != null ? `（C${sel}）` : ''}`, 'ok');
     await loadJbod();
   });
 }
@@ -548,24 +988,45 @@ function renderTopology(st) {
 
 /* ---------- 巡读 / 一致性检查 ---------- */
 function renderMaintenance(st) {
-  const m = st.maintenance || {};
   const wrap = $('#maint-cards');
+
+  // 巡读与一致性检查是每张控制器各自的设置：多卡机器上必须让用户
+  // 先明确针对哪张卡，不能拿"默认那张"的读数代表全部。
+  const controllers = ctrlListOf(st);
+  const primary = Number(
+    (st.controller && st.controller.ctrl != null) ? st.controller.ctrl : controllers[0].ctrl
+  );
+  const cur = (state.maintCtrl != null && controllers.some(c => Number(c.ctrl) === Number(state.maintCtrl)))
+    ? Number(state.maintCtrl)
+    : primary;
+  state.maintCtrl = cur;
+  const cobj = controllers.find(c => Number(c.ctrl) === cur) || controllers[0];
+  const m = (cobj && cobj.maintenance) || st.maintenance || {};
+
+  const ctrlPicker = controllers.length > 1
+    ? `<select class="select sm" id="sel-maint-ctrl">${controllers.map(c =>
+        `<option value="${esc(c.ctrl)}"${Number(c.ctrl) === cur ? ' selected' : ''}>控制器 C${esc(c.ctrl)}</option>`
+      ).join('')}</select>`
+    : '';
 
   const prOps = state.isAdmin ? `
     <div class="maint-ops">
+      ${ctrlPicker}
       <button class="btn sm" data-pr="start">启动</button>
       <button class="btn sm" data-pr="pause">暂停</button>
       <button class="btn sm" data-pr="resume">恢复</button>
       <button class="btn sm danger" data-pr="stop">停止</button>
     </div>` : '';
 
-  const vdOpts = (state.vds || []).map(v =>
-    `<option value="${esc(v.vd)}">VD ${esc(v.vd)}（${esc(v.dg_vd || '')} ${esc(v.name || '')}）</option>`).join('');
+  const vdsOfCur = (state.vds || []).filter(v => Number(v.ctrl != null ? v.ctrl : 0) === cur);
+  const vdOpts = vdsOfCur.map(v =>
+    `<option value="${esc(v.ctrl != null ? v.ctrl : 0)}:${esc(v.vd)}">C${esc(v.ctrl != null ? v.ctrl : 0)} · VD ${esc(v.vd)}（${esc(v.dg_vd || '')} ${esc(v.name || '')}）</option>`).join('');
   const ccOps = state.isAdmin ? `
     <div class="maint-ops">
+      ${controllers.length > 1 ? '' : ''}
       <select class="select" id="sel-cc-vd">${vdOpts || '<option value="">无虚拟盘</option>'}</select>
-      <button class="btn sm" id="btn-cc-start" ${state.vds.length ? '' : 'disabled'}>启动</button>
-      <button class="btn sm danger" id="btn-cc-stop" ${state.vds.length ? '' : 'disabled'}>停止</button>
+      <button class="btn sm" id="btn-cc-start" ${vdsOfCur.length ? '' : 'disabled'}>启动</button>
+      <button class="btn sm danger" id="btn-cc-stop" ${vdsOfCur.length ? '' : 'disabled'}>停止</button>
     </div>` : '';
 
   const mk = (title, eyebrow, o, opsHtml) => `
@@ -587,37 +1048,107 @@ function renderMaintenance(st) {
     mk('一致性检查', 'Consistency check', m.consistency_check, ccOps);
 
   if (state.isAdmin) {
+    const maintCtrlSel = $('#sel-maint-ctrl');
+    if (maintCtrlSel) {
+      maintCtrlSel.addEventListener('change', () => {
+        state.maintCtrl = Number(maintCtrlSel.value);
+        renderMaintenance(st);
+      });
+    }
     $$('[data-pr]', wrap).forEach(b => b.addEventListener('click', () => {
       const action = b.dataset.pr;
       const text = { start: '启动', pause: '暂停', resume: '恢复', stop: '停止' }[action];
-      raidAction({ target: 'patrolread', action }, `巡读：${text}`,
-        `确认${text}巡读 (Patrol Read)？`, action === 'stop');
+      raidAction({ target: 'patrolread', action, ctrl: cur }, `巡读：${text}`,
+        `确认对控制器 C${cur} ${text}巡读 (Patrol Read)？`, action === 'stop');
     }));
-    const ccVd = () => { const v = $('#sel-cc-vd').value; return v === '' ? null : Number(v); };
+    const ccVd = () => {
+      const v = $('#sel-cc-vd').value;
+      if (v === '') return null;
+      const [c, vd] = String(v).split(':').map(Number);
+      return { ctrl: c, vd };
+    };
     $('#btn-cc-start') && $('#btn-cc-start').addEventListener('click', () => {
-      const vd = ccVd();
-      if (vd == null) { toast('请选择虚拟盘', 'error'); return; }
-      raidAction({ target: 'cc', action: 'start', vd }, `一致性检查：启动`,
-        `确认对 VD ${vd} 启动一致性检查？该操作会占用一定的 IO 资源。`, false);
+      const t = ccVd();
+      if (!t) { toast('请选择虚拟盘', 'error'); return; }
+      raidAction({ target: 'cc', action: 'start', vd: t.vd, ctrl: t.ctrl }, `一致性检查：启动`,
+        `确认对控制器 C${t.ctrl} 的 VD ${t.vd} 启动一致性检查？该操作会占用一定的 IO 资源。`, false);
     });
     $('#btn-cc-stop') && $('#btn-cc-stop').addEventListener('click', () => {
-      const vd = ccVd();
-      if (vd == null) { toast('请选择虚拟盘', 'error'); return; }
-      raidAction({ target: 'cc', action: 'stop', vd }, `一致性检查：停止`,
-        `确认停止 VD ${vd} 上正在运行的一致性检查？`, true);
+      const t = ccVd();
+      if (!t) { toast('请选择虚拟盘', 'error'); return; }
+      raidAction({ target: 'cc', action: 'stop', vd: t.vd, ctrl: t.ctrl }, `一致性检查：停止`,
+        `确认停止控制器 C${t.ctrl} 的 VD ${t.vd} 上正在运行的一致性检查？`, true);
     });
   }
 }
 
 /* ---------- RAID 操作（巡读 / CC / VD 初始化） ---------- */
 function raidAction(body, title, desc, danger) {
+  const payload = Object.assign({}, body);
+  // 未显式指定控制器时：VD 操作跟随该 VD 所属控制器，
+  // 其余控制器级操作跟随当前状态里的主控制器。
+  if (payload.ctrl == null && payload.vd != null) {
+    const v = (state.vds || []).find(x => Number(x.vd) === Number(payload.vd));
+    if (v && v.ctrl != null) payload.ctrl = Number(v.ctrl);
+  }
+  if (payload.ctrl == null && state.status) {
+    const c = state.status.controller || {};
+    payload.ctrl = Number(c.ctrl != null ? c.ctrl : 0);
+  }
   confirmModal(title, `<p>${esc(desc)}</p>`, '确认执行', danger, async () => {
-    const r = await api('/api/raid_action', { method: 'POST', body });
+    const r = await api('/api/raid_action', { method: 'POST', body: payload });
     if (r && r.ok === false) throw new Error(r.error || '操作失败');
-    toast(title + ' 已执行', 'ok');
+    if (r && r.task) {
+      toast(`${title} 已提交（任务 #${r.task.id}）`, 'ok');
+      openTaskDrawer();
+    } else {
+      toast(title + ' 已执行', 'ok');
+    }
     await loadStatus();
     await loadVdDetail();
   });
+}
+
+/* 任务提交后的统一反馈：危险操作是异步执行的，
+   提示必须是"已提交"而不是"已完成"，并直接把任务中心打开，
+   否则用户会以为操作瞬间结束了、或者不知道去哪看进度。 */
+function notifyTaskSubmitted(r, label) {
+  if (r && r.task) {
+    toast(`${label} 已提交（任务 #${r.task.id}）`, 'ok');
+    openTaskDrawer();
+  } else {
+    toast(`${label} 已执行`, 'ok');
+  }
+}
+
+function openTaskDrawer() {
+  const scrim = $('#task-scrim');
+  const drawer = $('#task-drawer');
+  if (!scrim || !drawer) return;
+  scrim.classList.remove('hidden');
+  drawer.classList.add('open');
+  renderTaskList();
+  startTaskPoll();
+}
+
+let _taskPoll = null;
+
+/* 长任务（扩容、初始化）耗时以分钟计，60 秒的全局刷新太慢，
+   看不到进度变化；抽屉打开期间单独用更短的周期轮询。 */
+function startTaskPoll() {
+  if (_taskPoll) clearInterval(_taskPoll);
+  _taskPoll = setInterval(() => {
+    if ($('#task-drawer') && $('#task-drawer').classList.contains('open')) {
+      renderTaskList().catch(() => {});
+    }
+  }, 2500);
+}
+
+function stopTaskPoll() {
+  if (_taskPoll) {
+    clearInterval(_taskPoll);
+    _taskPoll = null;
+  }
 }
 
 /* ---------- 虚拟磁盘（vd_detail） ---------- */
@@ -669,7 +1200,7 @@ function renderVirtualDisks() {
   const tb = $('#vd-table tbody');
   const hideOps = !state.isAdmin;
   $$('#vd-table .admin-col').forEach(el => el.classList.toggle('col-hidden', hideOps));
-  if (!vds.length) { tb.innerHTML = '<tr><td colspan="9" class="muted">无虚拟磁盘</td></tr>'; return; }
+  if (!vds.length) { tb.innerHTML = '<tr><td colspan="10" class="muted">无虚拟磁盘</td></tr>'; return; }
   tb.innerHTML = '';
   vds.forEach(v => {
     const key = String(v.vd);
@@ -680,6 +1211,7 @@ function renderVirtualDisks() {
     tr.title = expanded ? '点击收起成员磁盘' : '点击展开成员磁盘';
     const opHtml = currentOpDisplay(v);
     tr.innerHTML = `
+      <td class="num">C${esc(v.ctrl != null ? v.ctrl : 0)}</td>
       <td class="num"><span class="vd-caret">${expanded ? '▾' : '▸'}</span>${esc(v.dg_vd || '—')} <span class="tiny">(${disks.length} 盘)</span></td>
       <td>${esc(v.name || '—')}</td>
       <td>${esc(v.type || '—')}</td>
@@ -728,7 +1260,7 @@ function renderVirtualDisks() {
           <td class="num">${esc(p.intf || '—')} / ${esc(p.med || '—')}</td>
           <td>${esc(p.model || '—')}</td>
         </tr>`).join('');
-      dr.innerHTML = `<td colspan="9"><div class="vd-sub">
+      dr.innerHTML = `<td colspan="10"><div class="vd-sub">
         <div class="tiny" style="margin-bottom:4px">成员磁盘（${disks.length}）</div>
         <table class="data">
           <thead><tr><th>槽位</th><th>DID</th><th>状态</th><th>容量</th><th>接口/介质</th><th>型号</th></tr></thead>
@@ -757,7 +1289,7 @@ function vdAction(v, key) {
   if (!a) return;
   const label = `VD ${v.vd}（${v.dg_vd || ''} ${v.name || ''}）`;
   raidAction(
-    { target: a.target, action: a.action, vd: v.vd },
+    { target: a.target, action: a.action, vd: v.vd, ctrl: Number(v.ctrl != null ? v.ctrl : 0) },
     `${a.text}`,
     `虚拟盘 ${label}：${a.desc}`,
     a.danger
@@ -766,14 +1298,17 @@ function vdAction(v, key) {
 
 function expandVd(v) {
   const raid = RAID_TYPE_MAP[String(v.type || '').toUpperCase()] || 'r5';
+  const vdCtrl = Number(v.ctrl != null ? v.ctrl : 0);
+  // 只能加入同一张控制器上的盘：跨卡的盘后端会拒绝，
+  // 与其让用户在提交时才看到报错，不如根本不出现在候选里
   const eligible = (state.status && state.status.physical_disks || [])
-    .filter(d => d.state === 'UGood');
+    .filter(d => d.state === 'UGood' && bayCtrl(d) === vdCtrl);
   if (!eligible.length) {
-    toast('没有可加入阵列的 UGood 盘', 'error');
+    toast(`控制器 C${vdCtrl} 上没有可加入阵列的 UGood 盘`, 'error');
     return;
   }
   const opts = eligible.map(d =>
-    `<option value="${esc(d.eid)}:${esc(d.slot)}">${esc(d.label)} · ${esc(d.model || '')}</option>`
+    `<option value="${esc(bayCtrl(d))}:${esc(d.eid)}:${esc(d.slot)}">${esc(d.label)} · ${esc(d.model || '')}</option>`
   ).join('');
   showModal({
     title: `VD ${v.vd} 动态扩容`,
@@ -788,15 +1323,15 @@ function expandVd(v) {
         label: '开始扩容',
         cls: 'primary',
         handler: async (btn) => {
-          const [eid, slot] = $('#expand-drive').value.split(':').map(Number);
+          const [dctrl, eid, slot] = $('#expand-drive').value.split(':').map(Number);
           btnLoading(btn, true);
           try {
             const r = await api('/api/raid_expand', {
               method: 'POST',
-              body: { vd: v.vd, raid, drives: [{ eid, slot }] },
+            body: { vd: v.vd, ctrl: vdCtrl, raid, drives: [{ ctrl: dctrl, eid, slot }] },
             });
             if (r && r.ok === false) throw new Error(r.error || '扩容失败');
-            toast('动态扩容已启动', 'ok');
+            notifyTaskSubmitted(r, '动态扩容');
             closeModal();
             await loadVdDetail();
             await loadStatus();
@@ -841,12 +1376,12 @@ function renderPhysicalDisks(st) {
 
   // 清理勾选集合中已不存在或已变为不可勾选的磁盘
   const eligibleKeys = new Set(
-    disks.filter(pdRaidEligible).map(d => d.eid + ':' + d.slot)
+    disks.filter(pdRaidEligible).map(diskKey)
   );
   Array.from(state.raidSel).forEach(k => { if (!eligibleKeys.has(k)) state.raidSel.delete(k); });
 
   if (!disks.length) {
-    tb.innerHTML = '<tr><td colspan="14" class="muted">无物理磁盘</td></tr>';
+    tb.innerHTML = '<tr><td colspan="15" class="muted">无物理磁盘</td></tr>';
     updateRaidBar();
     return;
   }
@@ -859,9 +1394,10 @@ function renderPhysicalDisks(st) {
     if (Number(d.predictive_failure) > 0) alerts.push('<span class="badge warn">PF</span>');
     if (Number(d.shield_counter) > 0) alerts.push('<span class="badge warn">Shield</span>');
     const eligible = pdRaidEligible(d);
-    const key = d.eid + ':' + d.slot;
+    const key = diskKey(d);
     tr.innerHTML = `
       <td class="admin-col ${hideSel ? 'col-hidden' : ''}"></td>
+      <td class="num">${esc('C' + bayCtrl(d))}</td>
       <td class="num">${esc(d.label || ('E' + d.eid + ':S' + d.slot))}${d.locate ? '<span class="locate-dot" title="定位灯已开启"></span>' : ''}</td>
       <td>${esc(d.model || '—')}</td>
       <td class="num">${esc(d.sn || '—')}</td>
@@ -885,7 +1421,21 @@ function renderPhysicalDisks(st) {
         ? '勾选后可参与创建阵列'
         : '该磁盘已加入阵列或状态不允许，禁止勾选';
       cb.addEventListener('change', () => {
-        if (cb.checked) state.raidSel.add(key); else state.raidSel.delete(key);
+        if (cb.checked) {
+          // 一个阵列的成员盘必须同属一张控制器：跨卡选择在硬件上不成立，
+          // 在勾选时就拦住，不要等到提交才报错
+          const picked = state.raidSel.size
+            ? parseDiskKey(Array.from(state.raidSel)[0])[0]
+            : bayCtrl(d);
+          if (bayCtrl(d) !== picked) {
+            cb.checked = false;
+            toast(`一个阵列只能使用同一张 RAID 卡上的磁盘（已选 C${picked}，本盘在 C${bayCtrl(d)}）`, 'error');
+            return;
+          }
+          state.raidSel.add(key);
+        } else {
+          state.raidSel.delete(key);
+        }
         updateRaidBar();
       });
       selCell.appendChild(cb);
@@ -984,7 +1534,7 @@ function diskAction(d, action) {
   const [text, desc] = DISK_ACTION_TEXT[action] || [action, ''];
   const label = d.label || ('E' + d.eid + ':S' + d.slot);
   const doIt = async (extraBody) => {
-    const r = await api('/api/disk_action', { method: 'POST', body: { eid: d.eid, slot: d.slot, action, ...(extraBody || {}) } });
+    const r = await api('/api/disk_action', { method: 'POST', body: { ctrl: bayCtrl(d), eid: d.eid, slot: d.slot, action, ...(extraBody || {}) } });
     if (r && r.ok === false) throw new Error(r.error || '操作失败');
     toast(`磁盘 ${label}：${text} 已执行`, 'ok');
     await loadStatus();
@@ -1037,9 +1587,9 @@ function diskAction(d, action) {
         const typed = ($('#erase-confirm').value || '').trim();
         if (typed !== label) throw new Error(`请输入正确的盘位标识 "${label}"`);
         if (!$('#erase-ack').checked) throw new Error('请先勾选风险确认');
-        const r = await api('/api/disk_erase', { method: 'POST', body: { eid: d.eid, slot: d.slot, pattern, confirm: label, acknowledge: true } });
+        const r = await api('/api/disk_erase', { method: 'POST', body: { ctrl: bayCtrl(d), eid: d.eid, slot: d.slot, pattern, confirm: label, acknowledge: true } });
         if (r && r.ok === false) throw new Error(r.error || '启动擦除失败');
-        toast(`磁盘 ${label}：安全擦除已启动`, 'ok');
+        notifyTaskSubmitted(r, `磁盘 ${label} 安全擦除`);
         await loadStatus();
       });
     return;
@@ -1106,15 +1656,19 @@ function createRaid() {
   const disks = (state.status && state.status.physical_disks) || [];
   const chosen = [];
   for (const key of state.raidSel) {
-    const [eid, slot] = key.split(':').map(Number);
-    const d = disks.find(x => Number(x.eid) === eid && Number(x.slot) === slot);
+    const [ckey, eid, slot] = parseDiskKey(key);
+    const d = disks.find(
+      x => bayCtrl(x) === ckey && Number(x.eid) === eid && Number(x.slot) === slot
+    );
     if (!d || !pdRaidEligible(d)) {
-      toast(`磁盘 E${eid}:S${slot} 状态已变化，请重新勾选`, 'error');
+      toast(`磁盘 C${ckey}:E${eid}:S${slot} 状态已变化，请重新勾选`, 'error');
       return;
     }
     chosen.push(d);
   }
-  chosen.sort((a, b) => (a.eid - b.eid) || (a.slot - b.slot));
+  chosen.sort(
+    (a, b) => (bayCtrl(a) - bayCtrl(b)) || (a.eid - b.eid) || (a.slot - b.slot)
+  );
 
   const rows = chosen.map(d =>
     `<li><strong class="mono">${esc(d.label || ('E' + d.eid + ':S' + d.slot))}</strong>
@@ -1129,11 +1683,11 @@ function createRaid() {
         body: {
           level,
           name,
-          drives: chosen.map(d => ({ eid: d.eid, slot: d.slot })),
+          drives: chosen.map(d => ({ ctrl: bayCtrl(d), eid: d.eid, slot: d.slot })),
         },
       });
       if (r && r.ok === false) throw new Error(r.error || '创建失败');
-      toast(`RAID${level} 阵列创建成功`, 'ok');
+      notifyTaskSubmitted(r, `RAID${level} 阵列创建`);
       state.raidSel.clear();
       $('#raid-name').value = '';
       await loadStatus();
@@ -1301,14 +1855,14 @@ async function loadEvents() {
   try {
     data = await api(`/api/events?level=${state.evLevel}&page=${state.evPage}&page_size=${state.evPageSize}`);
   } catch (e) {
-    $('#event-list').innerHTML = `<div class="loading-line">加载失败：${esc(e.message)}</div>`;
+    $('#event-list').innerHTML = stateFromError(e);
     return;
   }
   state.evTotal = data.total || 0;
   const list = $('#event-list');
   const events = data.events || [];
   if (!events.length) {
-    list.innerHTML = '<div class="loading-line">暂无事件</div>';
+    list.innerHTML = stateBlock('empty', '暂无事件记录', '设备运行正常时，这里会保持空白。');
   } else {
     list.innerHTML = events.map((ev, i) => {
       const lv = String(ev.level || 'info').toLowerCase();
@@ -1511,7 +2065,7 @@ async function loadSmart() {
   const btn = $('#btn-smart');
   btnLoading(btn, true);
   try {
-    const r = await api(`/api/disk_smart?eid=${encodeURIComponent(d.eid)}&slot=${encodeURIComponent(d.slot)}`);
+    const r = await api(`/api/disk_smart?ctrl=${encodeURIComponent(bayCtrl(d))}&eid=${encodeURIComponent(d.eid)}&slot=${encodeURIComponent(d.slot)}`);
     state.smartData = r;
     renderSmart(r);
   } catch (e) {
@@ -1590,7 +2144,7 @@ async function loadStorage() {
   tb.innerHTML = '<tr><td colspan="5" class="muted">加载中…</td></tr>';
   let data;
   try { data = await api('/api/storage/devices'); }
-  catch (e) { tb.innerHTML = `<tr><td colspan="5" class="muted">加载失败：${esc(e.message)}</td></tr>`; return; }
+  catch (e) { tb.innerHTML = `<tr><td colspan="5">${stateFromError(e)}</td></tr>`; return; }
   tb.innerHTML = '';
   const devices = data.devices || [];
   if (!devices.length) { tb.innerHTML = '<tr><td colspan="5" class="muted">未发现块设备</td></tr>'; return; }
@@ -1760,18 +2314,21 @@ function formatDevice(dev) {
 async function loadUsers() {
   $('#users-warning').classList.toggle('hidden', state.authRequired);
   const tb = $('#users-table tbody');
-  tb.innerHTML = '<tr><td colspan="3" class="muted">加载中…</td></tr>';
+  tb.innerHTML = '<tr><td colspan="4" class="muted">加载中…</td></tr>';
   let data;
   try { data = await api('/api/users'); }
-  catch (e) { tb.innerHTML = `<tr><td colspan="3" class="muted">加载失败：${esc(e.message)}</td></tr>`; return; }
+  catch (e) { tb.innerHTML = `<tr><td colspan="4">${stateFromError(e)}</td></tr>`; return; }
   tb.innerHTML = '';
   const users = data.users || [];
-  if (!users.length) { tb.innerHTML = '<tr><td colspan="3" class="muted">暂无用户</td></tr>'; return; }
+  fillRoleSelect();
+  if (!users.length) { tb.innerHTML = '<tr><td colspan="4">' + stateBlock('empty', '还没有本地用户', '当前未启用登录认证，任何人都能访问。建议立即创建第一个管理员。', '', true) + '</td></tr>'; return; }
   users.forEach(u => {
     const tr = document.createElement('tr');
+    const info = ROLE_INFO[u.role] || ROLE_INFO.viewer;
     tr.innerHTML = `
       <td>${esc(u.username)}</td>
-      <td><span class="badge ${u.role === 'admin' ? 'info' : ''}">${u.role === 'admin' ? '管理员' : '只读用户'}</span></td>
+      <td><span class="badge ${u.role === 'admin' ? 'info' : u.role === 'operator' ? 'ok' : u.role === 'auditor' ? 'warn' : ''}">${esc(info.name)}</span></td>
+      <td class="tiny">${esc(info.perms)}</td>
       <td class="ops"></td>`;
     const ops = tr.querySelector('.ops');
     const rp = document.createElement('button');
@@ -1907,7 +2464,10 @@ function bayProgress(d) {
 const BAY_SPECS = [
   { bays: 8, u: '2U', uHeight: 220 },
   { bays: 12, u: '2U', uHeight: 220 },
-  { bays: 16, u: '4U', uHeight: 440 },
+  // 16 槽压制到 2U：4 排托盘各压扁一档，整体高度和 8/12 槽是同一量级。
+  // 之前按 4U 算，面板直接翻倍到 730px 高——盘位多不等于机箱高，
+  // 2U 的 16 盘位背板本来就是靠把托盘压扁来塞下 4 排的。
+  { bays: 16, u: '2U', uHeight: 220 },
   { bays: 20, u: '5U', uHeight: 550 },
   { bays: 24, u: '4U', uHeight: 440 },
 ];
@@ -1921,13 +2481,74 @@ function autoBaySpec(count) {
   return BAY_SPECS.find(s => s.bays >= target) || BAY_SPECS[BAY_SPECS.length - 1];
 }
 
+/* ---------- 机箱背板（SES）实测数据 ----------
+
+   盘位面板以前只能按"用户选的机箱规格"画：机器到底有几个槽位是猜的。
+   SES 能给出背板的真实槽位表，所以：
+
+   * 规格选「自动」时，盘位数按背板实测走，而不是按已装盘数凑一个最小值；
+   * 每块盘按自己的物理槽位号取真实指示灯状态；
+   * 当面板槽位数与背板一致时，空槽也能对上物理位置，
+     于是"背板看见盘、控制器没认到"能在正确的槽位上亮出来。
+   * 用户显式选了规格就以用户的为准——那是他的显式选择，
+     但不能默默无语：规格与背板不一致时给出提示和一键对齐。 */
+let _ses = null;
+let _sesPromise = null;
+
+function ensureSes() {
+  if (_sesPromise) return _sesPromise;
+  _sesPromise = api('/api/enclosure')
+    .then(d => {
+      _ses = d && d.available ? d : null;
+      return _ses;
+    })
+    .catch(() => {
+      _ses = null;
+      return null;
+    });
+  return _sesPromise;
+}
+
+function sesSlotCount() {
+  const t = (_ses && _ses.totals) || null;
+  return t && t.slots ? Number(t.slots) : 0;
+}
+
+function sesSlotMap() {
+  const encs = (_ses && _ses.enclosures) || [];
+  // 多背板时槽位号会在每个背板内重复，而面板不知道盘属于哪个背板，
+  // 硬按槽位号合并会把两块背板对错——宁可不合并。
+  if (encs.length !== 1) return {};
+  const out = {};
+  (encs[0].slots || []).forEach(s => { out[Number(s.slot)] = s; });
+  return out;
+}
+
 function bayKey(d) {
-  return d.eid + ':' + d.slot;
+  return bayCtrl(d) + ':' + d.eid + ':' + d.slot;
+}
+
+/* 磁盘所属控制器编号。旧数据没有 ctrl 字段时按 0 处理。 */
+function bayCtrl(d) {
+  const c = Number(d && d.ctrl);
+  return Number.isFinite(c) ? c : 0;
+}
+
+/* 磁盘在界面上的唯一键。必须带控制器编号：两张 RAID 卡的
+   eid/slot 会重复，只用 eid:slot 会选错卡上的盘。 */
+function diskKey(d) {
+  return bayCtrl(d) + ':' + d.eid + ':' + d.slot;
+}
+
+/* 把 diskKey / bayKey 拆回 [ctrl, eid, slot] */
+function parseDiskKey(key) {
+  return String(key).split(':').map(Number);
 }
 
 function loadBayLayout() {
   try {
-    state.bayLayout = JSON.parse(localStorage.getItem('lsi-bay-layout') || '{}');
+    // v2：托盘键加入控制器编号，旧排版无法安全沿用，直接重置
+    state.bayLayout = JSON.parse(localStorage.getItem('lsi-bay-layout-v2') || '{}');
   } catch (e) {
     state.bayLayout = {};
   }
@@ -1935,12 +2556,12 @@ function loadBayLayout() {
 
 function saveBayLayout() {
   try {
-    localStorage.setItem('lsi-bay-layout', JSON.stringify(state.bayLayout));
+    localStorage.setItem('lsi-bay-layout-v2', JSON.stringify(state.bayLayout));
   } catch (e) { /* 忽略 */ }
 }
 
-function arrangeDisks(list, capacity, eid) {
-  const key = String(eid);
+function arrangeDisks(list, capacity, groupKey) {
+  const key = String(groupKey);
   const slots = new Array(capacity).fill(null);
   const byKey = {};
   list.forEach(d => { byKey[bayKey(d)] = d; });
@@ -1988,7 +2609,10 @@ function switchBcacheHitPeriod(uuid, period, btn) {
 }
 
 function onTrayDragStart(ev) {
-  _dragState = { eid: ev.currentTarget.dataset.eid, idx: Number(ev.currentTarget.dataset.idx) };
+  _dragState = {
+    group: ev.currentTarget.dataset.groupKey,
+    idx: Number(ev.currentTarget.dataset.idx),
+  };
   ev.dataTransfer.effectAllowed = 'move';
   try { ev.dataTransfer.setData('text/plain', ''); } catch (e) { /* 忽略 */ }
   ev.currentTarget.classList.add('dragging');
@@ -2008,12 +2632,12 @@ function onTrayDrop(ev) {
   ev.preventDefault();
   ev.currentTarget.classList.remove('drop-target');
   if (!_dragState) return;
-  const srcEid = _dragState.eid;
+  const srcGroup = _dragState.group;
   const srcIdx = _dragState.idx;
-  const dstEid = ev.currentTarget.dataset.eid;
+  const dstGroup = ev.currentTarget.dataset.groupKey;
   const dstIdx = Number(ev.currentTarget.dataset.idx);
-  if (srcEid !== dstEid || srcIdx === dstIdx) return;
-  moveBay(String(srcEid), srcIdx, dstIdx);
+  if (srcGroup !== dstGroup || srcIdx === dstIdx) return;
+  moveBay(String(srcGroup), srcIdx, dstIdx);
 }
 
 function onTrayDragEnd(ev) {
@@ -2022,21 +2646,92 @@ function onTrayDragEnd(ev) {
   $$('.drop-target').forEach(el => el.classList.remove('drop-target'));
 }
 
-function moveBay(eid, from, to) {
+/* 机箱是物理设备，一台机器只有一个前面板。
+   机器里可以插多张 RAID 卡，但盘位属于机箱：控制器只是每块盘的一个
+   属性（显示在托盘上），不能按卡把前面板拆成多个。 */
+const MACHINE_GROUP = 'machine';
+
+const TONE_RANK = { ok: 0, unknown: 1, warn: 2, crit: 3 };
+
+/* 多控制器场景下取最严重的一个色调：一张卡正常不能掩盖另一张卡异常 */
+function worstTone(values, fallback) {
+  let worst = fallback || 'ok';
+  (values || []).forEach(v => {
+    const t = ctrlHealthTone(v);
+    if ((TONE_RANK[t] || 0) > (TONE_RANK[worst] || 0)) worst = t;
+  });
+  return worst;
+}
+
+/* 整机盘位顺序：控制器 → 机箱 → 槽位 */
+function machineDiskList(st) {
+  return (st.physical_disks || []).slice().sort((a, b) =>
+    (bayCtrl(a) - bayCtrl(b)) ||
+    (Number(a.eid) - Number(b.eid)) ||
+    (Number(a.slot) - Number(b.slot))
+  );
+}
+
+/* 真实 19" 机箱的盘位比例。
+   机箱内宽 482.6mm，每行 4 个盘位 → 盘位面宽 120.65mm；
+   行高 = 机箱高度(u × 44.45mm) ÷ 行数。
+   由这个比例反推盘位高度，面板变宽时整体等比放大，
+   而不是把盘位横向拉成细长条。 */
+const RACK_INNER_MM = 482.6;
+const U_MM = 44.45;
+
+function bayAspect(spec) {
+  const rows = Math.max(1, spec.bays / 4);
+  // spec.u 形如 '2U'/'4U'，必须取数字部分：
+  // Number('2U') 是 NaN，会让 aspect-ratio 整条声明失效。
+  const uCount = parseInt(spec.u, 10) || 2;
+  const rowHeightMm = (uCount * U_MM) / rows;
+  return (RACK_INNER_MM / 4) / rowHeightMm;
+}
+
+/* 计算整机盘位规划。盘数超过所选机箱规格时自动扩档，
+   否则多出来的盘会直接消失（用户只会在别的页面发现盘少了）。 */
+function machineBayPlan(st) {
+  const list = machineDiskList(st);
+  const explicit = state.bayCapacity && state.bayCapacity !== 'auto';
+  let spec = explicit ? baySpecFor(Number(state.bayCapacity)) : null;
+  let fromSes = false;
+  if (!spec) {
+    // 「自动」= 让系统决定。背板实测能给出真实槽位数，比按已装盘数
+    // 倒推一个最小值准确得多，所以优先用它。
+    const sesBays = sesSlotCount();
+    const sesSpec = sesBays ? baySpecFor(sesBays) : null;
+    if (sesSpec) {
+      spec = sesSpec;
+      fromSes = true;
+    }
+  }
+  if (!spec) spec = autoBaySpec(list.length);
+  let capacity = spec.bays;
+  let expanded = false;
+  if (list.length > capacity) {
+    spec = autoBaySpec(list.length);
+    capacity = spec.bays;
+    expanded = true;
+  }
+  return {
+    list, spec, capacity, expanded,
+    fromSes,
+    // 槽位数来自背板时不能声称是哪个 U —— SES 只知道槽位，不知道机箱高度。
+    uLabel: fromSes ? '背板实测' : spec.u,
+    explicitSpec: explicit ? Number(state.bayCapacity) : null,
+  };
+}
+
+function moveBay(groupKey, from, to) {
   const st = state.status;
-  const disks = (st.physical_disks || [])
-    .filter(d => String(d.eid) === String(eid))
-    .sort((a, b) => Number(a.slot) - Number(b.slot));
-  const spec = state.bayCapacity && state.bayCapacity !== 'auto'
-    ? baySpecFor(Number(state.bayCapacity)) || autoBaySpec(disks.length)
-    : autoBaySpec(disks.length);
-  const capacity = spec.bays;
-  const slots = arrangeDisks(disks, capacity, eid);
+  const plan = machineBayPlan(st);
+  const slots = arrangeDisks(plan.list, plan.capacity, groupKey);
   if (from < 0 || from >= slots.length || to < 0 || to >= slots.length || !slots[from]) return;
   const moved = slots[from];
   slots[from] = slots[to];
   slots[to] = moved;
-  state.bayLayout[String(eid)] = slots.map(d => (d ? bayKey(d) : null));
+  state.bayLayout[String(groupKey)] = slots.map(d => (d ? bayKey(d) : null));
   saveBayLayout();
   renderEnclosures();
 }
@@ -2050,16 +2745,18 @@ async function renderEnclosures() {
       st = await api('/api/status');
       state.status = st;
     } catch (e) {
-      wrap.innerHTML = `<div class="muted">加载失败：${esc(e.message)}</div>`;
+      wrap.innerHTML = stateFromError(e);
       return;
     }
   }
   const disks = st.physical_disks || [];
   const ctrl = st.controller || {};
   loadBayLayout();
+  // 背板数据要先拿到：盘位数与槽位对齐都依赖它。
+  await ensureSes();
   wrap.innerHTML = '';
   if (!disks.length) {
-    wrap.innerHTML = '<div class="muted">暂无磁盘数据</div>';
+    wrap.innerHTML = stateBlock('empty', '没有物理磁盘', '控制器没有报告任何物理盘；刚插入的盘通常要等下一轮采集。');
     return;
   }
 
@@ -2073,27 +2770,80 @@ async function renderEnclosures() {
     renderEnclosures();
   });
 
-  const groups = {};
-  disks.forEach(d => {
-    const eid = String(d.eid);
-    (groups[eid] || (groups[eid] = [])).push(d);
-  });
+  // 一台机器一个前面板：盘位属于机箱，控制器只是每块盘的属性。
+  const plan = machineBayPlan(st);
+  const list = plan.list;
+  const capacity = plan.capacity;
+  const uLabel = plan.uLabel;
+  const groupKey = MACHINE_GROUP;
+  const placed = arrangeDisks(list, capacity, groupKey);
+  const controllers = ctrlListOf(st);
 
-  Object.keys(groups).sort((a, b) => Number(a) - Number(b)).forEach(eid => {
-    const list = groups[eid].slice().sort((a, b) => Number(a.slot) - Number(b.slot));
-    const spec = state.bayCapacity && state.bayCapacity !== 'auto'
-      ? baySpecFor(Number(state.bayCapacity)) || autoBaySpec(list.length)
-      : autoBaySpec(list.length);
-    const capacity = spec.bays;
-    const uLabel = spec.u;
-    const rows = capacity / 4;
-    const gap = 14;
-    const trayH = Math.max(64, Math.floor((spec.uHeight - (rows - 1) * gap) / rows));
-    const placed = arrangeDisks(list, capacity, eid);
-    const ctrlTone = stateTone(ctrl.health) === 'crit' ? 'crit' : stateTone(ctrl.health) === 'warn' ? 'warn' : 'ok';
-    const bbuTone = stateTone(ctrl.bbu_state) === 'crit' ? 'crit' : stateTone(ctrl.bbu_state) === 'warn' ? 'warn' : 'ok';
-    const healthText = HEALTH_TEXT[st.health] || st.health || '未知';
-    const rocText = ctrl.roc_temp != null ? ctrl.roc_temp + '°C' : '—';
+  // 背板视角：真实槽位表，以及"背板看见盘、控制器没认到"的槽位集合
+  const sesMap = sesSlotMap();
+  const sesBays = sesSlotCount();
+  const sesTotals = (_ses && _ses.totals) || {};
+  const sesAligned = sesBays > 0 && sesBays === capacity;
+  const ctrlSlots = new Set(list.map(d => Number(d.slot)));
+  const ghostSlots = new Set();
+  if (sesAligned) {
+    Object.values(sesMap).forEach(s => {
+      if (s.installed && !ctrlSlots.has(Number(s.slot))) ghostSlots.add(Number(s.slot));
+    });
+  }
+  const sesFoot = sesBays
+    ? (plan.fromSes ? '' : ` · 背板实测 ${sesBays} 槽 / 已插 ${sesTotals.installed || 0}`)
+      + (sesTotals.faults ? ` · 背板 ${sesTotals.faults} 个故障灯` : '')
+    : '';
+
+  // 显式选了规格但和背板对不上时，提示并给一键对齐。
+  // 不静默改用户的选择，但也不能让"面板画 8 个槽、机器其实有 16 个"
+  // 这种偏差一直藏着。
+  if (sesBays && plan.explicitSpec && plan.explicitSpec !== sesBays && baySpecFor(sesBays)) {
+    const hint = document.createElement('span');
+    hint.className = 'tiny';
+    hint.innerHTML = `背板实测 <strong>${sesBays}</strong> 槽，当前规格 <strong>${plan.explicitSpec}</strong> 槽——`
+      + `空槽位置无法与硬件对应。<button class="btn sm" id="btn-bay-align" type="button">按背板对齐</button>`;
+    tools.appendChild(hint);
+    hint.querySelector('#btn-bay-align').addEventListener('click', () => {
+      state.bayCapacity = String(sesBays);
+      const sel = $('#bay-capacity');
+      if (sel) sel.value = String(sesBays);
+      renderEnclosures();
+    });
+  }
+  if (sesBays && sesAligned && !plan.explicitSpec) {
+    const hint = document.createElement('span');
+    hint.className = 'tiny';
+    hint.textContent = `盘位数取自背板实测（${sesBays} 槽）；可在「机箱规格」中手动指定。`;
+    tools.appendChild(hint);
+  }
+
+  const ctrlTone = worstTone(controllers.map(c => c.health), 'ok');
+  const bbuTone = worstTone(controllers.map(c => c.bbu_state), 'ok');
+  const healthText = HEALTH_TEXT[st.health] || st.health || '未知';
+  const rocText = controllers
+    .filter(c => c.roc_temp != null)
+    .map(c => `C${c.ctrl} ${c.roc_temp}°`)
+    .join(' / ') || '—';
+  const models = [...new Set(controllers.map(c => c.model).filter(Boolean))];
+  const modelText = models.length === 0
+    ? 'Controller'
+    : models.length === 1
+      ? `${controllers.length} × ${models[0]}`
+      : models.join(' / ');
+  const perCtrl = new Map();
+  list.forEach(d => {
+    const c = bayCtrl(d);
+    perCtrl.set(c, (perCtrl.get(c) || 0) + 1);
+  });
+  // 空的控制器也要列出来（C0 ×0）：一台机器上装了卡却没接盘，
+  // 是运维需要知道的状态，不能因为没有盘就从面板上消失。
+  const ctrlSummary = controllers
+    .map(c => `C${c.ctrl} ×${perCtrl.get(Number(c.ctrl)) || 0}`)
+    .join(' · ') || '—';
+
+  {
     const view = document.createElement('div');
     view.className = 'chassis-view';
     view.innerHTML = `
@@ -2107,8 +2857,8 @@ async function renderEnclosures() {
         <div class="chassis-top">
           <div class="chassis-brand">
             <span class="chassis-name">DataMax-LSI</span>
-            <span class="chassis-model">${esc(ctrl.model || 'Controller')} · FW ${esc(ctrl.fw || '—')}</span>
-            <span class="chassis-asset">${esc(st.host || '')} · Enclosure ${esc(eid)}</span>
+            <span class="chassis-model">${esc(modelText)}</span>
+            <span class="chassis-asset">${esc(st.host || '')} · ${esc(ctrlSummary)}</span>
           </div>
           <div class="chassis-status">
             <span class="status-cell"><span class="panel-led led-power"></span>PWR</span>
@@ -2120,40 +2870,67 @@ async function renderEnclosures() {
         <div class="chassis-screen screen-${esc(st.health || 'unknown')}" aria-hidden="true">${esc(healthText)} · ROC ${esc(rocText)}</div>
         <div class="bay-rack"></div>
         <div class="chassis-foot">
-          <span class="panel-label">Enclosure ${esc(eid)} · ${uLabel} · ${capacity} 盘位 · 已装 ${list.length}</span>
+          <span class="panel-label">${uLabel} · ${capacity} 盘位 · 已装 ${list.length}${plan.expanded ? '（按盘数自动升档）' : ''}${sesFoot}</span>
           <span class="chassis-vents"></span>
         </div>
       </div>`;
     const rack = view.querySelector('.bay-rack');
-    rack.style.setProperty('--tray-h', trayH + 'px');
+    rack.style.setProperty('--tray-aspect', bayAspect(plan.spec).toFixed(3));
     for (let i = 0; i < capacity; i++) {
       const d = placed[i];
       const tray = document.createElement('button');
       tray.type = 'button';
-      tray.dataset.eid = eid;
+      tray.dataset.groupKey = groupKey;
       tray.dataset.idx = String(i);
       if (!d) {
-        tray.className = 'tray tray-empty';
-        tray.disabled = true;
-        tray.innerHTML = `<span class="tray-slot">空槽</span>`;
+        // 面板槽位数与背板一致时，显示序号就是物理槽号，可以把
+        // "背板看见盘、控制器没认到"标在正确的槽位上。
+        const ses = sesAligned ? sesMap[i] : null;
+        if (ses && ghostSlots.has(i)) {
+          tray.className = 'tray tray-ses-ghost';
+          tray.title = `槽位 ${i}：背板报告已插盘，但 RAID 控制器没有识别到这块盘。`
+            + '常见原因是背板到卡的链路接触不良、盘未上电，或盘刚插入尚未枚举。';
+          tray.innerHTML = `
+            <span class="tray-handle"></span>
+            <span class="tray-led"></span>
+            <span class="tray-meta">
+              <span class="tray-slot">#${i}</span>
+              <span class="tray-model">背板有盘 · 控制器未识别</span>
+            </span>
+            <span class="tray-state">未识别</span>`;
+        } else {
+          tray.className = 'tray tray-empty';
+          tray.disabled = true;
+          tray.innerHTML = `<span class="tray-slot">${sesAligned ? '#' + i : '空槽'}</span>`;
+        }
       } else {
         const tone = diskVisualTone(d);
         const hs = isHotSpare(d);
         const prog = bayProgress(d);
-        tray.className = 'tray tray-' + tone + (hs ? ' tray-hs' : '') + (d.locate ? ' tray-locate' : '');
+        const ses = sesMap[Number(d.slot)];
+        const sesFault = !!(ses && ses.fault);
+        tray.className = 'tray tray-' + tone + (hs ? ' tray-hs' : '')
+          + ((d.locate || (ses && ses.locate)) ? ' tray-locate' : '')
+          + (sesFault ? ' tray-ses-fault' : '');
         const stateText = (hs ? '热备 · ' : '') + (d.state || '—');
         const tempText = d.temperature != null ? d.temperature + '°C' : '—';
         tray.innerHTML = `
           <span class="tray-handle"></span>
           <span class="tray-led"></span>
           <span class="tray-meta">
-            <span class="tray-slot">${esc(d.label)}</span>
+            <span class="tray-slot">${esc(d.label)}<span class="tray-ctrl" title="所属 RAID 控制器">C${bayCtrl(d)}</span></span>
             <span class="tray-model">${esc(d.model || '—')}</span>
           </span>
           <span class="tray-temp">${tempText}</span>
-          <span class="tray-state">${esc(stateText)}</span>
+          <span class="tray-state">${esc(stateText)}${sesFault ? '<span class="tray-ses-badge" title="背板故障灯亮">SES 故障</span>' : ''}</span>
           ${prog ? `<span class="tray-progress"><i style="width:${prog.pct}%;background:${prog.color}"></i></span>` : ''}`;
-        tray.title = `${d.model || '—'} · ${d.sn || '—'} · ${d.state || '—'} · ${tempText}`;
+        tray.title = `${d.model || '—'} · ${d.sn || '—'} · ${d.state || '—'} · ${tempText}`
+          + (ses
+            ? `\n背板槽位 #${ses.slot}：${ses.status}`
+              + ` · 供电 ${ses.power_status || '—'}`
+              + ` · 故障灯 ${ses.fault ? '亮' : '灭'}`
+              + ` · 定位灯 ${ses.locate ? '亮' : '灭'}`
+            : '');
         tray.draggable = true;
         tray.addEventListener('dragstart', onTrayDragStart);
         tray.addEventListener('dragend', onTrayDragEnd);
@@ -2165,7 +2942,102 @@ async function renderEnclosures() {
       rack.appendChild(tray);
     }
     wrap.appendChild(view);
+  }
+  renderBaySide(st, capacityTotal(plan));
+}
+
+function capacityTotal(plan) {
+  return { capacity: plan.capacity, u: plan.uLabel, filled: plan.list.length };
+}
+
+/* 前面板旁边的机器级信息。
+
+   面板本身要限制宽度（盘位不能无限放大），空出来的横向空间就用来放
+   "一眼要看的数据"——盘位占用、状态分布、温度、容量、控制器。这些内容
+   原来分散在别的卡片里，放在面板旁边反而是它们最该出现的位置。 */
+function renderBaySide(st, plan) {
+  const box = $('#bay-side');
+  if (!box) return;
+  const disks = st.physical_disks || [];
+  const ctrls = ctrlListOf(st);
+  const vds = st.virtual_disks || [];
+  const degraded = vds.filter(v => String(v.state || '').toLowerCase() !== 'optl').length;
+  const cap = plan.capacity || 0;
+  const filled = disks.length;
+  const temps = disks.map(d => d.temperature).filter(t => typeof t === 'number');
+  const avg = temps.length ? (temps.reduce((a, b) => a + b, 0) / temps.length) : null;
+
+  // 盘位状态分布：按可视化面板的口径归类，和面板上的颜色一一对应
+  const buckets = { 正常: 0, 关注: 0, 严重: 0, 热备: 0 };
+  disks.forEach(d => {
+    const tone = diskVisualTone(d);
+    const hs = isHotSpare(d);
+    if (hs) buckets['热备'] += 1;
+    else if (tone === 'crit') buckets['严重'] += 1;
+    else if (tone === 'warn') buckets['关注'] += 1;
+    else buckets['正常'] += 1;
   });
+  const empty = Math.max(0, cap - filled);
+  const maxN = Math.max(1, filled, empty);
+
+  const sizeGB = disks.reduce((a, d) => {
+    const m = String(d.size || '').match(/([\d.]+)\s*GB/i);
+    return a + (m ? parseFloat(m[1]) : 0);
+  }, 0);
+
+  const row = (label, n, cls) => `<div class="bay-dist-row">
+      <span>${esc(label)}</span>
+      <span class="bay-dist-bar"><i class="${cls}" style="width:${Math.round((n / maxN) * 100)}%"></i></span>
+      <span class="bay-dist-val">${n}</span>
+    </div>`;
+
+  box.innerHTML = `
+    <div class="bay-stat-grid">
+      <div class="bay-stat">
+        <div class="k">盘位占用</div>
+        <div class="v">${filled} / ${cap}</div>
+        <div class="s">空槽 ${empty} 个</div>
+      </div>
+      <div class="bay-stat">
+        <div class="k">已装容量</div>
+        <div class="v">${sizeGB >= 1000 ? (sizeGB / 1000).toFixed(2) + 'T' : Math.round(sizeGB) + 'G'}</div>
+        <div class="s">${disks.length} 块物理盘</div>
+      </div>
+      <div class="bay-stat">
+        <div class="k">磁盘均温</div>
+        <div class="v">${avg != null ? avg.toFixed(1) + '°' : '—'}</div>
+        <div class="s">${temps.length ? `最高 ${Math.max.apply(null, temps)}°C` : '无温度数据'}</div>
+      </div>
+      <div class="bay-stat">
+        <div class="k">阵列</div>
+        <div class="v">${esc(vds.length)}</div>
+        <div class="s">${degraded ? degraded + ' 个非最优' : '全部正常'}</div>
+      </div>
+    </div>
+
+    <div class="bay-sec">
+      <div class="bay-side-sec-title">盘位状态分布</div>
+      <div class="bay-dist">
+        ${row('正常', buckets['正常'], '')}
+        ${row('关注', buckets['关注'], 'warn')}
+        ${row('严重', buckets['严重'], 'crit')}
+        ${row('热备', buckets['热备'], 'hs')}
+        ${row('空槽', empty, 'empty')}
+      </div>
+    </div>
+
+    <div class="bay-sec">
+      <div class="bay-side-sec-title">控制器</div>
+      ${ctrls
+        .map(
+          c => `<div class="bay-ctrl-row">
+          <span class="bay-ctrl-id">C${esc(c.ctrl)}</span>
+          <span class="bay-ctrl-model" title="${esc(c.model || '')}">${esc((c.model || '').replace(/^AVAGOMegaRAID/, 'MegaRAID '))}</span>
+          <span class="tiny mono">${c.roc_temp != null ? esc(c.roc_temp) + '°C' : '—'}</span>
+        </div>`
+        )
+        .join('') || '<div class="muted tiny">无控制器数据</div>'}
+    </div>`;
 }
 
 async function loadLedger() {
@@ -2175,12 +3047,12 @@ async function loadLedger() {
   try {
     data = await api('/api/disk_ledger');
   } catch (e) {
-    tb.innerHTML = `<tr><td colspan="12" class="muted">加载失败：${esc(e.message)}</td></tr>`;
+    tb.innerHTML = `<tr><td colspan="12">${stateFromError(e)}</td></tr>`;
     return;
   }
   const rows = data.disks || [];
   if (!rows.length) {
-    tb.innerHTML = '<tr><td colspan="12" class="muted">暂无磁盘数据</td></tr>';
+    tb.innerHTML = '<tr><td colspan="12">' + stateBlock('empty', '没有物理磁盘', '控制器未报告任何磁盘。', '', true) + '</td></tr>';
     return;
   }
   tb.innerHTML = rows.map(r => {
@@ -2209,7 +3081,7 @@ async function loadReport() {
   try {
     data = await api('/api/report/summary');
   } catch (e) {
-    wear.innerHTML = `<div class="muted">加载失败：${esc(e.message)}</div>`;
+    wear.innerHTML = stateFromError(e);
     life.innerHTML = '<div class="muted">加载失败</div>';
     return;
   }
@@ -2221,7 +3093,7 @@ async function loadReport() {
         <span class="rank-metrics">重映射 ${esc(x.reallocated)} · 待定 ${esc(x.pending)} · 无法纠正 ${esc(x.uncorrectable)}</span>
         ${levelBadge(x.predict_level)}
       </div>`).join('')
-    : '<div class="muted">暂无磨损数据</div>';
+    : stateBlock('empty', '暂无磨损数据', '尚未采到 SMART 属性，等待下一轮采集。');
 
   const lifeRows = data.lifetime_top || [];
   life.innerHTML = lifeRows.length
@@ -2230,7 +3102,7 @@ async function loadReport() {
         <span class="rank-sub">${esc(x.model || '—')}</span>
         <span class="rank-metrics">${esc(x.power_on_hours)} 小时 · ${esc(x.power_on_days)} 天</span>
       </div>`).join('')
-    : '<div class="muted">暂无通电时长数据</div>';
+    : stateBlock('empty', '暂无通电时长数据', '磁盘尚未回报 Power On Hours。');
 }
 
 async function loadReplacements() {
@@ -2240,7 +3112,7 @@ async function loadReplacements() {
   try {
     data = await api('/api/disk_ledger');
   } catch (e) {
-    el.innerHTML = `<div class="muted">加载失败：${esc(e.message)}</div>`;
+    el.innerHTML = stateFromError(e);
     return;
   }
   const candidates = (data.disks || []).filter(d => d.predict_level === 'warn' || d.predict_level === 'crit');
@@ -2259,7 +3131,7 @@ async function loadReplacements() {
           <span class="step">5. 设为全局热备</span><button class="btn sm" data-step="hotspare">执行</button>
         </div>`
       : '<div class="tiny">仅管理员可执行换盘操作</div>';
-    return `<div class="replace-item" data-eid="${esc(d.eid)}" data-slot="${esc(d.slot)}">
+    return `<div class="replace-item" data-ctrl="${esc(bayCtrl(d))}" data-eid="${esc(d.eid)}" data-slot="${esc(d.slot)}">
       <div class="replace-head">
         <span class="replace-label mono">${esc(d.label)}</span>
         <span class="badge ${cls}">${esc(d.replace_advice)}</span>
@@ -2272,9 +3144,12 @@ async function loadReplacements() {
     el.querySelectorAll('button[data-step]').forEach(btn => {
       btn.addEventListener('click', () => {
         const item = btn.closest('.replace-item');
+        const ctrlId = Number(item.dataset.ctrl);
         const eid = Number(item.dataset.eid);
         const slot = Number(item.dataset.slot);
-        const d = (state.status && state.status.physical_disks || []).find(x => Number(x.eid) === eid && Number(x.slot) === slot);
+        const d = (state.status && state.status.physical_disks || []).find(
+          x => bayCtrl(x) === ctrlId && Number(x.eid) === eid && Number(x.slot) === slot
+        );
         if (!d) { toast('未找到该磁盘', 'error'); return; }
         const step = btn.dataset.step;
         if (step === 'locate') diskAction(d, d.locate ? 'locate_stop' : 'locate_start');
@@ -2292,7 +3167,7 @@ async function loadHotspare() {
   try {
     data = await api('/api/hotspare_policy');
   } catch (e) {
-    body.innerHTML = `<div class="muted">加载失败：${esc(e.message)}</div>`;
+    body.innerHTML = stateFromError(e);
     return;
   }
   const cfg = data.config || {};
@@ -2302,7 +3177,7 @@ async function loadHotspare() {
     ? eligible.map(d => `<div class="hs-row">
         <span class="mono">${esc(d.label)}</span>
         <span class="tiny">${esc(d.model || '')}</span>
-        ${state.isAdmin ? `<button class="btn sm" data-hs="${esc(d.eid)}:${esc(d.slot)}">设为全局热备</button>` : '<span class="tiny">可配置</span>'}
+        ${state.isAdmin ? `<button class="btn sm" data-hs="${esc(bayCtrl(d))}:${esc(d.eid)}:${esc(d.slot)}">设为全局热备</button>` : '<span class="tiny">可配置</span>'}
       </div>`).join('')
     : '<div class="tiny" style="margin-top:10px">当前没有 UGood/JBOD 盘可设为热备</div>';
 
@@ -2324,8 +3199,10 @@ async function loadHotspare() {
       ${eligible.length ? '<div class="tiny" style="margin-top:10px">可设为全局热备：</div><div class="hs-list">' + eligibleHtml + '</div>' : ''}`;
     body.querySelectorAll('button[data-hs]').forEach(btn => {
       btn.addEventListener('click', () => {
-        const [eid, slot] = btn.dataset.hs.split(':').map(Number);
-        const d = (state.status && state.status.physical_disks || []).find(x => Number(x.eid) === eid && Number(x.slot) === slot);
+        const [ctrlId, eid, slot] = parseDiskKey(btn.dataset.hs);
+        const d = (state.status && state.status.physical_disks || []).find(
+          x => bayCtrl(x) === ctrlId && Number(x.eid) === eid && Number(x.slot) === slot
+        );
         if (d) diskAction(d, 'hotspare_global');
       });
     });
@@ -2369,12 +3246,12 @@ async function loadLife() {
   try {
     data = await api('/api/disk_ledger');
   } catch (e) {
-    body.innerHTML = `<div class="muted">加载失败：${esc(e.message)}</div>`;
+    body.innerHTML = stateFromError(e);
     return;
   }
   const rows = data.disks || [];
   if (!rows.length) {
-    body.innerHTML = '<div class="muted">暂无磁盘寿命数据</div>';
+    body.innerHTML = stateBlock('empty', '暂无寿命数据', '需要磁盘回报磨损指标后才能估算剩余寿命。');
     return;
   }
   const stageText = { normal: '正常', watch: '关注', aged: '老化', critical: '临界' };
@@ -2395,23 +3272,3022 @@ async function loadLife() {
 function switchView(v) {
   state.view = v;
   try {
-    if (['overview', 'storage', 'logs', 'ops', 'users'].includes(v)) {
+    if (['overview', 'storage', 'perf', 'logs', 'ops', 'users', 'reports', 'hosts'].includes(v)) {
       localStorage.setItem('lsi-view', v);
     }
   } catch (e) { /* 忽略 */ }
   $$('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.view === v));
-  ['overview', 'storage', 'logs', 'ops', 'users'].forEach(name => {
+  ['overview', 'storage', 'perf', 'logs', 'ops', 'users', 'reports', 'hosts'].forEach(name => {
     $('#view-' + name).classList.toggle('hidden', name !== v);
   });
+  if (v === 'overview') tabifyOverview(); else tabifyView(v);
   if (v === 'storage' && !state.storageLoaded) loadStorage();
   if (v === 'storage' && !state.fsUsage) loadFsUsage();
   if (v === 'storage' && !state.nfsLoaded) loadNfs();
   if (v === 'storage' && !state.bcacheLoaded) loadBcache();
+  if (v === 'storage') loadCapacityForecast();
+  if (v === 'storage') loadDataBackup();
+  if (v === 'storage') loadBackupSchedule();
+  if (v === 'storage') loadFsPaths();
+  if (v === 'perf') loadPerfLive();
+  if (v === 'perf') loadPerfTrend();
+  if (v === 'perf') loadIoBench();
   if (v === 'ops' && !state.opsLoaded) loadOps();
+  if (v === 'ops') loadBackup();
+  if (v === 'ops') loadConfigSnapshots();
+  if (v === 'ops') loadRecovery();
+  if (v === 'ops') loadCacheProtection();
+  if (v === 'ops') loadHardware();
+  if (v === 'ops') loadEnclosure();
+  if (v === 'ops') loadMaintenance();
+  if (v === 'ops') loadCtrlPolicy();
   if (v === 'users' && !state.usersLoaded) loadUsers();
+  if (v === 'reports') loadReports();
+  if (v === 'hosts') loadHosts();
+  if (v === 'hosts') loadFleetAlerts();
+}
+
+
+/* ---------- 页面内标签分组 ----------
+   每页卡片太多，滚动很长。这里把每个视图的顶层卡片按每 4 块一组
+   自动分组，标签名取该组第一块卡片的标题——不写死映射，后续加卡片
+   也能自动归入。只重排 DOM 层级，卡片本身与所有 id 保持不变。 */
+/* ---------- 页面内标签分组 ----------
+   每页卡片太多、滚动很长。默认每 3 块一组；少数卡片需要独立成组
+   （比如"数据备份与恢复"是一整块业务），用 SPECIAL 单独拎出来。
+   只重排 DOM 层级，卡片本身与所有 id 保持不变。 */
+const TAB_SPECIAL = {
+  'card-data-backup': '数据备份与恢复',
+};
+
+
+/* 概览页专用分组：内容是静态的 13 个区块，按业务含义划分，
+   比"每 3 块一组"更符合阅读顺序。 */
+function tabifyOverview() {
+  const view = document.getElementById('view-overview');
+  if (!view || view.dataset.tabbed === '1') return;
+  const kids = [...view.children].filter(el => el.nodeType === 1);
+  if (kids.length < 6) return;
+  const groups = [
+    { label: '总览', idx: [0, 2] },
+    { label: '系统与文件', idx: [1, 11] },
+    { label: '告警与健康', idx: [3, 4] },
+    { label: '磁盘与阵列', idx: [5, 8, 9, 10] },
+    { label: '维护与趋势', idx: [6, 7] },
+    { label: '授权', idx: [12] },
+  ];
+  const bar = document.createElement('div');
+  bar.className = 'subtabs';
+  const panels = [];
+  for (const g of groups) {
+    const items = g.idx.map(i => kids[i]).filter(Boolean);
+    if (!items.length) continue;
+    const panel = document.createElement('div');
+    panel.className = 'subpanel';
+    items.forEach(el => panel.appendChild(el));
+    view.appendChild(panel);
+    panels.push(panel);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'subtab';
+    btn.textContent = g.label;
+    btn.addEventListener('click', () => {
+      bar.querySelectorAll('.subtab').forEach(b => b.classList.toggle('active', b === btn));
+      panels.forEach(p => p.classList.toggle('active', p === panel));
+    });
+    bar.appendChild(btn);
+  }
+  panels[0]?.classList.add('active');
+  bar.firstChild?.classList.add('active');
+  view.insertBefore(bar, view.firstChild);
+  view.dataset.tabbed = '1';
+}
+
+function tabifyView(name) {
+  const view = document.getElementById('view-' + name);
+  if (!view || view.dataset.tabbed === '1') return;
+  // view 本身是 grid 的（概览页 12 列栅格）不做分组：
+  // `.grid-hero`/`.grid-stats` 靠 display:contents 直接参与栅格，
+  // 外面包一层会让这些选择器失效、整页散架。
+  if (getComputedStyle(view).display === 'grid') return;
+
+  const kids = [...view.children].filter(el => el.nodeType === 1);
+  if (kids.length <= 4) return;
+
+  const pick = (el, sel) => (el.querySelector(sel)?.textContent || '').trim();
+  const labelOf = (el) => {
+    const t = pick(el, '.card-head strong') || pick(el, 'h3') || pick(el, 'strong') || '内容';
+    return t.slice(0, 16);
+  };
+
+  const chunks = [];
+  let buf = [];
+  const flush = () => { if (buf.length) { chunks.push({ label: labelOf(buf[0]), items: buf }); buf = []; } };
+  for (const el of kids) {
+    const special = TAB_SPECIAL[el.id];
+    if (special) { flush(); chunks.push({ label: special, items: [el] }); continue; }
+    buf.push(el);
+    if (buf.length >= 3) flush();
+  }
+  flush();
+
+  const bar = document.createElement('div');
+  bar.className = 'subtabs';
+  const panels = [];
+  for (const chunk of chunks) {
+    const panel = document.createElement('div');
+    panel.className = 'subpanel';
+    chunk.items.forEach(el => panel.appendChild(el));
+    view.appendChild(panel);
+    panels.push(panel);
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'subtab';
+    btn.textContent = chunk.label;
+    btn.addEventListener('click', () => {
+      bar.querySelectorAll('.subtab').forEach(b => b.classList.toggle('active', b === btn));
+      panels.forEach(p => p.classList.toggle('active', p === panel));
+    });
+    bar.appendChild(btn);
+  }
+  panels[0]?.classList.add('active');
+  bar.firstChild?.classList.add('active');
+  view.insertBefore(bar, view.firstChild);
+  view.dataset.tabbed = '1';
 }
 
 /* ---------- UI 绑定 ---------- */
+
+/* ---------- 报表中心 ---------- */
+
+/* ---------- 授权 ---------- */
+
+/* ---------- 角色与权限 ---------- */
+
+let ROLE_INFO = {
+  viewer: { name: '只读', desc: '', perms: '' },
+  operator: { name: '运维', desc: '', perms: '' },
+  admin: { name: '管理员', desc: '', perms: '' },
+  auditor: { name: '审计', desc: '', perms: '' },
+};
+
+/* 角色信息从后端下发，前端不写死中文名与权限描述——
+   否则以后调整权限矩阵要同时改两处，迟早对不上。 */
+function buildRoleInfo(desc) {
+  const roles = (desc || {}).roles || {};
+  const perms = (desc || {}).perms || {};
+  const next = {};
+  ['viewer', 'operator', 'admin', 'auditor'].forEach(k => {
+    const r = roles[k] || { name: k, desc: '' };
+    next[k] = {
+      name: r.name || k,
+      desc: r.desc || '',
+      perms: (r.perms || []).map(p => (perms[p] || {}).label || p).join(' · '),
+    };
+  });
+  if (Object.keys(roles).length) ROLE_INFO = next;
+}
+
+function fillRoleSelect() {
+  const sel = $('#nu-role');
+  if (!sel || sel.dataset.filled === '1') return;
+  sel.innerHTML = Object.entries(ROLE_INFO)
+    .map(([k, v]) => `<option value="${esc(k)}">${esc(v.name)} — ${esc(v.desc)}</option>`)
+    .join('');
+  sel.dataset.filled = '1';
+}
+
+/* ---------- 多机管理 ---------- */
+
+const HOST_HEALTH_TEXT = { ok: '正常', warn: '警告', crit: '严重', unknown: '未知' };
+
+/* ---------- 多机统一告警视图 ---------- */
+
+async function loadFleetAlerts() {
+  const box = $('#fleet-alerts');
+  if (!box) return;
+  let d;
+  try {
+    d = await api('/api/hosts/alerts');
+  } catch (e) {
+    box.innerHTML = `<div class="muted">${esc(e.message)}</div>`;
+    $('#fleet-alert-stats').textContent = '';
+    return;
+  }
+  const stats = d.stats || {};
+  $('#fleet-alert-stats').textContent = stats.total
+    ? `共 ${stats.total} 条 · 错误 ${stats.error || 0} · 警告 ${stats.warning || 0}${
+        stats.offline_hosts ? ` · 失联节点 ${stats.offline_hosts}` : ''
+      }`
+    : '';
+
+  const items = d.alerts || [];
+  if (!items.length) {
+    box.innerHTML = '<div class="muted">所有节点当前都没有未处理告警</div>';
+    return;
+  }
+  box.innerHTML = items
+    .map(
+      a => `<div class="fleet-alert ${esc(a.level)}">
+      <div class="fa-head">
+        <span class="badge ${a.level === 'error' ? 'crit' : a.level === 'warning' ? 'warn' : 'info'}">${
+          a.level === 'error' ? '错误' : a.level === 'warning' ? '警告' : '信息'
+        }</span>
+        <span class="fa-host">${esc(a.host)}${a.local ? ' <span class="tiny">（本机）</span>' : ''}</span>
+        <span class="fa-title">${esc(a.title)}${Number(a.count) > 1 ? ` ×${esc(a.count)}` : ''}</span>
+        <span class="tiny mono">${esc(a.last_seen || '')}</span>
+      </div>
+      <div class="fa-detail">${esc(a.detail || '')}</div>
+      <div class="fa-ops">
+        ${
+          a.offline
+            ? `<button class="btn sm ghost" data-fa-open="${esc(a.address)}">打开节点</button>`
+            : a.alert_id && state.canOperate
+              ? `<button class="btn sm" data-fa-ack="${esc(a.host_id)}:${esc(a.alert_id)}">确认</button>`
+              : ''
+        }
+        ${a.offline || !a.address ? '' : `<button class="btn sm ghost" data-fa-jump="${esc(a.address)}">前往节点</button>`}
+      </div>
+    </div>`
+    )
+    .join('');
+
+  $$('#fleet-alerts [data-fa-ack]').forEach(b =>
+    b.addEventListener('click', async () => {
+      const [hid, aid] = b.dataset.faAck.split(':');
+      btnLoading(b, true);
+      try {
+        await api(`/api/hosts/${hid}/alerts/${aid}/ack`, { method: 'POST' });
+        toast('告警已确认', 'ok');
+        await loadFleetAlerts();
+      } catch (e) {
+        toast(e.message, 'error');
+        btnLoading(b, false);
+      }
+    })
+  );
+  $$('#fleet-alerts [data-fa-open], #fleet-alerts [data-fa-jump]').forEach(b =>
+    b.addEventListener('click', () =>
+      window.open(b.dataset.faOpen || b.dataset.faJump, '_blank')
+    )
+  );
+}
+
+function bindFleetAlertUI() {
+  const t = $('#remote-ack-toggle');
+  if (t) {
+    t.addEventListener('change', async () => {
+      try {
+        await api('/api/agent/remote_ack', { method: 'POST', body: { enabled: t.checked } });
+        toast(t.checked ? '已允许中心代为确认告警' : '已禁止中心代为确认告警', 'ok');
+      } catch (e) {
+        toast(e.message, 'error');
+        t.checked = !t.checked;
+      }
+    });
+  }
+}
+
+/* ---------- 缓存保护与写缓存 ---------- */
+
+function renderCacheProtection(list) {
+  const box = $('#battery-body');
+  if (!box) return;
+  const items = list || [];
+  if (!items.length) {
+    box.innerHTML = stateBlock('empty', '没有控制器数据', 'storcli 未返回控制器信息，检查驱动与工具是否可用。');
+    return;
+  }
+  box.innerHTML = items
+    .map(cp => {
+      const tone = cp.severity === 'crit' ? 'crit' : cp.severity === 'warn' ? 'warn' : 'ok';
+      const unit = cp.unit || {};
+      const unitText = unit.present
+        ? `${unit.model || '缓存单元'} · ${unit.state || '状态未知'}${unit.temperature != null ? ` · ${unit.temperature}°C` : ''}`
+        : `未安装（${unit.raw_presence || '未知'}）`;
+      const ports = (cp.ports || [])
+        .map(
+          p => `<div class="cache-port">
+          <span class="mono">${esc(p.vd)}</span>
+          <span class="cache-chip ${p.temporarily_disabled ? 'warn' : p.write.includes('写回') ? 'crit' : 'ok'}">写：${esc(p.write)}</span>
+          <span class="cache-chip">读：${esc(p.read)}</span>
+          <span class="tiny mono">${esc(p.cache_code || '—')}</span>
+        </div>`
+        )
+        .join('');
+      const findings = (cp.findings || [])
+        .map(
+          f => `<div class="cache-finding ${esc(f.level)}">
+          <div class="cf-head">
+            <span class="badge ${f.level === 'crit' ? 'crit' : f.level === 'warn' ? 'warn' : f.level === 'ok' ? 'ok' : 'info'}">${
+              { crit: '严重', warn: '关注', ok: '正常', info: '说明' }[f.level] || f.level
+            }</span>
+            <strong>${esc(f.title)}</strong>
+          </div>
+          <div class="cf-detail">${esc(f.detail)}</div>
+          ${f.advice ? `<div class="cf-advice">建议：${esc(f.advice)}</div>` : ''}
+        </div>`
+        )
+        .join('');
+      return `<div class="cache-block">
+        <div class="cache-head">
+          <span class="badge ${tone}">${tone === 'crit' ? '危险' : tone === 'warn' ? '需关注' : '正常'}</span>
+          <strong>控制器 C${esc(cp.ctrl)}</strong>
+          <span class="tiny">${esc(unitText)}</span>
+        </div>
+        ${ports}
+        <div class="cache-findings">${findings}</div>
+      </div>`;
+    })
+    .join('');
+}
+
+async function loadCacheProtection() {
+  const box = $('#battery-body');
+  if (!box) return;
+  try {
+    const st = await api('/api/status');
+    state.status = st;
+    renderCacheProtection(st.cache_protection);
+  } catch (e) {
+    box.innerHTML = stateFromError(e);
+  }
+}
+
+/* ---------- 换卡恢复向导 ---------- */
+
+let _recoveryData = [];
+
+async function loadRecovery() {
+  const box = $('#recovery-body');
+  if (!box) return;
+  box.innerHTML = '<div class="loading-line">诊断中…</div>';
+  let d;
+  try {
+    d = await api('/api/recovery/diagnose');
+  } catch (e) {
+    box.innerHTML = `<div class="muted">诊断失败：${esc(e.message)}</div>`;
+    return;
+  }
+  _recoveryData = d.diagnoses || [];
+  const sel = $('#recovery-ctrl');
+  const ids = d.controllers || [];
+  if (sel && sel.dataset.filled !== ids.join(',')) {
+    sel.innerHTML = ids.map(id => `<option value="${esc(id)}">控制器 C${esc(id)}</option>`).join('');
+    sel.dataset.filled = ids.join(',');
+  }
+  const cur = sel && sel.value !== '' ? Number(sel.value) : (ids[0] != null ? Number(ids[0]) : null);
+  renderRecovery(cur);
+}
+
+function renderRecovery(ctrlId) {
+  const box = $('#recovery-body');
+  if (!box) return;
+  const d = _recoveryData.find(x => Number(x.ctrl) === Number(ctrlId)) || _recoveryData[0];
+  if (!d) {
+    box.innerHTML = stateBlock('empty', '没有可诊断的控制器', '换卡向导需要至少一张已识别的 RAID 卡。');
+    return;
+  }
+  const tone = d.severity === 'crit' ? 'crit' : d.severity === 'warn' ? 'warn' : 'ok';
+  const toneText = { crit: '需要处理', warn: '需要确认', ok: '正常' }[tone];
+
+  const evidence = (d.evidence || []).length
+    ? `<div class="rec-evidence">${d.evidence
+        .map(
+          e => `<div class="rec-ev-item ${esc(e.level)}">
+          <span class="badge ${e.level === 'high' ? 'crit' : e.level === 'medium' ? 'warn' : 'info'}">${
+            e.level === 'high' ? '重要' : e.level === 'medium' ? '关注' : '信息'
+          }</span><span>${esc(e.text)}</span></div>`
+        )
+        .join('')}</div>`
+    : '';
+
+  const steps = (d.steps || [])
+    .map(
+      s => `<div class="rec-step ${s.danger ? 'danger' : ''} ${s.blocker ? 'blocker' : ''}">
+      <span class="rec-num">${esc(s.n)}</span>
+      <div class="rec-body">
+        <div class="rec-title">${esc(s.title)}${s.blocker ? ' <span class="badge crit">阻断</span>' : ''}${s.danger ? ' <span class="badge warn">高风险</span>' : ''}</div>
+        <div class="rec-detail">${esc(s.detail)}</div>
+        ${s.confirm ? `<div class="rec-confirm">执行前确认：${esc(s.confirm)}</div>` : ''}
+        ${s.action ? `<button class="btn sm" data-rec-action="${esc(s.action)}" data-rec-ctrl="${esc(d.ctrl)}">${esc({
+          snapshot: '记录当前配置',
+          foreign_import: '导入外来配置',
+          diff: '与上次快照比对',
+        }[s.action] || '执行')}</button>` : ''}
+      </div>
+    </div>`
+    )
+    .join('');
+
+  box.innerHTML = `
+    <div class="rec-head">
+      <span class="badge ${tone}">${esc(toneText)}</span>
+      <strong>${esc(d.title)}</strong>
+      ${d.snapshot ? `<span class="tiny">比对基准：快照 #${esc(d.snapshot.id)}（${esc(d.snapshot.ts)}）</span>` : '<span class="tiny">无比对基准</span>'}
+    </div>
+    <div class="rec-summary">${esc(d.summary)}</div>
+    ${evidence}
+    <div class="rec-steps">${steps}</div>
+    ${
+      d.controller
+        ? `<div class="tiny rec-meta">当前控制器：${esc(d.controller.model || '—')} · 固件 ${esc(
+            d.controller.fw || '—'
+          )} · 健康 ${esc(d.controller.health || '—')} · ${esc(d.controller.num_disks || 0)} 盘 / ${esc(
+            d.controller.num_vds || 0
+          )} 阵列</div>`
+        : ''
+    }`;
+
+  $$('#recovery-body [data-rec-action]').forEach(b =>
+    b.addEventListener('click', () => runRecoveryAction(b.dataset.recAction, Number(b.dataset.recCtrl), b))
+  );
+}
+
+async function runRecoveryAction(action, ctrlId, btn) {
+  if (action === 'snapshot') {
+    btnLoading(btn, true);
+    try {
+      await api('/api/config/snapshots', { method: 'POST', body: { ctrl: ctrlId, note: '恢复流程记录' } });
+      toast('已记录当前配置', 'ok');
+      await loadConfigSnapshots();
+      await loadRecovery();
+    } catch (e) {
+      toast(e.message, 'error');
+    } finally {
+      btnLoading(btn, false);
+    }
+    return;
+  }
+  if (action === 'diff') {
+    await loadConfigSnapshots();
+    await showConfigDiff();
+    const el = $('#config-diff');
+    if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    else if (el) el.classList.remove('hidden');
+    return;
+  }
+  if (action === 'foreign_import') {
+    confirmModal(
+      '导入外来阵列配置',
+      `<p>将把磁盘上的原阵列元数据导回控制器 C${ctrlId}。</p>
+       <div class="restore-warn">
+         <strong>执行前请确认</strong>
+         <ul>
+           <li>所有成员盘都已插到位（缺盘会导致导入出降级阵列）</li>
+           <li><strong>没有</strong>用这些盘创建过新阵列——建过阵列元数据已被覆盖，导入无法找回数据</li>
+           <li>已经记录了一份配置快照作为回退依据</li>
+         </ul>
+       </div>`,
+      '确认导入',
+      true,
+      async () => {
+        const r = await api('/api/foreign_import', {
+          method: 'POST',
+          body: { ctrl: ctrlId, acknowledge: true },
+        });
+        if (r && r.task) {
+          toast(`导入任务已提交（#${r.task.id}）`, 'ok');
+          openTaskDrawer();
+        } else {
+          toast('外来配置已导入', 'ok');
+        }
+        await loadRecovery();
+      }
+    );
+  }
+}
+
+function bindRecoveryUI() {
+  const run = $('#btn-recovery-run');
+  if (run) {
+    run.addEventListener('click', async () => {
+      btnLoading(run, true);
+      try {
+        _recoveryData = [];
+        await loadRecovery();
+      } finally {
+        btnLoading(run, false);
+      }
+    });
+  }
+  const sel = $('#recovery-ctrl');
+  if (sel) sel.addEventListener('change', () => renderRecovery(Number(sel.value)));
+}
+
+/* ---------- 控制器配置快照 ---------- */
+
+const CONFIG_REASON = { baseline: '基线', auto: '自动', drift: '检测到变更', manual: '手动记录' };
+
+async function loadConfigSnapshots() {
+  const tb = $('#config-table tbody');
+  if (!tb) return;
+  let d;
+  try {
+    d = await api('/api/config/snapshots');
+  } catch (e) {
+    tb.innerHTML = `<tr><td colspan="7" class="muted">${esc(e.message)}</td></tr>`;
+    return;
+  }
+  state.configData = d;
+  const latest = d.latest;
+  $('#config-latest').textContent = latest
+    ? `C${d.ctrl} 最近快照 ${latest.ts} · 指纹 ${latest.hash}`
+    : `C${d.ctrl} 暂无快照，下次采集会自动建立基线`;
+
+  const hist = d.history || [];
+  if (!hist.length) {
+    tb.innerHTML = '<tr><td colspan="7">' + stateBlock('empty', '还没有配置快照', '下次采集会自动建立基线，之后每次配置变化都会记录。', '', true) + '</td></tr>';
+    return;
+  }
+  tb.innerHTML = hist
+    .map(
+      h => `<tr>
+      <td class="num">${esc(h.id)}</td>
+      <td class="num">${esc(h.ts)}</td>
+      <td class="num">${esc(h.hash)}</td>
+      <td>${h.reason === 'drift'
+        ? '<span class="badge warn">检测到变更</span>'
+        : `<span class="badge">${esc(CONFIG_REASON[h.reason] || h.reason || '自动')}</span>`}</td>
+      <td>${esc(h.operator || '—')}</td>
+      <td>${esc(h.note || '—')}</td>
+      <td class="ops"><button class="btn sm ghost" data-detail="${esc(h.id)}">查看</button></td>
+    </tr>`
+    )
+    .join('');
+  $$('#config-table [data-detail]').forEach(b =>
+    b.addEventListener('click', async () => {
+      try {
+        const r = await api('/api/config/snapshots/' + b.dataset.detail);
+        const s = r.snapshot;
+        showModal({
+          title: `配置快照 #${s.id} · C${s.ctrl}`,
+          body: `<dl class="kv">
+              <dt>时间</dt><dd>${esc(s.ts)}</dd>
+              <dt>指纹</dt><dd class="mono">${esc(s.hash)}</dd>
+              <dt>型号</dt><dd>${esc(s.data.model || '—')}</dd>
+              <dt>固件</dt><dd>${esc(s.data.firmware || '—')}</dd>
+            </dl>
+            <div class="tiny" style="margin:12px 0 6px">控制器设置</div>
+            <pre class="smart-pre">${esc(JSON.stringify(s.data.settings || {}, null, 1))}</pre>
+            <div class="tiny" style="margin:12px 0 6px">虚拟磁盘</div>
+            <pre class="smart-pre">${esc(JSON.stringify(s.data.vds || [], null, 1))}</pre>`,
+          actions: [{ label: '关闭', handler: closeModal }],
+        });
+      } catch (e) {
+        toast(e.message, 'error');
+      }
+    })
+  );
+}
+
+async function showConfigDiff() {
+  const box = $('#config-diff');
+  if (!box) return;
+  let d;
+  try {
+    d = await api('/api/config/diff');
+  } catch (e) {
+    toast(e.message, 'error');
+    return;
+  }
+  box.classList.remove('hidden');
+  if (d.ok === false) {
+    box.innerHTML = `<div class="muted">${esc(d.error)}</div>`;
+    return;
+  }
+  if (d.note) {
+    box.innerHTML = `<div class="muted">${esc(d.note)}</div>`;
+    return;
+  }
+  const changes = d.changes || [];
+  if (!changes.length) {
+    box.innerHTML = `<div class="cfg-diff-head">快照 #${esc(d.a.id)} → #${esc(d.b.id)}：配置未发生变化</div>`;
+    return;
+  }
+  box.innerHTML = `<div class="cfg-diff-head">
+      快照 #${esc(d.a.id)}（${esc(d.a.ts)}） → #${esc(d.b.id)}（${esc(d.b.ts)}）：共 ${changes.length} 项差异
+    </div>
+    <div class="cfg-diff-list">${changes
+      .map(
+        c => `<div class="cfg-diff-row ${esc(c.impact || '')}">
+        <span class="badge ${c.impact === 'high' ? 'crit' : c.impact === 'medium' ? 'warn' : 'info'}">${
+          c.impact === 'high' ? '重要' : c.impact === 'medium' ? '一般' : '信息'
+        }</span>
+        <span class="cfg-diff-label">${esc(c.label)}</span>
+        <span class="cfg-diff-path mono">${esc(c.from)} → ${esc(c.to)}</span>
+      </div>`
+      )
+      .join('')}</div>`;
+}
+
+function bindConfigUI() {
+  const snap = $('#btn-config-snap');
+  if (snap) {
+    snap.addEventListener('click', async () => {
+      btnLoading(snap, true);
+      try {
+        await api('/api/config/snapshots', { method: 'POST', body: { note: '手动记录' } });
+        toast('已记录当前控制器配置', 'ok');
+        await loadConfigSnapshots();
+      } catch (e) {
+        toast(e.message, 'error');
+      } finally {
+        btnLoading(snap, false);
+      }
+    });
+  }
+  const diff = $('#btn-config-diff');
+  if (diff) diff.addEventListener('click', showConfigDiff);
+}
+
+/* ---------- 数据与备份 ---------- */
+
+function fmtBytes(n) {
+  const v = Number(n) || 0;
+  if (v <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  let x = v;
+  while (x >= 1024 && i < units.length - 1) {
+    x /= 1024;
+    i++;
+  }
+  return `${i === 0 ? x : x.toFixed(1)} ${units[i]}`;
+}
+
+async function loadBackup() {
+  const tb = $('#backup-table tbody');
+  if (!tb) return;
+  let d;
+  try {
+    d = await api('/api/backups');
+  } catch (e) {
+    tb.innerHTML = `<tr><td colspan="6" class="muted">${esc(e.message)}</td></tr>`;
+    return;
+  }
+  renderBackup(d);
+}
+
+function renderBackup(d) {
+  const usage = d.usage || {};
+  const cfg = d.config || {};
+  $('#backup-usage').innerHTML = [
+    ['数据目录', fmtBytes(usage.data_bytes)],
+    ['数据库', fmtBytes(usage.db_bytes)],
+    ['备份占用', fmtBytes(usage.backup_bytes)],
+    ['样本总数', String((d.preview || {}).total_samples || 0)],
+  ]
+    .map(([k, v]) => `<div class="usage-item"><span class="k">${esc(k)}</span><span class="v mono">${esc(v)}</span></div>`)
+    .join('');
+
+  const pend = d.pending;
+  const pendBox = $('#backup-pending');
+  if (pend) {
+    pendBox.classList.remove('hidden');
+    pendBox.innerHTML = `<div>
+        <strong>有一次待应用的恢复</strong>
+        <span class="tiny">${esc(pend.file)} · 暂存于 ${esc(pend.staged_at)} · 操作者 ${esc(pend.operator || '—')}</span>
+        <span class="tiny">重启服务后生效。应用前会自动备份当前数据（若策略开启）。</span>
+      </div>
+      ${state.isAdmin ? '<button class="btn sm ghost" id="btn-restore-cancel">取消恢复</button>' : ''}`;
+    const cancel = $('#btn-restore-cancel');
+    if (cancel) {
+      cancel.addEventListener('click', async () => {
+        try {
+          await api('/api/backups/restore/cancel', { method: 'POST' });
+          toast('已取消待应用的恢复', 'ok');
+          await loadBackup();
+        } catch (e) {
+          toast(e.message, 'error');
+        }
+      });
+    }
+  } else {
+    pendBox.classList.add('hidden');
+    pendBox.innerHTML = '';
+  }
+
+  $('#ret-days').value = cfg.retention_days != null ? cfg.retention_days : 0;
+  $('#ret-keep').value = cfg.keep_backups != null ? cfg.keep_backups : 10;
+  $('#ret-auto').checked = cfg.auto_backup !== false;
+  $('#retention-hint').textContent = cfg._retention_locked
+    ? '保留天数由环境变量 LSI_RETENTION_DAYS 指定，界面不可修改'
+    : '';
+  $('#ret-days').disabled = !!cfg._retention_locked;
+  renderRetentionPreview(d.preview || {});
+
+  const items = d.backups || [];
+  if (!items.length) {
+    $('#backup-table tbody').innerHTML = '<tr><td colspan="6">' + stateBlock('empty', '还没有备份', '点击上方「创建备份」生成第一份数据快照。', '', true) + '</td></tr>';
+    return;
+  }
+  $('#backup-table tbody').innerHTML = items
+    .map(b => `<tr>
+      <td class="num">${esc(b.file)}</td>
+      <td>${b.scope === 'full' ? '<span class="badge info">完整</span>' : '<span class="badge">配置</span>'}</td>
+      <td class="num">${esc(b.created_at)}</td>
+      <td class="num">${esc(fmtBytes(b.bytes))}</td>
+      <td>${esc(b.note || '—')}</td>
+      <td class="ops">
+        <button class="btn sm ghost" data-verify="${esc(b.file)}">校验</button>
+        ${state.canAudit ? `<button class="btn sm ghost" data-download="${esc(b.file)}">下载</button>` : ''}
+        ${state.isAdmin ? `<button class="btn sm" data-restore="${esc(b.file)}">恢复</button>` : ''}
+        ${state.isAdmin ? `<button class="btn sm ghost" data-del="${esc(b.file)}">删除</button>` : ''}
+      </td>
+    </tr>`)
+    .join('');
+
+  $$('#backup-table [data-verify]').forEach(b =>
+    b.addEventListener('click', async () => {
+      try {
+        const r = await api(`/api/backups/${encodeURIComponent(b.dataset.verify)}/verify`);
+        toast(r.ok ? `校验通过（${r.manifest.scope === 'full' ? '完整' : '配置'}备份）` : `校验失败：${r.error}`, r.ok ? 'ok' : 'error');
+      } catch (e) {
+        toast(e.message, 'error');
+      }
+    })
+  );
+  $$('#backup-table [data-download]').forEach(b =>
+    b.addEventListener('click', () => {
+      window.location.href = `/api/backups/${encodeURIComponent(b.dataset.download)}/download`;
+    })
+  );
+  $$('#backup-table [data-del]').forEach(b =>
+    b.addEventListener('click', () => {
+      confirmModal('删除备份', `<p>确认删除 <strong>${esc(b.dataset.del)}</strong>？删除后该备份文件无法找回。</p>`, '删除', true, async () => {
+        await api(`/api/backups/${encodeURIComponent(b.dataset.del)}/remove`, { method: 'POST' });
+        toast('备份已删除', 'ok');
+        await loadBackup();
+      });
+    })
+  );
+  $$('#backup-table [data-restore]').forEach(b =>
+    b.addEventListener('click', () => openRestoreModal(b.dataset.restore))
+  );
+}
+
+function renderRetentionPreview(p) {
+  const box = $('#retention-preview');
+  if (!box) return;
+  if (!p.days) {
+    box.innerHTML = '<span class="tiny">当前为永久保留，不会清理任何历史样本。</span>';
+    return;
+  }
+  box.innerHTML = `<span class="tiny">按当前策略将清理 <strong>${esc(p.samples)}</strong> 条样本（共 ${esc(p.total_samples)} 条），
+    清理后最早数据为 ${esc(p.cutoff)} 之后。${p.oldest ? `现存最早样本：${esc(p.oldest)}。` : ''}</span>
+    ${state.isAdmin ? '<button class="btn sm danger" id="btn-ret-apply">立即执行清理</button>' : ''}`;
+  const btn = $('#btn-ret-apply');
+  if (btn) {
+    btn.addEventListener('click', () => {
+      confirmModal(
+        '立即执行数据清理',
+        `<p>将删除 <strong>${esc(p.samples)}</strong> 条历史样本，此操作不可撤销。</p><p class="tiny">建议先执行一次完整备份。</p>`,
+        '确认清理',
+        true,
+        async () => {
+          const r = await api('/api/backups/retention/apply', { method: 'POST' });
+          toast(`已删除 ${r.result.removed_samples} 条样本、${r.result.removed_backups} 份备份`, 'ok');
+          await loadBackup();
+        }
+      );
+    });
+  }
+}
+
+function openRestoreModal(name) {
+  showModal({
+    title: '恢复数据',
+    body: `<p>将从备份 <strong class="mono">${esc(name)}</strong> 恢复数据。</p>
+      <div class="restore-warn">
+        <strong>这是覆盖性操作</strong>
+        <ul>
+          <li>当前配置与数据库将被备份中的内容替换</li>
+          <li>恢复<strong>不会立即生效</strong>——内容先暂存，重启服务后应用</li>
+          <li>应用前会自动备份当前数据（若策略开启），可回退</li>
+        </ul>
+      </div>
+      <div class="field" style="margin-top:12px">
+        <label for="restore-confirm">输入 <code>RESTORE</code> 以确认</label>
+        <input class="input mono" id="restore-confirm" placeholder="RESTORE" />
+      </div>`,
+    actions: [
+      { label: '取消', handler: closeModal },
+      {
+        label: '暂存并等待重启',
+        cls: 'danger',
+        handler: async btn => {
+          btnLoading(btn, true);
+          try {
+            await api(`/api/backups/${encodeURIComponent(name)}/restore`, {
+              method: 'POST',
+              body: { acknowledge: true, confirm: $('#restore-confirm').value.trim() },
+            });
+            toast('已暂存恢复，重启服务后生效', 'ok');
+            closeModal();
+            await loadBackup();
+          } catch (e) {
+            toast(e.message, 'error');
+            btnLoading(btn, false);
+          }
+        },
+      },
+    ],
+  });
+}
+
+function bindBackupUI() {
+  const mk = async scope => {
+    try {
+      const r = await api('/api/backups', { method: 'POST', body: { scope } });
+      toast(`已创建${scope === 'full' ? '完整' : '配置'}备份（${fmtBytes(r.backup.bytes)}）`, 'ok');
+      await loadBackup();
+    } catch (e) {
+      toast(e.message, 'error');
+    }
+  };
+  const bc = $('#btn-backup-config');
+  if (bc) bc.addEventListener('click', () => mk('config'));
+  const bf = $('#btn-backup-full');
+  if (bf) {
+    bf.addEventListener('click', () => {
+      confirmModal(
+        '完整备份',
+        '<p>完整备份会打包全部历史样本（CSV 与数据库），数据量大时可能需要几十秒到几分钟，期间磁盘 IO 会升高。</p>',
+        '开始备份',
+        false,
+        () => mk('full')
+      );
+    });
+  }
+  const save = $('#btn-ret-save');
+  if (save) {
+    save.addEventListener('click', async () => {
+      btnLoading(save, true);
+      try {
+        const r = await api('/api/backups/config', {
+          method: 'POST',
+          body: {
+            retention_days: Number($('#ret-days').value) || 0,
+            keep_backups: Number($('#ret-keep').value) || 10,
+            auto_backup: $('#ret-auto').checked,
+          },
+        });
+        toast('保留策略已保存', 'ok');
+        renderRetentionPreview(r.preview || {});
+      } catch (e) {
+        toast(e.message, 'error');
+      } finally {
+        btnLoading(save, false);
+      }
+    });
+  }
+}
+
+async function loadHosts() {
+  const tb = $('#hosts-table tbody');
+  if (!tb) return;
+  let d;
+  try {
+    d = await api('/api/hosts');
+  } catch (e) {
+    tb.innerHTML = `<tr><td colspan="12" class="muted">${esc(e.message)}</td></tr>`;
+    $('#host-stats').innerHTML = '';
+    return;
+  }
+  renderHosts(d);
+  loadAgentToken();
+}
+
+const _hostFilter = { q: '', status: 'all', group: 'all', sel: new Set() };
+let _hostsPayload = null;
+
+function updateHostSelLabel() {
+  const el = $('#host-selected');
+  if (el) el.textContent = _hostFilter.sel.size ? `已选 ${_hostFilter.sel.size} 个` : '未选中';
+}
+
+async function bulkHostAction(action) {
+  const ids = [..._hostFilter.sel];
+  if (!ids.length) { toast('请先勾选节点', 'error'); return; }
+  let groupName = '';
+  if (action === 'group') {
+    const g = window.prompt('新的分组名（留空表示清除分组）', '');
+    if (g === null) return;
+    groupName = g.trim();
+  }
+  await bulkHostActionDo(action, ids, groupName);
+}
+
+async function bulkHostActionDo(action, ids, groupName) {
+  try {
+    const r = await api('/api/hosts/bulk', {
+      method: 'POST',
+      body: { ids, action, group_name: groupName || '' },
+    });
+    const label = action === 'enable' ? '启用' : action === 'disable' ? '停用' : '修改分组';
+    toast(`已${label} ${r.changed} 个节点`, 'ok');
+    _hostFilter.sel.clear();
+    await loadHosts();
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
+function hostMatches(h) {
+  const s = h.summary || {};
+  if (_hostFilter.q) {
+    const blob = `${h.name || ''} ${h.address || ''} ${h.group_name || ''}`.toLowerCase();
+    if (!blob.includes(_hostFilter.q.toLowerCase())) return false;
+  }
+  const st = _hostFilter.status;
+  if (st === 'online' && !h.online) return false;
+  if (st === 'offline' && h.online) return false;
+  if (st === 'alert' && !Number(s.alerts_open || 0)) return false;
+  if (st === 'degraded' && !Number(s.vds_degraded || 0)) return false;
+  if (_hostFilter.group !== 'all' && String(h.group_name || '') !== _hostFilter.group) return false;
+  return true;
+}
+
+function renderHosts(d) {
+  _hostsPayload = d;
+  const all = d.hosts || [];
+  _hostsCache = all;
+  const stats = d.stats || {};
+
+  const cards = [
+    ['节点总数', String(stats.total || 0), '含本机'],
+    ['在线', String(stats.online || 0), stats.offline ? `${stats.offline} 台离线` : '全部在线'],
+    ['未处理告警', String(all.reduce((a, h) => a + Number((h.summary || {}).alerts_open || 0), 0)), '所有节点合计'],
+    ['磁盘总数', String(all.reduce((a, h) => a + Number((h.summary || {}).disks_total || 0), 0)), '所有节点合计'],
+  ];
+  $('#host-stats').innerHTML = cards.map(([k, v, s], i) => `<div class="card" style="--d:${i}">
+      <div class="eyebrow">${esc(k)}</div><div class="stat-value">${esc(v)}</div>
+      <div class="stat-sub">${esc(s)}</div></div>`).join('');
+
+  const last = d.last || {};
+  $('#hosts-last').textContent = last.ts
+    ? `上次采集 ${fmtDateTime(new Date(last.ts * 1000).toISOString().slice(0, 19).replace('T', ' '))}`
+    : '';
+
+  // 分组下拉：从现有节点里收集，保持稳定顺序
+  const groups = [...new Set(all.map(h => String(h.group_name || '')).filter(Boolean))].sort();
+  const gsel = $('#host-group');
+  if (gsel && gsel.dataset.sig !== groups.join('|')) {
+    gsel.innerHTML = '<option value="all">全部分组</option>'
+      + groups.map(g => `<option value="${esc(g)}">${esc(g)}</option>`).join('');
+    gsel.dataset.sig = groups.join('|');
+    if (!groups.includes(_hostFilter.group)) _hostFilter.group = 'all';
+    gsel.value = _hostFilter.group;
+  }
+
+  const hosts = all.filter(hostMatches);
+  const sel = _hostFilter.sel;
+
+  if (!all.length) {
+    $('#hosts-table tbody').innerHTML = `<tr><td colspan="14">${stateBlock(
+      'empty', '还没有纳管任何节点',
+      '点击右上角「添加节点」，填入对端地址与本机采集令牌即可加入统一视图。',
+      state.isAdmin ? '<button class="btn sm" id="btn-host-add-empty">添加节点</button>' : ''
+    )}</td></tr>`;
+    const addEmpty = $('#btn-host-add-empty');
+    if (addEmpty) addEmpty.addEventListener('click', () => $('#btn-host-add').click());
+    updateHostSelLabel(); return;
+  }
+  if (!hosts.length) {
+    $('#hosts-table tbody').innerHTML = '<tr><td colspan="14" class="muted">没有符合筛选条件的节点</td></tr>';
+    updateHostSelLabel(); return;
+  }
+
+  $('#hosts-table tbody').innerHTML = hosts.map(h => {
+    const s = h.summary || {};
+    const online = h.online;
+    const tone = !online ? 'crit' : s.health === 'crit' ? 'crit' : s.health === 'warn' ? 'warn' : 'ok';
+    const health = !online ? '离线' : HOST_HEALTH_TEXT[s.health] || s.health || '未知';
+    const ctrls = (s.controllers || []).map(c => `C${c.ctrl}`).join(' ') || '—';
+    const bad = Number(s.disks_bad_count || 0);
+    const deg = Number(s.vds_degraded || 0);
+    const ops = [
+      online && !h.local ? `<button class="btn sm ghost" data-open="${esc(h.address)}">打开</button>` : '',
+      state.isAdmin ? `<button class="btn sm ghost" data-edit="${esc(h.id)}">编辑</button>` : '',
+      state.isAdmin && !h.local ? `<button class="btn sm ghost" data-remove="${esc(h.id)}">移除</button>` : '',
+    ].filter(Boolean).join(' ');
+    return `<tr>
+      <td><input type="checkbox" data-pick="${esc(h.id)}" ${sel.has(Number(h.id)) ? 'checked' : ''} /></td>
+      <td><span class="host-dot ${tone}" title="${online ? '在线' : esc(h.error || '离线')}"></span></td>
+      <td>${esc(h.name)}${h.local ? ' <span class="badge info">本机</span>' : ''}${h.enabled ? '' : ' <span class="badge">已停用</span>'}</td>
+      <td class="tiny">${esc(h.group_name || '—')}</td>
+      <td class="num">${esc(h.address)}</td>
+      <td>${online ? `<span class="badge ${tone === 'ok' ? 'ok' : tone === 'warn' ? 'warn' : 'crit'}">${esc(health)}</span>` : `<span class="tiny" style="color:var(--crit)">${esc(h.error || '离线')}</span>`}</td>
+      <td class="num">${esc(ctrls)}</td>
+      <td class="num">${online ? esc(s.disks_total || 0) : '—'}${bad ? ` <span class="badge crit">${esc(bad)}</span>` : ''}</td>
+      <td class="num">${online ? esc(s.vds_total || 0) : '—'}${deg ? ` <span class="badge warn">${esc(deg)}</span>` : ''}</td>
+      <td class="num">${online && s.max_temp != null ? esc(s.max_temp) + '°C' : '—'}</td>
+      <td class="num">${online ? esc(s.alerts_open || 0) : '—'}</td>
+      <td class="num">${online ? esc(s.tasks_active || 0) : '—'}</td>
+      <td class="num">${esc(h.last_seen || '—')}</td>
+      <td class="ops">${ops || '<span class="tiny">—</span>'}</td>
+    </tr>`;
+  }).join('');
+
+  $$('#hosts-table [data-pick]').forEach(cb => cb.addEventListener('change', () => {
+    const id = Number(cb.dataset.pick);
+    if (cb.checked) sel.add(id); else sel.delete(id);
+    updateHostSelLabel();
+  }));
+  updateHostSelLabel();
+
+  $$('#hosts-table [data-open]').forEach(b =>
+    b.addEventListener('click', () => window.open(b.dataset.open, '_blank'))
+  );
+  $$('#hosts-table [data-edit]').forEach(b =>
+    b.addEventListener('click', () => openHostModal(Number(b.dataset.edit)))
+  );
+  $$('#hosts-table [data-remove]').forEach(b =>
+    b.addEventListener('click', () => {
+      const id = Number(b.dataset.remove);
+      const h = hosts.find(x => Number(x.id) === id) || {};
+      confirmModal(
+        '移除节点',
+        `<p>确认从本中心移除「<strong>${esc(h.name || '')}</strong>」？</p>
+         <p class="tiny">仅移除监控登记，不会对被管节点本身做任何改动。</p>`,
+        '移除',
+        true,
+        async () => {
+          await api(`/api/hosts/${id}/remove`, { method: 'POST' });
+          toast('节点已移除', 'ok');
+          await loadHosts();
+        }
+      );
+    })
+  );
+}
+
+function openHostModal(hostId) {
+  const isEdit = !!hostId;
+  const h = isEdit ? (_hostsCache.find(x => Number(x.id) === Number(hostId)) || {}) : {};
+  showModal({
+    title: isEdit ? `编辑节点 ${h.name || ''}` : '添加存储节点',
+    body: `<div class="field"><label for="h-name">名称</label>
+        <input class="input" id="h-name" value="${esc(h.name || '')}" placeholder="如：机房A-存储01" /></div>
+      <div class="field"><label for="h-addr">地址</label>
+        <input class="input mono" id="h-addr" value="${esc(h.address || '')}" placeholder="http://192.168.88.30:5200" /></div>
+      <div class="field"><label for="h-token">采集令牌</label>
+        <input class="input mono" id="h-token" value="" placeholder="${isEdit ? '留空表示不修改' : '被管节点「多机管理 → 本机采集令牌」中的值'}" /></div>
+      <div class="field"><label for="h-note">备注（选填）</label>
+        <input class="input" id="h-note" value="${esc(h.note || '')}" /></div>
+      <p class="tiny">被管节点需与本中心运行同一产品，并在其「多机管理」页面复制采集令牌。</p>`,
+    actions: [
+      { label: '取消', handler: closeModal },
+      {
+        label: isEdit ? '保存' : '添加',
+        cls: 'primary',
+        handler: async btn => {
+          btnLoading(btn, true);
+          const body = {
+            name: $('#h-name').value.trim(),
+            address: $('#h-addr').value.trim(),
+            note: $('#h-note').value.trim(),
+          };
+          const tk = $('#h-token').value.trim();
+          if (tk) body.token = tk;
+          try {
+            if (isEdit) await api(`/api/hosts/${hostId}`, { method: 'POST', body });
+            else await api('/api/hosts', { method: 'POST', body });
+            toast(isEdit ? '节点已保存' : '节点已添加', 'ok');
+            closeModal();
+            await loadHosts();
+          } catch (e) {
+            toast(e.message, 'error');
+            btnLoading(btn, false);
+          }
+        },
+      },
+    ],
+  });
+}
+
+let _hostsCache = [];
+
+async function loadAgentToken() {
+  if (!state.isAdmin) return;
+  try {
+    const d = await api('/api/agent/token');
+    $('#agent-token').textContent = d.token || '—';
+    const t = $('#remote-ack-toggle');
+    if (t) t.checked = !!d.remote_ack;
+  } catch (e) {
+    $('#agent-token').textContent = '—';
+  }
+}
+
+function bindHostsUI() {
+  const refresh = $('#btn-hosts-refresh');
+  if (refresh) {
+    refresh.addEventListener('click', async () => {
+      btnLoading(refresh, true);
+      try {
+        const d = await api('/api/hosts/refresh', { method: 'POST' });
+        const off = (d.results || []).filter(r => !r.online);
+        toast(off.length ? `采集完成，${off.length} 台离线` : '采集完成，全部在线', off.length ? 'error' : 'ok');
+        _hostsCache = d.hosts || [];
+        renderHosts({ hosts: _hostsCache, stats: { total: _hostsCache.length, online: _hostsCache.filter(h => h.online).length, offline: _hostsCache.filter(h => !h.online).length }, last: {} });
+      } catch (e) {
+        toast(e.message, 'error');
+      } finally {
+        btnLoading(refresh, false);
+      }
+    });
+  }
+  const add = $('#btn-host-add');
+  if (add) add.addEventListener('click', () => openHostModal(null));
+  const copy = $('#btn-token-copy');
+  if (copy) {
+    copy.addEventListener('click', async () => {
+      const t = $('#agent-token').textContent;
+      if (!t || t === '—') return;
+      try {
+        await navigator.clipboard.writeText(t);
+        toast('令牌已复制', 'ok');
+      } catch (e) {
+        toast('复制失败，请手动选择文本', 'error');
+      }
+    });
+  }
+  const rot = $('#btn-token-rotate');
+  if (rot) {
+    rot.addEventListener('click', () => {
+      confirmModal(
+        '重置采集令牌',
+        '<p>重置后，所有已经用旧令牌登记本机的中心都会采集失败，需要重新填入新令牌。</p>',
+        '确认重置',
+        true,
+        async () => {
+          const d = await api('/api/agent/token/rotate', { method: 'POST' });
+          $('#agent-token').textContent = d.token || '—';
+          toast('令牌已重置', 'ok');
+        }
+      );
+    });
+  }
+}
+
+async function loadLicense() {
+  const box = $('#license-body');
+  if (!box) return;
+  let d;
+  try {
+    d = await api('/api/license');
+  } catch (e) {
+    box.innerHTML = stateFromError(e);
+    return;
+  }
+  state.license = d.license || {};
+  renderLicense(state.license);
+}
+
+function renderLicense(L) {
+  const box = $('#license-body');
+  if (!box) return;
+
+  const tone = L.licensed ? 'ok' : L.trial ? 'info' : 'warn';
+  const badge = L.licensed
+    ? '<span class="badge ok">已授权</span>'
+    : L.trial
+      ? '<span class="badge info">试用中</span>'
+      : '<span class="badge warn">社区版</span>';
+
+  const rows = [
+    ['版本', esc(L.edition_name || '—')],
+    ['授权对象', esc(L.licensee || '—')],
+    ['序列号', esc(L.serial || '—')],
+    ['可管理设备数', L.seats ? esc(L.seats) : '—'],
+    ['签发日期', esc(L.issued_at || '—')],
+    ['到期日期', esc(L.expires_at || (L.licensed ? '永久' : '—'))],
+    L.trial ? ['试用剩余', `${esc(L.days_left)} 天`] : null,
+  ].filter(Boolean);
+
+  // 功能清单：一眼看出当前版本包含什么、缺什么
+  const feats = Object.values(L.features || {})
+    .map(f => `<span class="feat-pill ${f.enabled ? 'on' : 'off'}" title="${f.enabled ? '已包含' : '需要' + (({ pro: '专业版', enterprise: '企业版' })[f.edition] || f.edition)}">
+      ${f.enabled ? '✓' : '✕'} ${esc(f.name)}</span>`)
+    .join('');
+
+  box.innerHTML = `
+    <div class="license-head">
+      ${badge}
+      <span class="tiny">${esc(L.edition_name || '')}</span>
+      ${L.reason ? `<span class="tiny" style="color:var(--warn)">${esc(L.reason)}</span>` : ''}
+    </div>
+    <dl class="kv">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>
+    <div class="tiny" style="margin:12px 0 6px">功能清单</div>
+    <div class="feat-list">${feats}</div>
+    ${L.crypto_available ? '' : '<p class="tiny" style="color:var(--warn);margin-top:10px">运行环境缺少 cryptography 库，无法验证签名授权。</p>'}`;
+
+  if (state.isAdmin) {
+    $('#btn-license-install').classList.toggle('hidden', false);
+    $('#btn-license-remove').classList.toggle('hidden', !L.licensed);
+  }
+}
+
+function bindLicenseUI() {
+  const install = $('#btn-license-install');
+  const file = $('#license-file');
+  if (install && file) {
+    install.addEventListener('click', () => file.click());
+    file.addEventListener('change', async () => {
+      const f = file.files && file.files[0];
+      if (!f) return;
+      const text = await f.text();
+      try {
+        const r = await api('/api/license', { method: 'POST', body: { license: text } });
+        toast('授权已安装', 'ok');
+        state.license = r.license || {};
+        renderLicense(state.license);
+      } catch (e) {
+        toast(e.message, 'error');
+      } finally {
+        file.value = '';
+      }
+    });
+  }
+  const rm = $('#btn-license-remove');
+  if (rm) {
+    rm.addEventListener('click', () => {
+      confirmModal(
+        '移除授权',
+        '<p>移除后将从已授权版本退回社区版，报表、告警确认等增值功能将不可用。存储监控与磁盘管理不受影响。</p>',
+        '确认移除',
+        true,
+        async () => {
+          const r = await api('/api/license/remove', { method: 'POST' });
+          toast('授权已移除', 'ok');
+          state.license = r.license || {};
+          renderLicense(state.license);
+        }
+      );
+    });
+  }
+}
+
+let _reportPeriod = 'day';
+let _reportData = null;
+
+const REPORT_LEVEL_TEXT = { ok: '正常', info: '关注', warn: '建议更换', crit: '立即更换' };
+
+async function loadReports() {
+  const meta = $('#report-meta');
+  if (!meta) return;
+  meta.textContent = '生成中…';
+  try {
+    const d = await api('/api/reports/summary?period=' + encodeURIComponent(_reportPeriod));
+    _reportData = d.report;
+  } catch (e) {
+    meta.textContent = '加载失败：' + e.message;
+    return;
+  }
+  renderReport(_reportData);
+  loadReportSchedule();
+}
+
+function renderReport(r) {
+  if (!r) return;
+  const m = r.meta || {};
+  const healthText = { ok: '正常', warn: '警告', crit: '严重', unknown: '未知' }[r.health.overall] || r.health.overall;
+
+  $('#report-meta').innerHTML =
+    `主机 <strong>${esc(m.host || '')}</strong> · 周期 ${esc(m.title || '')} · 生成于 ${esc(m.generated_at || '')}` +
+    ` · 整体健康 ${stateBadge(r.health.overall === 'ok' ? 'Optimal' : r.health.overall === 'crit' ? 'Failed' : 'Degraded')}` +
+    ` <span class="tiny">${esc(healthText)}</span>`;
+
+  const cap = r.capacity || {};
+  const raid = r.raid || {};
+  const disks = r.disks || {};
+  const alerts = r.alerts || {};
+  const tasks = r.tasks || {};
+
+  const cards = [
+    ['已用容量', cap.used || '—', `占总容量 ${cap.use_percent != null ? cap.use_percent + '%' : '—'}`],
+    ['总容量', cap.size || '—', '文件系统合计'],
+    ['虚拟磁盘', String(raid.total || 0), raid.degraded ? `${raid.degraded} 个非最优` : '全部正常'],
+    ['物理磁盘', String(disks.total || 0), disks.avg_temp != null ? `均温 ${disks.avg_temp}°C` : '无温度数据'],
+    ['周期内告警', String(alerts.opened || 0), `恢复 ${alerts.resolved || 0} · 未处理 ${alerts.open_now || 0}`],
+    ['运维操作', String(tasks.total || 0), tasks.failed ? `${tasks.failed} 次失败` : '无失败'],
+  ];
+  $('#report-cards').innerHTML = cards
+    .map(([k, v, s], i) => `<div class="card" style="--d:${i}">
+      <div class="eyebrow">${esc(k)}</div>
+      <div class="stat-value">${esc(v)}</div>
+      <div class="stat-sub">${esc(s)}</div>
+    </div>`)
+    .join('');
+
+  const capRows = (cap.mounts || [])
+    .map(x => `<tr>
+      <td>${esc(x.mountpoint)}</td>
+      <td class="num">${esc(x.device || '—')}</td>
+      <td>${esc(x.fstype || '—')}</td>
+      <td class="num">${esc(x.size)}</td>
+      <td class="num">${esc(x.used)}</td>
+      <td class="num">${esc(x.avail)}</td>
+      <td class="num">${esc(x.use_percent)}%</td>
+      <td class="num">${esc(x.growth)}</td>
+    </tr>`)
+    .join('');
+  $('#report-cap-table tbody').innerHTML = capRows || '<tr><td colspan="8" class="muted">周期内无文件系统样本</td></tr>';
+
+  const vdRows = (raid.vds || [])
+    .map(v => `<tr>
+      <td class="num">C${esc(v.ctrl)}</td>
+      <td class="num">${esc(v.dg_vd || '—')}</td>
+      <td>${esc(v.type || '—')}</td>
+      <td class="num">${esc(v.size || '—')}</td>
+      <td>${stateBadge(v.state)}</td>
+    </tr>`)
+    .join('');
+  $('#report-vd-table tbody').innerHTML = vdRows || '<tr><td colspan="5" class="muted">无虚拟磁盘</td></tr>';
+
+  const wearRows = (disks.worn || [])
+    .map(d => `<tr>
+      <td class="num">${esc(d.label || '—')}</td>
+      <td class="num">${esc(d.reallocated)}</td>
+      <td class="num">${esc(d.pending)}</td>
+      <td class="num">${esc(d.uncorrectable)}</td>
+      <td><span class="badge ${d.level === 'crit' ? 'crit' : d.level === 'warn' ? 'warn' : d.level === 'info' ? 'info' : ''}">${esc(REPORT_LEVEL_TEXT[d.level] || d.level)}</span></td>
+    </tr>`)
+    .join('');
+  $('#report-wear-table tbody').innerHTML = wearRows || '<tr><td colspan="5" class="muted">无磁盘数据</td></tr>';
+
+  const growth = disks.smart_growth || [];
+  const bc = r.bcache || {};
+  $('#report-activity').innerHTML = `
+    <div class="report-activity">
+      <div>
+        <div class="tiny">周期内告警明细（${(alerts.items || []).length}）</div>
+        <div class="mini-list">${
+          (alerts.items || []).slice(0, 8).map(a =>
+            `<div class="mini-row"><span class="badge ${a.level === 'error' ? 'crit' : a.level === 'warning' ? 'warn' : 'info'}">${esc({ error: '错误', warning: '警告', info: '信息' }[a.level] || a.level)}</span>
+             <span class="mini-text">${esc(a.title)}</span><span class="tiny mono">${esc(a.first_seen)}</span></div>`
+          ).join('') || '<div class="muted">周期内没有新增告警</div>'
+        }</div>
+      </div>
+      <div>
+        <div class="tiny">周期内运维操作（${(tasks.items || []).length}）</div>
+        <div class="mini-list">${
+          (tasks.items || []).slice(0, 8).map(t =>
+            `<div class="mini-row"><span class="badge ${t.status === 'failed' ? 'crit' : 'ok'}">${esc({ succeeded: '成功', failed: '失败', running: '执行中', queued: '排队中' }[t.status] || t.status)}</span>
+             <span class="mini-text">${esc(t.title)} ${esc(t.target || '')}</span><span class="tiny mono">${esc(t.created_at)}</span></div>`
+          ).join('') || '<div class="muted">周期内没有运维操作</div>'
+        }</div>
+      </div>
+      <div>
+        <div class="tiny">磁盘健康与缓存</div>
+        <div class="mini-list">
+          <div class="mini-row"><span class="mini-text">SMART 属性增长的磁盘</span><span class="tiny mono">${growth.length} 块</span></div>
+          ${growth.slice(0, 5).map(g => `<div class="mini-row"><span class="mini-text mono">${esc(g.disk)}</span>
+            <span class="tiny mono">重映射 +${esc(g.reallocated)} · 待定 +${esc(g.pending)} · 无法纠正 +${esc(g.uncorrectable)}</span></div>`).join('')}
+          ${(bc.devices || []).map(d => `<div class="mini-row"><span class="mini-text mono">${esc(d.device)}</span>
+            <span class="tiny mono">小时命中率 ${esc(d.latest_hour)}% · 均值 ${esc(d.avg_hour)}%</span></div>`).join('')}
+        </div>
+      </div>
+    </div>`;
+}
+
+function reportUrl(extra) {
+  return `/api/reports/export?period=${encodeURIComponent(_reportPeriod)}${extra || ''}`;
+}
+
+/* ---------- 报表定时投递 ---------- */
+
+function rschState(p, unit) {
+  if (!p) return '';
+  if (!p.valid_time) return '时间格式无效，这个周期不会触发';
+  const bits = [p.window_key === p.last_sent ? `本${unit}已投递` : `本${unit}待投递`];
+  if (p.retry_after) bits.push(`上次失败，${String(p.retry_after).slice(11, 16)} 重试`);
+  return bits.join(' · ');
+}
+
+async function loadReportSchedule() {
+  const box = $('#rsch-history');
+  if (!box) return;
+  let d;
+  try {
+    d = await api('/api/reports/schedule');
+  } catch (e) {
+    box.innerHTML = `<div class="muted tiny">加载失败：${esc(e.message)}</div>`;
+    return;
+  }
+  const cfg = d.config || {};
+  const ps = d.periods || {};
+
+  $('#rsch-enabled').checked = !!cfg.enabled;
+  $('#rsch-to').value = cfg.recipients || '';
+  if (cfg.recipients) {
+    $('#rsch-to-hint').textContent = '使用这里填写的收件人';
+  } else if (d.alert_email_to) {
+    $('#rsch-to-hint').textContent = `沿用告警收件人：${d.alert_email_to}`;
+  } else {
+    $('#rsch-to-hint').textContent = '告警收件人也是空的，投递会直接失败';
+  }
+  $('#rsch-sendmail').textContent =
+    `通过 ${d.sendmail_path || 'sendmail'} 发出，正文含 HTML 报表 + CSV 附件`;
+
+  const day = cfg.daily || {};
+  $('#rsch-daily-on').checked = !!day.enabled;
+  $('#rsch-daily-time').value = day.time || '08:00';
+  $('#rsch-daily-state').textContent = rschState(ps.day, '日');
+
+  const week = cfg.weekly || {};
+  $('#rsch-weekly-on').checked = !!week.enabled;
+  $('#rsch-weekly-day').value = String(week.weekday || 1);
+  $('#rsch-weekly-time').value = week.time || '08:30';
+  $('#rsch-weekly-state').textContent = rschState(ps.week, '周');
+
+  const month = cfg.monthly || {};
+  const mday = $('#rsch-monthly-day');
+  if (!mday.dataset.filled) {
+    mday.innerHTML = Array.from({ length: 31 }, (_, i) =>
+      `<option value="${i + 1}">${i + 1} 日</option>`).join('');
+    mday.dataset.filled = '1';
+  }
+  $('#rsch-monthly-on').checked = !!month.enabled;
+  mday.value = String(month.day || 1);
+  $('#rsch-monthly-time').value = month.time || '09:00';
+  $('#rsch-monthly-state').textContent = rschState(ps.month, '月');
+
+  const hist = cfg.history || [];
+  box.innerHTML = hist.length
+    ? '<div class="bay-side-sec-title">最近投递</div>' +
+      hist
+        .slice(0, 8)
+        .map(
+          (h) => `<div class="rsch-rec">
+        <span class="mono tiny">${esc(h.at || '')}</span>
+        <span class="st ${h.ok ? 'ok' : 'fail'}">${h.ok ? '成功' : '失败'}</span>
+        <span class="msg" title="${esc(h.message || '')}">${esc(h.label || '')} · ${esc(h.trigger || '')} · ${esc(h.message || '')}</span>
+      </div>`
+        )
+        .join('')
+    : '<div class="muted tiny">还没有投递记录。保存设置后可用「立即发送一份」验证收件人是否配通。</div>';
+}
+
+async function rschSave() {
+  const btn = $('#btn-report-sched-save');
+  btnLoading(btn, true);
+  try {
+    const d = await api('/api/reports/schedule', {
+      method: 'POST',
+      // 必须传对象：api() 只在 body 不是字符串时才补 Content-Type，
+      // 传字符串的话后端 get_json() 拿到 None，接口返回 200 但什么都没保存。
+      body: {
+        enabled: $('#rsch-enabled').checked,
+        recipients: $('#rsch-to').value.trim(),
+        daily: { enabled: $('#rsch-daily-on').checked, time: $('#rsch-daily-time').value },
+        weekly: {
+          enabled: $('#rsch-weekly-on').checked,
+          weekday: Number($('#rsch-weekly-day').value),
+          time: $('#rsch-weekly-time').value,
+        },
+        monthly: {
+          enabled: $('#rsch-monthly-on').checked,
+          day: Number($('#rsch-monthly-day').value),
+          time: $('#rsch-monthly-time').value,
+        },
+      },
+    });
+    toast(d.ok ? '投递设置已保存' : '保存失败', d.ok ? 'ok' : 'error');
+    await loadReportSchedule();
+  } catch (e) {
+    toast(e.message, 'error');
+  } finally {
+    btnLoading(btn, false);
+  }
+}
+
+async function rschSendNow() {
+  const btn = $('#btn-report-send');
+  btnLoading(btn, true);
+  try {
+    const r = await api('/api/reports/send', {
+      method: 'POST',
+      body: { period: _reportPeriod },
+    });
+    toast(r.ok ? `已投递：${r.message}` : `投递失败：${r.message}`, r.ok ? 'ok' : 'error');
+    await loadReportSchedule();
+  } catch (e) {
+    toast(e.message, 'error');
+  } finally {
+    btnLoading(btn, false);
+  }
+}
+
+/* ---------- 性能中心 ---------- */
+
+/* IO 慢的一键诊断：把结论按可能性排序，每条都带证据。
+   这里刻意不展示所有原始读数——用户来问"为什么慢"，需要的是判断，
+   不是再看一遍 IOPS。原始数据在下面的实时性能表里。 */
+const IODIAG_LEVEL = { crit: '严重', warn: '关注', info: '线索', ok: '正常' };
+
+async function runIoDiagnosis() {
+  const btn = $('#btn-iodiag');
+  const box = $('#iodiag-findings');
+  btnLoading(btn, true);
+  $('#iodiag-verdict').className = 'iodiag-verdict';
+  $('#iodiag-verdict').innerHTML = '<span class="muted tiny">采样中（约 2 秒）…</span>';
+  try {
+    const d = await api('/api/io/diagnose');
+    if (d.ok === false) throw new Error(d.error || '诊断失败');
+    $('#iodiag-at').textContent = d.at || '';
+    $('#iodiag-verdict').className = 'iodiag-verdict ' + (d.severity || '');
+    $('#iodiag-verdict').innerHTML =
+      `<span class="badge ${d.severity === 'crit' ? 'crit' : d.severity === 'warn' ? 'warn' : 'ok'}">`
+      + `${d.severity === 'crit' ? '存在瓶颈' : d.severity === 'warn' ? '需要关注' : '未见异常'}</span> `
+      + `<strong>${esc(d.summary || '')}</strong>`
+      + ((d.excluded || []).length
+        ? `<div class="tiny" style="margin-top:6px">已排除 ${d.excluded.length} 块系统盘：`
+          + d.excluded.map(x => `${esc(x.name)}（${esc(x.reason)}，${x.iops} IOPS / ${x.latency_ms}ms）`).join('、')
+          + ' —— 它属于设备自身操作系统，不计入存储性能判定。</div>'
+        : '');
+
+    const t = d.totals || {};
+    $('#iodiag-metrics').innerHTML = [
+      ['数据面 IOPS', t.iops != null ? String(t.iops) : '—', '已排除系统盘'],
+      ['数据面吞吐', fmtRate(t.bytes_per_sec || 0), '读 + 写'],
+      ['平均 IO 尺寸', t.avg_io_kb != null ? t.avg_io_kb + ' KB' : '—',
+        t.avg_io_kb == null ? '采样窗口内无 IO' : (t.avg_io_kb < 16 ? '偏小，随机为主' : '顺序为主')],
+      ['可用内存', d.mem_available_percent != null ? d.mem_available_percent + '%' : '—', '低于 10% 会放大 IO'],
+    ].map(([k, v, s]) => `<div class="card stat-card">
+        <div class="eyebrow">${esc(k)}</div>
+        <div class="stat-value">${esc(v)}</div>
+        <div class="stat-sub">${esc(s)}</div>
+      </div>`).join('');
+
+    box.innerHTML = (d.findings || []).map((f, i) => `
+      <div class="iodiag-finding ${esc(f.level)}">
+        <div class="head">
+          <span class="badge ${f.level === 'crit' ? 'crit' : f.level === 'warn' ? 'warn' : f.level === 'ok' ? 'ok' : 'info'}">
+            ${i === 0 && (f.level === 'crit' || f.level === 'warn') ? '首要' : esc(IODIAG_LEVEL[f.level] || f.level)}
+          </span>
+          <strong>${esc(f.title)}</strong>
+        </div>
+        <div class="why">${esc(f.detail)}</div>
+        ${f.advice ? `<div class="do">建议：${esc(f.advice)}</div>` : ''}
+      </div>`).join('');
+
+    const procs = d.processes || [];
+    $('#iodiag-procs').innerHTML = procs.length
+      ? `<div class="bay-side-sec-title" style="margin-top:16px">IO 占用最高的进程</div>
+         <div class="table-wrap">
+           <table class="data">
+             <thead><tr><th>PID</th><th>进程</th><th>命令行</th><th class="num">读</th><th class="num">写</th><th class="num">合计</th></tr></thead>
+             <tbody>${procs.map(p => `<tr>
+               <td class="mono">${p.pid}</td>
+               <td class="mono">${esc(p.name)}</td>
+               <td class="tiny">${esc((p.cmdline || '').slice(0, 110) || '—')}</td>
+               <td class="num mono">${fmtRate(p.read_bps)}</td>
+               <td class="num mono">${fmtRate(p.write_bps)}</td>
+               <td class="num mono">${fmtRate(p.total_bps)}</td>
+             </tr>`).join('')}</tbody>
+           </table>
+         </div>`
+      : '<div class="muted tiny" style="margin-top:14px">采样窗口内没有进程产生块设备 IO。</div>';
+  } catch (e) {
+    $('#iodiag-verdict').className = 'iodiag-verdict warn';
+    $('#iodiag-verdict').textContent = '诊断失败：' + e.message;
+    box.innerHTML = '';
+  } finally {
+    btnLoading(btn, false);
+  }
+}
+
+const PERF_ROLE = {
+  vd: '阵列虚拟盘', bcache: 'bcache 缓存卷', nvme: 'NVMe',
+  md: '软 RAID', system: '系统盘', disk: '数据盘',
+};
+
+/* ---------- 基准测试（唯一会写盘的功能） ---------- */
+let _benchTimer = null;
+
+function renderBench(d) {
+  const modeSel = $('#bench-mode');
+  if (modeSel && !modeSel.dataset.filled && (d.modes || []).length) {
+    modeSel.innerHTML = d.modes.map(m => `<option value="${esc(m.key)}">${esc(m.label)}</option>`).join('');
+    modeSel.value = 'rand-rw';
+    modeSel.dataset.filled = '1';
+  }
+  const sel = $('#bench-target');
+  if (sel && !sel.dataset.filled) {
+    const ts = d.targets || [];
+    sel.innerHTML = ts.length
+      ? ts.map(t => `<option value="${esc(t.mountpoint)}">${esc(t.mountpoint)} · ${esc(t.device)} · 空闲 ${t.free_mb} MB</option>`).join('')
+      : '<option value="">没有符合条件的测试目录</option>';
+    sel.dataset.filled = '1';
+  }
+  const running = !!d.running;
+  $('#btn-bench-start').disabled = running || !d.available || !(d.targets || []).length;
+  $('#btn-bench-cancel').disabled = !running;
+  $('#btn-bench-start').textContent = running ? '测试中…' : '开始测试';
+  $('#bench-state').textContent = d.available
+    ? (running ? (d.phase || '') : (d.finished_at ? `上次完成 ${d.finished_at}` : 'fio 就绪'))
+    : '未安装 fio';
+
+  // 实时值：运行中取最新采样点，结束后取 fio 的汇总
+  const live = d.live || [];
+  const last = live.length ? live[live.length - 1] : null;
+  const sum = d.summary || null;
+  const show = running && last ? last : sum;
+  $('#bk-iops').textContent = show && show.iops != null ? Math.round(show.iops).toLocaleString() : '—';
+  $('#bk-bw').textContent = show && show.bw_bytes != null ? (show.bw_bytes / 1048576).toFixed(1)
+    : (show && show.mbps != null ? show.mbps.toFixed(1) : '—');
+  const lat = show ? (show.lat_ms != null ? show.lat_ms : show.latency_ms) : null;
+  $('#bk-lat').textContent = lat != null ? Number(lat).toFixed(3) : '—';
+  $('#bk-p99').textContent = sum && sum.p99_ms != null ? sum.p99_ms : '—';
+  $('#bk-pct').textContent = running ? (d.progress || 0) + '%' : (sum ? '100%' : '—');
+  $('#bk-elapsed').textContent = running
+    ? `已运行 ${d.elapsed || 0}/${d.total || 0} 秒`
+    : (d.finished_at ? `完成于 ${d.finished_at.slice(11)}` : '');
+  $('#bench-bar-fill').style.width = (running ? (d.progress || 0) : (sum ? 100 : 0)) + '%';
+
+  $('#bench-summary').innerHTML = sum && sum.ok
+    ? [['IOPS（平均）', `${Math.round(sum.iops).toLocaleString()} ops/s`],
+       ['吞吐量（平均）', `${(sum.bw_bytes / 1048576).toFixed(1)} MB/s`],
+       ['平均延迟', `${sum.lat_ms} ms`],
+       ['P95 / P99', `${sum.p95_ms} / ${sum.p99_ms} ms`],
+       ['总数据量', `${(sum.total_bytes / 1073741824).toFixed(2)} GB`],
+       ['读写比例', `${sum.read_ratio}% 读 / ${(100 - sum.read_ratio).toFixed(1)}% 写`]]
+       .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')
+    : `<dt>状态</dt><dd>${esc(d.error || (d.cancelled ? '已取消' : '尚未测试'))}</dd>`;
+
+  const logs = d.log || [];
+  $('#bench-log').innerHTML = logs.length
+    ? logs.map(l => `<div class="row"><span class="t">${esc(l.at)}</span><span>${esc(l.msg)}</span></div>`).join('')
+    : '<span class="muted tiny">尚未测试</span>';
+}
+
+async function loadIoBench() {
+  try {
+    renderBench(await api('/api/io/bench'));
+  } catch (e) {
+    $('#bench-state').textContent = '加载失败';
+  }
+}
+
+async function startIoBench() {
+  if (!$('#bench-ack').checked) {
+    toast('请先勾选确认：允许在所选目录生成并删除临时文件', 'error');
+    return;
+  }
+  const btn = $('#btn-bench-start');
+  btnLoading(btn, true);
+  try {
+    const d = await api('/api/io/bench', {
+      method: 'POST',
+      body: {
+        target: $('#bench-target').value,
+        size_mb: Number($('#bench-size').value),
+        mode: $('#bench-mode').value,
+        threads: Number($('#bench-threads').value),
+        iodepth: Number($('#bench-qd').value),
+        bs: $('#bench-bs').value,
+        runtime: Number($('#bench-runtime').value),
+        ramp: Number($('#bench-ramp').value),
+        read_mix: Number($('#bench-mix').value),
+        drop_cache: $('#bench-nocache').checked,
+        direct: true,
+      },
+    });
+    if (d.ok) toast('基准测试已开始，期间带宽会被占满', 'ok');
+    await loadIoBench();
+    startBenchPoll();
+  } catch (e) {
+    toast(e.message, 'error');
+  } finally {
+    btnLoading(btn, false);
+  }
+}
+
+function startBenchPoll() {
+  if (_benchTimer) clearInterval(_benchTimer);
+  _benchTimer = setInterval(async () => {
+    if (state.view !== 'perf') return;
+    try {
+      const d = await api('/api/io/bench');
+      renderBench(d);
+      if (!d.running && _benchTimer) { clearInterval(_benchTimer); _benchTimer = null; }
+    } catch (e) { /* 忽略单次轮询失败 */ }
+  }, 1200);
+}
+const PERF_METRIC = {
+  iops: { idx: 1, unit: 'IOPS', label: 'IOPS' },
+  mbps: { idx: -1, unit: 'MB/s', label: '读+写带宽' },
+  latency: { idx: 4, unit: 'ms', label: '平均延迟' },
+  util: { idx: 5, unit: '%', label: '利用率' },
+};
+
+let _perfChart = null;
+let _perfTimer = null;
+let _perfDevices = [];
+let _perfMeta = {};
+
+function perfLatClass(ms) {
+  if (ms >= 200) return 'crit';
+  if (ms >= 50) return 'warn';
+  return 'ok';
+}
+
+function perfMountText(r) {
+  const m = (r.mounts || []).join(', ');
+  if (m) return m;
+  const s = (r.serves || []).filter(x => (x.mounts || []).length);
+  if (s.length) return `${s[0].holder} → ${s[0].mounts.join(', ')}`;
+  return '';
+}
+
+async function loadPerfLive() {
+  const tb = $('#perf-table tbody');
+  if (!tb) return;
+  let d;
+  try {
+    d = await api('/api/perf/live');
+  } catch (e) {
+    tb.innerHTML = `<tr><td colspan="9">${stateFromError(e)}</td></tr>`;
+    return;
+  }
+  if (d.ok === false) {
+    tb.innerHTML = `<tr><td colspan="9" class="muted">采集失败：${esc(d.error || '未知错误')}</td></tr>`;
+    return;
+  }
+  const t = d.total || {};
+  _perfMeta = {};
+  (d.rows || []).forEach(r => { _perfMeta[r.name] = r; });
+
+  $('#perf-at').textContent = `${d.at || ''} · ${d.interval || 0}s 采样`;
+  $('#perf-cards').innerHTML = [
+    ['总 IOPS', (t.iops || 0).toFixed(0), '全部块设备合计'],
+    ['读带宽', fmtRate(t.read_bps || 0), '采样窗口内的平均速率'],
+    ['写带宽', fmtRate(t.write_bps || 0), '采样窗口内的平均速率'],
+    ['最忙设备', d.busiest || '—', d.busiest ? `利用率 ${d.busiest_util}%` : '当前无 IO'],
+  ].map(([k, v, s]) => `<div class="card stat-card">
+      <div class="eyebrow">${esc(k)}</div>
+      <div class="stat-value">${esc(v)}</div>
+      <div class="stat-sub">${esc(s)}</div>
+    </div>`).join('');
+
+  tb.innerHTML = (d.rows || []).map(r => {
+    const lat = r.latency_ms || 0;
+    const util = r.util_percent || 0;
+    const mount = perfMountText(r);
+    return `<tr>
+      <td class="mono">${esc(r.name)}</td>
+      <td><span class="badge ${r.role === 'vd' || r.role === 'bcache' ? 'info' : ''}">${esc(PERF_ROLE[r.role] || r.role)}</span></td>
+      <td>${esc(r.model || '—')}${mount ? `<div class="tiny mono">${esc(mount)}</div>` : ''}</td>
+      <td class="num mono">${(r.iops || 0).toFixed(1)}</td>
+      <td class="num mono">${fmtRate(r.read_bps || 0)}</td>
+      <td class="num mono">${fmtRate(r.write_bps || 0)}</td>
+      <td class="num mono"><span class="cap-days ${perfLatClass(lat)}">${lat.toFixed(2)} ms</span></td>
+      <td class="num mono">${util.toFixed(1)}%</td>
+      <td class="num mono">${(r.queue_depth || 0).toFixed(2)}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="9">' + stateBlock('empty', '没有可展示的块设备', '', '', true) + '</td></tr>';
+}
+
+function perfDevicesFromHistory(devices) {
+  if (_perfDevices.length) return;
+  // 默认只看前三个设备：全画上去图例就成了一堵墙，看不出任何趋势
+  const preferred = devices.filter(n => (_perfMeta[n] || {}).role === 'vd' || (_perfMeta[n] || {}).role === 'bcache');
+  _perfDevices = (preferred.length ? preferred : devices).slice(0, 3);
+}
+
+async function loadPerfTrend() {
+  const empty = $('#perf-chart-empty');
+  const canvas = $('#perf-chart');
+  if (!canvas) return;
+  let d;
+  try {
+    d = await api('/api/perf/history?hours=' + state.perfHours);
+  } catch (e) {
+    empty.textContent = '加载失败：' + e.message;
+    empty.classList.remove('hidden');
+    return;
+  }
+  const devices = d.devices || [];
+  perfDevicesFromHistory(devices);
+  const chips = $('#perf-dev-chips');
+  chips.innerHTML = devices.map((n, i) => {
+    const on = _perfDevices.includes(n);
+    return `<button class="perf-dev-chip ${on ? 'on' : ''}" data-dev="${esc(n)}">
+      <span class="sw" style="color:${chartPalette()[i % 6]}"></span>${esc(n)}
+      <span class="sub">${esc(PERF_ROLE[(_perfMeta[n] || {}).role] || '')}</span>
+    </button>`;
+  }).join('');
+
+  const metric = PERF_METRIC[state.perfMetric] || PERF_METRIC.iops;
+  const datasets = [];
+  (d.series || []).forEach((s, i) => {
+    if (!_perfDevices.includes(s.name)) return;
+    const color = chartPalette()[i % 6];
+    datasets.push({
+      label: s.name,
+      data: (s.points || []).map(p => ({
+        x: p[0],
+        y: metric.idx === -1 ? Number(((p[2] || 0) + (p[3] || 0)).toFixed(2)) : p[metric.idx],
+      })),
+      borderColor: color,
+      backgroundColor: color,
+    });
+  });
+
+  if (_perfChart) { _perfChart.destroy(); _perfChart = null; }
+  if (!datasets.length || typeof Chart === 'undefined') {
+    empty.textContent = typeof Chart === 'undefined' ? '图表组件加载失败' : '暂无数据（历史样本按采集间隔累积，刚部署时需要等几轮）';
+    empty.classList.remove('hidden');
+    canvas.style.visibility = 'hidden';
+    return;
+  }
+  empty.classList.add('hidden');
+  canvas.style.visibility = 'visible';
+
+  const css = getComputedStyle(document.body);
+  const tick = css.getPropertyValue('--muted-foreground').trim() || '#7f8b9a';
+  const grid = css.getPropertyValue('--border').trim() || '#e2e7ee';
+  const tt = css.getPropertyValue('--popover').trim() || '#fff';
+  const tti = css.getPropertyValue('--popover-foreground').trim() || '#26303d';
+  const fmt = state.perfHours > 24 ? fmtDayClock : fmtClock;
+  datasets.forEach(ds => { ds.borderWidth = 1.8; ds.pointRadius = 0; ds.pointHitRadius = 8; ds.tension = 0.34; });
+
+  _perfChart = new Chart(canvas, {
+    type: 'line',
+    data: { datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 900, easing: 'easeOutQuart' },
+      interaction: { mode: 'nearest', intersect: false },
+      plugins: {
+        legend: {
+          labels: {
+            color: tick, boxWidth: 12, boxHeight: 2, usePointStyle: true, pointStyle: 'line', padding: 16,
+            font: { family: "'DM Sans', 'PingFang SC', sans-serif", size: 11, weight: '500' },
+          },
+        },
+        tooltip: {
+          backgroundColor: tt, titleColor: tti, bodyColor: tti, borderColor: grid, borderWidth: 1,
+          padding: 11, cornerRadius: 10,
+          titleFont: { family: "'JetBrains Mono', monospace", size: 11, weight: '600' },
+          bodyFont: { family: "'JetBrains Mono', monospace", size: 11 },
+          callbacks: {
+            title: (items) => items.length ? fmtDayClock(items[0].parsed.x) : '',
+            label: (item) => `${item.dataset.label}: ${item.parsed.y} ${metric.unit}`,
+          },
+        },
+      },
+      scales: {
+        x: {
+          type: 'linear',
+          ticks: { color: tick, maxTicksLimit: 8, callback: (v) => fmt(v) },
+          grid: { color: grid, drawTicks: false },
+          border: { display: false },
+        },
+        y: {
+          beginAtZero: true,
+          ticks: { color: tick, maxTicksLimit: 6 },
+          grid: { color: grid, drawTicks: false },
+          border: { display: false },
+          title: { display: true, text: metric.label, color: tick, font: { size: 11 } },
+        },
+      },
+    },
+  });
+}
+
+function startPerfAuto() {
+  if (_perfTimer) clearInterval(_perfTimer);
+  _perfTimer = setInterval(() => {
+    if (state.view !== 'perf') return;
+    if (!$('#perf-auto') || !$('#perf-auto').checked) return;
+    loadPerfLive();
+  }, 5000);
+}
+
+/* ---------- 服务器目录选择器 ---------- */
+async function pickServerDir(inputId) {
+  const input = $('#' + inputId);
+  if (!input) return;
+  let cur = input.value || '/mnt';
+  const mask = document.createElement('div');
+  mask.className = 'dirpick-mask';
+  mask.innerHTML = `<div class="dirpick">
+    <div class="dirpick-head">
+      <button class="btn sm ghost" data-up type="button">上一级</button>
+      <span class="dirpick-path"></span>
+      <button class="btn sm ghost" data-close type="button">关闭</button>
+    </div>
+    <div class="dirpick-list"></div>
+    <div class="dirpick-foot">
+      <span class="tiny" style="margin-right:auto;color:var(--ink-faint)">只列当前层目录，不递归扫描</span>
+      <button class="btn sm primary" data-choose type="button">选择此目录</button>
+    </div>
+  </div>`;
+  document.body.appendChild(mask);
+
+  const listEl = mask.querySelector('.dirpick-list');
+  const pathEl = mask.querySelector('.dirpick-path');
+  let parentPath = '/';
+
+  async function go(path) {
+    listEl.innerHTML = '<div class="state loading compact"><div class="t">读取中…</div></div>';
+    try {
+      const d = await api('/api/fs/browse?path=' + encodeURIComponent(path));
+      cur = d.path;
+      parentPath = d.parent || '/';
+      pathEl.textContent = cur;
+      input.dataset.cur = cur;
+      listEl.innerHTML = (d.dirs || []).length
+        ? d.dirs.map(x => `<button class="dirpick-row" type="button" data-dir="${esc(x.path)}">
+            <span class="nm">${esc(x.name)}</span>
+            ${x.is_mount ? '<span class="tag">挂载点</span>' : ''}
+            ${x.writable ? '' : '<span class="tag">只读</span>'}
+          </button>`).join('')
+        : '<div class="state empty compact"><div class="t">没有子目录</div></div>';
+      listEl.querySelectorAll('[data-dir]').forEach(b =>
+        b.addEventListener('click', () => go(b.dataset.dir)));
+    } catch (e) {
+      listEl.innerHTML = `<div class="state error compact"><div class="t">读取失败</div><div class="d">${esc(e.message)}</div></div>`;
+    }
+  }
+
+  mask.querySelector('[data-up]').addEventListener('click', () => go(parentPath));
+  mask.querySelector('[data-close]').addEventListener('click', () => mask.remove());
+  mask.querySelector('[data-choose]').addEventListener('click', () => {
+    input.value = cur;
+    mask.remove();
+  });
+  mask.addEventListener('click', (ev) => { if (ev.target === mask) mask.remove(); });
+  document.addEventListener('keydown', function esc(ev) {
+    if (ev.key === 'Escape') { mask.remove(); document.removeEventListener('keydown', esc); }
+  });
+  await go(cur);
+}
+
+/* ---------- 数据备份与恢复 ---------- */
+
+async function loadFsPaths() {
+  const dl = $('#db-paths');
+  if (!dl || dl.dataset.filled) return;
+  try {
+    const d = await api('/api/fs/paths');
+    dl.innerHTML = (d.paths || []).map(p =>
+      `<option value="${esc(p.path)}">${esc(p.kind === 'mount' ? (p.fstype || '挂载点') : '目录')}${p.writable ? '' : ' · 只读'}</option>`
+    ).join('');
+    dl.dataset.filled = '1';
+  } catch (e) { /* 路径候选失败不影响手输 */ }
+}
+
+async function loadDataBackup() {
+  try {
+    const d = await api('/api/data_backup');
+    const el = $('#dbackup-state');
+    if (el) el.textContent = d.running ? (d.phase || '运行中') : (d.finished ? `上次 ${d.finished}` : '就绪');
+  } catch (e) { /* 状态读取失败不阻塞页面 */ }
+}
+
+async function startDataBackup() {
+  const body = {
+    kind: $('#db-kind').value,
+    name: $('#db-name').value.trim() || 'backup',
+    source: $('#db-source').value.trim(),
+    target: $('#db-target').value.trim(),
+    keep: Number($('#db-keep').value) || 7,
+  };
+  if (!body.source || !body.target) { toast('请填写源目录与目标', 'error'); return; }
+  const btn = $('#btn-dbackup-start');
+  btnLoading(btn, true);
+  try {
+    const r = await api('/api/data_backup', { method: 'POST', body });
+    if (r.ok) toast('备份已开始，完成后可在「加载归档」里看到', 'ok');
+    await loadDataBackup();
+  } catch (e) { toast(e.message, 'error'); }
+  finally { btnLoading(btn, false); }
+}
+
+async function loadBackupSchedule() {
+  try {
+    const d = await api('/api/data_backup/schedule');
+    const s = (d.schedules || [])[0] || {};
+    $('#db-sched-on').checked = !!s.enabled;
+    $('#db-sched-freq').value = s.freq || 'daily';
+    $('#db-sched-time').value = s.time || '02:00';
+    $('#db-sched-state').textContent = s.id ? `已配置（${s.freq || 'daily'} ${s.time || ''}）` : '未配置';
+  } catch (e) { /* 忽略 */ }
+}
+
+async function saveBackupSchedule() {
+  const schedule = {
+    id: 'bkp-1',
+    enabled: $('#db-sched-on').checked,
+    freq: $('#db-sched-freq').value,
+    time: $('#db-sched-time').value,
+    name: $('#db-name').value.trim() || 'backup',
+    job: {
+      kind: $('#db-kind').value,
+      name: $('#db-name').value.trim() || 'backup',
+      source: $('#db-source').value.trim(),
+      target: $('#db-target').value.trim(),
+      keep: Number($('#db-keep').value) || 7,
+    },
+  };
+  if (!schedule.job.source || !schedule.job.target) { toast('请先填写源目录与目标', 'error'); return; }
+  try {
+    await api('/api/data_backup/schedule', { method: 'POST', body: { schedule } });
+    toast('定时备份已保存', 'ok');
+    await loadBackupSchedule();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function loadBackupArchives() {
+  const tb = $('#db-archives tbody');
+  const dest = $('#db-target').value.trim();
+  if (!dest) { toast('请先填写目标目录', 'error'); return; }
+  tb.innerHTML = '<tr><td colspan="6" class="muted">读取中…</td></tr>';
+  try {
+    const d = await api('/api/data_backup/archives?dest=' + encodeURIComponent(dest));
+    const list = d.archives || [];
+    tb.innerHTML = list.length ? list.map(a => `<tr>
+      <td class="mono tiny">${esc(a.archive.split('/').pop())}</td>
+      <td>${esc(a.level)}</td>
+      <td class="tiny">${esc(a.created_at)}</td>
+      <td class="num mono">${fmtBytes(a.bytes)}</td>
+      <td class="num">${a.verified ? '<span class="badge ok">已签名</span>' : '<span class="badge warn">无清单</span>'}</td>
+      <td><button class="btn sm ghost" data-db-dry="${esc(a.archive)}">演练</button>
+          <button class="btn sm ghost" data-db-restore="${esc(a.archive)}">恢复</button></td>
+    </tr>`).join('') : `<tr><td colspan="6">${stateBlock('empty', '这个目录还没有备份', '先填好源目录，点「开始备份」。', '', true)}</td></tr>`;
+    $$('#db-archives [data-db-dry]').forEach(b => b.addEventListener('click', () => restoreArchive(b.dataset.dbDry, true)));
+    $$('#db-archives [data-db-restore]').forEach(b => b.addEventListener('click', () => restoreArchive(b.dataset.dbRestore, false)));
+  } catch (e) {
+    tb.innerHTML = `<tr><td colspan="6">${stateFromError(e)}</td></tr>`;
+  }
+}
+
+async function restoreArchive(archive, dry) {
+  const target = $('#db-target').value.trim() + '/restore-' + Date.now().toString().slice(-6);
+  try {
+    const r = await api('/api/data_backup/restore_chain', {
+      method: 'POST',
+      body: { archive, target, dry_run: dry },
+    });
+    if (dry) {
+      toast(`演练通过：将写入 ${r.entries} 个条目到 ${target}`, 'ok');
+    } else {
+      toast(`已按 ${r.steps} 份归档恢复到 ${r.target}`, 'ok');
+    }
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+/* ---------- 容量预测 ---------- */
+
+function capDaysCell(days, label) {
+  if (days === null || days === undefined) return `<span class="cap-days flat">—</span>`;
+  if (days === 0) return `<span class="cap-days crit">已达${label}</span>`;
+  const cls = days <= 7 ? 'crit' : days <= 30 ? 'warn' : 'ok';
+  return `<span class="cap-days ${cls}">${days} 天</span>`;
+}
+
+async function loadCapacityForecast() {
+  const tb = $('#cap-table tbody');
+  if (!tb) return;
+  tb.innerHTML = '<tr><td colspan="9" class="muted">分析中…</td></tr>';
+  let d;
+  try {
+    d = await api('/api/capacity/forecast');
+  } catch (e) {
+    tb.innerHTML = `<tr><td colspan="9">${stateFromError(e)}</td></tr>`;
+    return;
+  }
+  const items = d.items || [];
+  $('#cap-note').textContent = `拟合窗口 ${d.window_days || 14} 天 · ${d.generated_at || ''}`;
+
+  const risk = d.risk || [];
+  $('#cap-risk').innerHTML = risk.map(r => {
+    const crit = (r.days_to_90 || 999) <= 7;
+    return `<div class="cap-risk-item ${crit ? 'crit' : ''}">
+      <span class="badge ${crit ? 'crit' : 'warn'}">${crit ? '紧迫' : '关注'}</span>
+      <strong>${esc(r.mountpoint)}</strong>
+      <span>预计 <strong>${r.days_to_90}</strong> 天后达到 90%（${esc(r.eta_90)}），
+        约 ${r.days_to_full} 天后写满（${esc(r.eta_full)}）</span>
+    </div>`;
+  }).join('');
+  if (risk.length) $('#cap-risk').style.marginBottom = '14px';
+
+  tb.innerHTML = items.map(i => {
+    const r2 = i.r2;
+    const conf = r2 === null || r2 === undefined ? '<span class="muted">—</span>'
+      : `<span class="mono">${r2.toFixed(2)}</span>${r2 < 0.5 ? '<div class="tiny">波动大</div>' : ''}`;
+    const grow = i.growth_per_day === null || i.growth_per_day === undefined
+      ? '<span class="muted">—</span>'
+      : (i.growth_per_day === 0 ? '<span class="muted">基本不增长</span>' : fmtBytes(i.growth_per_day) + '/天');
+    return `<tr>
+      <td>
+        <strong>${esc(i.mountpoint)}</strong>
+        <div class="tiny mono">${esc(i.device || '')}</div>
+        ${i.note ? `<div class="tiny">${esc(i.note)}</div>` : ''}
+      </td>
+      <td>${esc(i.fstype || '')}</td>
+      <td class="num">${fmtBytes(i.size)}</td>
+      <td class="num">${fmtBytes(i.used)}</td>
+      <td class="num mono">${i.use_percent}%</td>
+      <td class="num">${grow}</td>
+      <td>${capDaysCell(i.days_to_90, '90%')}${i.eta_90 ? `<div class="tiny mono">${esc(i.eta_90)}</div>` : ''}</td>
+      <td>${capDaysCell(i.days_to_full, '满')}${i.eta_full ? `<div class="tiny mono">${esc(i.eta_full)}</div>` : ''}</td>
+      <td class="num">${conf}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="9">' + stateBlock('empty', '暂无可分析的文件系统', '容量预测需要至少 6 小时的历史样本。', '', true) + '</td></tr>';
+}
+
+/* ---------- 硬件环境 ---------- */
+
+/* ---------- 机箱背板（SES）---------- */
+
+async function loadEnclosure() {
+  const box = $('#ses-slots');
+  if (!box) return;
+  let d;
+  try {
+    d = await api('/api/enclosure');
+  } catch (e) {
+    box.innerHTML = `<div class="muted tiny">加载失败：${esc(e.message)}</div>`;
+    return;
+  }
+  if (!d.available) {
+    $('#ses-note').textContent = d.error || '未发现 SES 背板';
+    $('#ses-cards').innerHTML = '';
+    box.innerHTML = '<div class="muted tiny">这台机器没有可读的 SES 机箱背板——直连背板或未启用 SES 时属正常情况。</div>';
+    $('#ses-issues').innerHTML = '';
+    return;
+  }
+  const t = d.totals || {};
+  const enc = (d.enclosures || [])[0] || {};
+  $('#ses-note').textContent = `${enc.vendor || ''} ${enc.model || ''} · ${enc.device || ''} · WWID ${enc.wwid || '—'}`;
+  $('#ses-cards').innerHTML = [
+    ['背板数量', String(t.enclosures || 0), 'SES 设备'],
+    ['槽位总数', String(t.slots || 0), enc.slots_unsupported ? `另有 ${enc.slots_unsupported} 个未实现槽位` : '按背板实际能力'],
+    ['已装磁盘', String(t.installed || 0), `空槽 ${Math.max(0, (t.slots || 0) - (t.installed || 0))} 个`],
+    ['故障 / 定位灯', `${t.faults || 0} / ${t.locating || 0}`, t.faults ? '背板已标记故障' : '无故障标记'],
+  ].map(([k, v, s]) => `<div class="card stat-card">
+      <div class="eyebrow">${esc(k)}</div>
+      <div class="stat-value">${esc(v)}</div>
+      <div class="stat-sub">${esc(s)}</div>
+    </div>`).join('');
+
+  const issues = d.issues || [];
+  $('#ses-issues').innerHTML = issues.map(i => `
+    <div class="cache-finding warn" style="margin-top:12px">
+      <div class="cf-head">
+        <span class="badge warn">不一致</span>
+        <strong>${esc(i.title)}</strong>
+      </div>
+      <div class="cf-detail">${esc(i.detail)}</div>
+      ${i.advice ? `<div class="cf-advice">建议：${esc(i.advice)}</div>` : ''}
+    </div>`).join('');
+
+  box.innerHTML = (enc.slots || []).map(s => {
+    const cls = [
+      'ses-slot',
+      s.installed ? 'installed' : 'empty',
+      s.fault ? 'fault' : '',
+      s.locate ? 'locate' : '',
+    ].filter(Boolean).join(' ');
+    const stText = s.installed ? '已装盘' : (s.status || '空槽');
+    return `<div class="${cls}" title="槽位 ${s.slot} · ${esc(s.status)} · 供电 ${esc(s.power_status || '—')}">
+      <span class="n">#${s.slot}</span>
+      <span class="st">${esc(stText)}</span>
+      <span class="lamp">
+        <i class="${s.installed ? 'on-ok' : ''}"></i>
+        <i class="${s.fault ? 'on-crit' : ''}"></i>
+        <i class="${s.locate ? 'on-primary' : ''}"></i>
+      </span>
+    </div>`;
+  }).join('') || '<div class="muted tiny">背板未报告任何磁盘槽位</div>';
+}
+
+/* ---------- 维护计划 ---------- */
+
+let _maintView = null;
+
+function maintFreqText(p) {
+  const wd = ['', '周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+  if (p.freq === 'interval') return `每 ${p.interval_hours || '?'} 小时`;
+  if (p.freq === 'daily') return '每天';
+  if (p.freq === 'weekly') return `每${wd[p.weekday || 1]}`;
+  if (p.freq === 'monthly') return `每月 ${p.day || 1} 日`;
+  return p.freq;
+}
+
+async function loadMaintenance() {
+  const tb = $('#maint-table tbody');
+  if (!tb) return;
+  let d;
+  try {
+    d = await api('/api/maintenance');
+  } catch (e) {
+    tb.innerHTML = `<tr><td colspan="7">${stateFromError(e)}</td></tr>`;
+    return;
+  }
+  _maintView = d;
+  $('#maint-enabled').checked = !!(d.config || {}).enabled;
+
+  const sel = $('#maint-new-action');
+  if (sel && !sel.dataset.filled) {
+    sel.innerHTML = (d.actions || []).map(a => `<option value="${esc(a.key)}">${esc(a.label)}</option>`).join('');
+    sel.dataset.filled = '1';
+  }
+
+  const plans = d.plans || [];
+  const lastRun = (d.config || {}).last_run || {};
+  tb.innerHTML = plans.map(p => {
+    const ran = (d.config || {}).history || [];
+    const last = ran.find(h => String(h.plan_id) === String(p.id));
+    const done = p.last_run ? '本周期已执行' : '本周期待执行';
+    return `<tr>
+      <td><strong>${esc(p.name)}</strong></td>
+      <td>${esc((d.actions.find(a => a.key === p.action) || {}).label || p.action)}</td>
+      <td>${esc(maintFreqText(p))}</td>
+      <td class="mono">${esc(p.freq === 'interval' ? '—' : p.time || '')}</td>
+      <td class="tiny">${last ? esc(last.at) : '<span class="muted">—</span>'}</td>
+      <td class="num tiny">${esc(done)}</td>
+      <td><span class="maint-row-actions">
+        <button class="btn sm" data-maint-run="${p.id}">立即执行</button>
+        <button class="btn sm ghost" data-maint-del="${p.id}">删除</button>
+      </span></td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="7" class="muted">还没有维护计划。建议至少配一条「每周巡读」。</td></tr>';
+
+  const hist = (d.config || {}).history || [];
+  $('#maint-history').innerHTML = hist.length
+    ? '<div class="bay-side-sec-title">最近执行</div>' +
+      hist.slice(0, 6).map(h => `<div class="rsch-rec">
+        <span class="mono tiny">${esc(h.at || '')}</span>
+        <span class="st ${h.ok ? 'ok' : 'fail'}">${h.ok ? '已下发' : '失败'}</span>
+        <span class="msg" title="${esc(h.message || '')}">${esc(h.name || '')} · ${esc(h.trigger || '')} · ${esc(h.message || '')}</span>
+      </div>`).join('')
+    : '';
+}
+
+async function maintSave(plans) {
+  try {
+    const d = await api('/api/maintenance', {
+      method: 'POST',
+      body: { enabled: $('#maint-enabled').checked, plans },
+    });
+    if (d.ok) toast('维护计划已保存', 'ok');
+    await loadMaintenance();
+    return d.ok;
+  } catch (e) {
+    toast(e.message, 'error');
+    return false;
+  }
+}
+
+function maintCurrentPlans() {
+  const raw = (_maintView && _maintView.plans) || [];
+  // 只回传后端需要的字段：把 window_key / last_run 这类派生值写回去，
+  // 下次读取时会被当成计划的一部分，字段只会越滚越多。
+  return raw.map(p => ({
+    id: p.id, name: p.name, action: p.action, freq: p.freq,
+    enabled: p.enabled, time: p.time, weekday: p.weekday,
+    day: p.day, interval_hours: p.interval_hours, params: p.params || {},
+  }));
+}
+
+async function maintAdd() {
+  const action = $('#maint-new-action').value;
+  const freq = $('#maint-new-freq').value;
+  const name = $('#maint-new-name').value.trim() || ($('#maint-new-action').selectedOptions[0] || {}).text || '维护计划';
+  const plan = {
+    id: Date.now() % 100000,
+    name,
+    action,
+    freq,
+    enabled: true,
+    time: $('#maint-new-time').value || '02:00',
+    weekday: Number($('#maint-new-weekday').value) || 1,
+    day: 1,
+    interval_hours: 24,
+    params: { ctrl: 0 },
+  };
+  const plans = maintCurrentPlans();
+  plans.push(plan);
+  if (await maintSave(plans)) $('#maint-new-name').value = '';
+}
+
+/* ---------- 硬件环境 ---------- */
+
+/* ---------- 控制器与虚拟盘策略 ---------- */
+let _policyData = null;
+
+const POLICY_ONOFF_LABELS = {
+  on: '开启', off: '关闭',
+};
+
+async function loadCtrlPolicy() {
+  const box = $('#policy-body');
+  if (!box) return;
+  let d;
+  try {
+    d = await api('/api/ctrl_policy?ctrl=0');
+  } catch (e) {
+    box.innerHTML = stateFromError(e);
+    return;
+  }
+  _policyData = d;
+  const v = d.values || {};
+  const cat = d.catalog || { ctrl: [], vd: [] };
+  const rates = cat.ctrl.filter(c => c.type === 'int');
+  const switches = cat.ctrl.filter(c => c.type === 'onoff');
+
+  $('#policy-hint').textContent = `C${d.ctrl} · 读取于 ${new Date().toLocaleTimeString()}`;
+
+  box.innerHTML = `
+    <div class="bench-form" style="grid-template-columns:repeat(3,minmax(0,1fr))">
+      ${rates.map(c => `<div class="field">
+        <label for="pol-${esc(c.key)}">${esc(c.label)}</label>
+        <div style="display:flex;gap:8px">
+          <input class="input" id="pol-${esc(c.key)}" type="number" min="${c.values[0]}" max="${c.values[1]}" value="${esc(v[c.key] || '')}" />
+          <button class="btn sm" data-policy="${esc(c.key)}">应用</button>
+        </div></div>`).join('')}
+    </div>
+    <div class="policy-grid" style="margin-top:14px">
+      ${switches.map(c => `<label class="policy-item" title="${esc(c.risk || '')}">
+        <input type="checkbox" data-toggle="${esc(c.key)}" ${v[c.key] === 'on' ? 'checked' : ''} />
+        ${esc(c.label)}${c.risk ? ' <span class="tiny" style="color:var(--warn)">⚠</span>' : ''}
+      </label>`).join('')}
+    </div>
+    <div class="bay-side-sec-title" style="margin-top:16px">虚拟盘策略</div>
+    <div class="bench-form" style="grid-template-columns:repeat(5,minmax(0,1fr))">
+      <div class="field"><label for="vd-pick">虚拟盘</label>
+        <select class="select" id="vd-pick">
+          ${(d.vds || []).map(x => `<option value="${esc(x.vd)}">${esc(x.vd)} · ${esc(x.state)}</option>`).join('')
+            || '<option value="">无</option>'}
+        </select></div>
+      ${(cat.vd || []).map(x => `<div class="field"><label title="${esc(x.risk || '')}">${esc(x.label)}</label>
+        <select class="select" data-vdpolicy="${esc(x.key)}">
+          ${x.values.map(vv => `<option value="${esc(vv)}">${esc(vv)}</option>`).join('')}
+        </select></div>`).join('')}
+    </div>`;
+
+  $$('#policy-body [data-policy]').forEach(btn => btn.addEventListener('click', async () => {
+    const key = btn.dataset.policy;
+    const val = $(`#pol-${key}`).value;
+    await setCtrlPolicy(key, val);
+  }));
+  $$('#policy-body [data-toggle]').forEach(cb => cb.addEventListener('change', async () => {
+    await setCtrlPolicy(cb.dataset.toggle, cb.checked ? 'on' : 'off');
+  }));
+  $$('#policy-body [data-vdpolicy]').forEach(sel => sel.addEventListener('change', async () => {
+    const vd = $('#vd-pick').value;
+    if (vd === '') return;
+    if (sel.dataset.vdpolicy === 'accesspolicy' && sel.value !== 'RW') {
+      if (!window.confirm(`把 ${vd} 设为 ${sel.value} 会立即影响业务访问，确认继续？`)) {
+        await loadCtrlPolicy();
+        return;
+      }
+    }
+    try {
+      await api('/api/vd_policy', {
+        method: 'POST',
+        body: { ctrl: 0, vd: Number(vd.split('/').pop()), key: sel.dataset.vdpolicy, value: sel.value },
+      });
+      toast('已下发，稍后刷新查看状态', 'ok');
+    } catch (e) { toast(e.message, 'error'); }
+  }));
+}
+
+async function setCtrlPolicy(key, value) {
+  try {
+    await api('/api/ctrl_policy', { method: 'POST', body: { ctrl: 0, key, value } });
+    toast('策略已下发，稍后刷新查看', 'ok');
+    setTimeout(loadCtrlPolicy, 1500);
+  } catch (e) {
+    toast(e.message, 'error');
+    await loadCtrlPolicy();
+  }
+}
+
+async function loadPhyCounters() {
+  const box = $('#phy-body');
+  if (!box) return;
+  box.innerHTML = '<div class="muted tiny">读取中…</div>';
+  let d;
+  try {
+    d = await api('/api/phy_counters?ctrl=0');
+  } catch (e) {
+    box.innerHTML = `<div class="muted">读取失败：${esc(e.message)}</div>`;
+    return;
+  }
+  const rows = d.disks || [];
+  box.innerHTML = rows.length ? `<table class="data">
+    <thead><tr><th>磁盘</th><th>计数项</th><th class="num">值</th><th></th></tr></thead>
+    <tbody>${rows.map(x => {
+      const items = (x.phy || []).filter(p => String(p.v) !== '0');
+      if (!items.length) {
+        return `<tr><td class="mono">${esc(x.label)}</td><td colspan="2" class="muted">${esc(x.err || '无异常计数（全 0）')}</td>
+          <td><button class="btn sm ghost" data-phyreset="${x.eid}:${x.slot}">复位</button></td></tr>`;
+      }
+      return items.map((p, i) => `<tr>
+        <td class="mono">${i === 0 ? esc(x.label) : ''}</td>
+        <td class="tiny">${esc(p.k)}</td>
+        <td class="num mono">${esc(p.v)}</td>
+        <td>${i === 0 ? `<button class="btn sm ghost" data-phyreset="${x.eid}:${x.slot}">复位</button>` : ''}</td>
+      </tr>`).join('');
+    }).join('')}</tbody></table>`
+    : stateBlock('empty', '没有可读的物理盘', '读取 PHY 计数需要先识别到磁盘。');
+
+  $$('#phy-body [data-phyreset]').forEach(b => b.addEventListener('click', async () => {
+    const [eid, slot] = b.dataset.phyreset.split(':');
+    if (!window.confirm('复位会清零该盘的 PHY 错误计数，用于观察之后是否继续增长。确认？')) return;
+    try {
+      await api('/api/phy_reset', { method: 'POST', body: { ctrl: 0, eid: Number(eid), slot: Number(slot) } });
+      toast('已下发复位', 'ok');
+    } catch (e) { toast(e.message, 'error'); }
+  }));
+}
+
+const HW_STATUS_TEXT = {
+  ok: '正常', nc: '非临界', cr: '临界', nr: '不可恢复',
+  ns: '无读数', na: '不适用', nf: '不存在',
+};
+
+function hwRow(s) {
+  const st = HW_STATUS_TEXT[s.status] || s.status;
+  const cls = s.status === 'ok' ? 'ok' : s.status === 'nc' ? 'warn' : ['cr', 'nr'].includes(s.status) ? 'crit' : '';
+  return `<tr>
+    <td>${esc(s.name)}</td>
+    <td class="num mono">${esc(s.raw || '—')}</td>
+    <td>${cls ? `<span class="badge ${cls}">${esc(st)}</span>` : `<span class="muted">${esc(st)}</span>`}</td>
+  </tr>`;
+}
+
+async function loadHardware(force) {
+  const tb = $('#hw-fan-table tbody');
+  if (!tb) return;
+  if (force) {
+    ['#hw-fan-table', '#hw-temp-table', '#hw-other-table'].forEach(sel => {
+      const b = $(sel + ' tbody');
+      if (b) b.innerHTML = '<tr><td colspan="3" class="muted">重新读取…</td></tr>';
+    });
+  }
+  let d;
+  try {
+    d = await api('/api/hardware' + (force ? '?refresh=1' : ''));
+  } catch (e) {
+    tb.innerHTML = `<tr><td colspan="3">${stateFromError(e)}</td></tr>`;
+    return;
+  }
+  const g = d.groups || {};
+  $('#hw-source').textContent = d.ok
+    ? `${d.source === 'ipmi' ? 'BMC' : 'hwmon'} · ${d.at || ''}`
+    : `传感器不可读：${d.error || '未知'}`;
+
+  const c = d.counts || {};
+  $('#hw-cards').innerHTML = [
+    ['风扇', `${c.fans_spinning || 0} / ${c.fans || 0}`, '在转 / 传感器位（"无读数"的多为空位）'],
+    ['温度传感器', String(c.temps || 0), 'BMC 与 hwmon 合计'],
+    ['电压传感器', String(c.power || 0), '主板与 VRM'],
+    ['整体', d.severity === 'crit' ? '严重' : d.severity === 'warn' ? '关注' : '正常',
+      (d.findings || []).length ? `${d.findings.length} 项待处理` : '无异常'],
+  ].map(([k, v, s]) => `<div class="card stat-card">
+      <div class="eyebrow">${esc(k)}</div>
+      <div class="stat-value">${esc(v)}</div>
+      <div class="stat-sub">${esc(s)}</div>
+    </div>`).join('');
+
+  $('#hw-findings').innerHTML = (d.findings || []).map(f => `
+    <div class="cache-finding ${esc(f.level)}" style="margin-top:10px">
+      <div class="cf-head">
+        <span class="badge ${f.level === 'crit' ? 'crit' : 'warn'}">${f.level === 'crit' ? '严重' : '关注'}</span>
+        <strong>${esc(f.title)}</strong>
+      </div>
+      <div class="cf-detail">${esc(f.detail)}</div>
+      ${f.advice ? `<div class="cf-advice">建议：${esc(f.advice)}</div>` : ''}
+    </div>`).join('');
+
+  const fans = g.fans || [];
+  $('#hw-fan-table tbody').innerHTML =
+    fans.map(hwRow).join('') || '<tr><td colspan="3" class="muted">未探测到风扇传感器</td></tr>';
+  const temps = (g.temps || []).slice().sort((a, b) => (b.value || 0) - (a.value || 0));
+  $('#hw-temp-table tbody').innerHTML =
+    temps.map(hwRow).join('') || '<tr><td colspan="3" class="muted">未探测到温度传感器</td></tr>';
+  const others = [...(g.power || []), ...(g.discrete || [])];
+  $('#hw-other-table tbody').innerHTML =
+    others.map(hwRow).join('') || '<tr><td colspan="3" class="muted">无</td></tr>';
+}
+
+/* ---------- 顶栏控制台：全局搜索 / 通知 / 操作记录 ---------- */
+
+const NAV_ITEMS = [
+  { view: 'overview', title: '监控概览', sub: '健康评分、告警、趋势' },
+  { view: 'storage', title: '文件管理', sub: 'bcache 加速、文件系统、NFS' },
+  { view: 'logs', title: '日志中心', sub: '事件日志与控制器日志' },
+  { view: 'ops', title: '运维中心', sub: '盘位可视化、资产台账、换盘' },
+  { view: 'reports', title: '报表中心', sub: '日报、周报、月报与导出' },
+  { view: 'hosts', title: '多机管理', sub: '机房内所有存储节点的统一视图' },
+  { view: 'users', title: '用户管理', sub: '账号与角色' },
+];
+
+let _cmdkItems = [];
+let _cmdkIndex = 0;
+let _taskFilter = 'all';
+let _taskExpandedId = null;
+
+function cmdkIsOpen() {
+  const el = $('#cmdk');
+  return el && !el.classList.contains('hidden');
+}
+
+function cmdkOpen() {
+  const el = $('#cmdk');
+  if (!el) return;
+  el.classList.remove('hidden');
+  const input = $('#cmdk-input');
+  input.value = '';
+  cmdkRender('');
+  input.focus();
+}
+
+function cmdkClose() {
+  const el = $('#cmdk');
+  if (el) el.classList.add('hidden');
+}
+
+/* 搜索目标：页面 + 物理磁盘 + 虚拟磁盘。
+   全部来自已有的 state，不额外请求——命令面板必须即时响应。 */
+function cmdkBuild(query) {
+  const q = String(query || '').trim().toLowerCase();
+  const groups = [];
+
+  const navs = NAV_ITEMS.filter(
+    n => !q || (n.title + ' ' + n.sub + ' ' + n.view).toLowerCase().includes(q)
+  );
+  if (navs.length) {
+    groups.push({
+      name: '页面',
+      items: navs.map(n => ({ kind: 'nav', view: n.view, title: n.title, sub: n.sub, tag: '页面' })),
+    });
+  }
+
+  const disks = (state.status && state.status.physical_disks) || [];
+  const hitDisks = disks.filter(d => {
+    if (!q) return false;
+    const hay = [
+      d.label, d.full_label, 'c' + bayCtrl(d), d.model, d.sn, d.state, d.dg,
+    ].join(' ').toLowerCase();
+    return hay.includes(q);
+  });
+  if (hitDisks.length) {
+    groups.push({
+      name: '物理磁盘',
+      items: hitDisks.map(d => ({
+        kind: 'disk',
+        disk: d,
+        title: `${d.full_label || d.label || ''} · ${d.state || ''}`,
+        sub: [d.model, d.size, d.sn].filter(Boolean).join(' · '),
+        tag: 'C' + bayCtrl(d),
+      })),
+    });
+  }
+
+  const vds = state.vds || [];
+  const hitVds = vds.filter(v => {
+    if (!q) return false;
+    const hay = ['vd ' + v.vd, v.dg_vd, v.type, v.name, v.size, v.os_device, 'c' + (v.ctrl != null ? v.ctrl : 0)]
+      .join(' ').toLowerCase();
+    return hay.includes(q);
+  });
+  if (hitVds.length) {
+    groups.push({
+      name: '虚拟磁盘',
+      items: hitVds.map(v => ({
+        kind: 'vd',
+        vd: v,
+        title: `C${v.ctrl != null ? v.ctrl : 0} · VD ${v.vd} · ${v.dg_vd || ''}`,
+        sub: [v.type, v.size, v.state, v.os_device].filter(Boolean).join(' · '),
+        tag: '阵列',
+      })),
+    });
+  }
+
+  return groups;
+}
+
+function cmdkRender(query) {
+  const box = $('#cmdk-results');
+  const groups = cmdkBuild(query);
+  _cmdkItems = [];
+  groups.forEach(g => g.items.forEach(i => _cmdkItems.push(i)));
+  _cmdkIndex = 0;
+  $('#cmdk-hint').textContent = _cmdkItems.length ? `${_cmdkItems.length} 项结果` : '';
+
+  if (!_cmdkItems.length) {
+    box.innerHTML = query
+      ? '<div class="muted" style="padding:16px 12px">没有匹配的磁盘、阵列或页面</div>'
+      : '<div class="muted" style="padding:16px 12px">输入盘位、序列号、型号或页面名开始搜索</div>';
+    return;
+  }
+
+  let idx = 0;
+  box.innerHTML = groups
+    .map(g => {
+      const rows = g.items
+        .map(i => {
+          const n = idx++;
+          return `<button type="button" class="cmdk-item${n === 0 ? ' active' : ''}" data-idx="${n}">
+            <span class="cmdk-tag">${esc(i.tag)}</span>
+            <span class="cmdk-item-title">${esc(i.title)}</span>
+            <span class="cmdk-item-sub">${esc(i.sub || '')}</span>
+          </button>`;
+        })
+        .join('');
+      return `<div class="cmdk-group">${esc(g.name)}</div>${rows}`;
+    })
+    .join('');
+
+  $$('#cmdk-results .cmdk-item').forEach(el => {
+    el.addEventListener('click', () => cmdkRun(_cmdkItems[Number(el.dataset.idx)]));
+    el.addEventListener('mousemove', () => {
+      const i = Number(el.dataset.idx);
+      if (i !== _cmdkIndex) cmdkHighlight(i);
+    });
+  });
+}
+
+function cmdkHighlight(i) {
+  _cmdkIndex = i;
+  $$('#cmdk-results .cmdk-item').forEach(el =>
+    el.classList.toggle('active', Number(el.dataset.idx) === i)
+  );
+  const el = $(`#cmdk-results .cmdk-item[data-idx="${i}"]`);
+  if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+}
+
+function cmdkRun(item) {
+  if (!item) return;
+  cmdkClose();
+  if (item.kind === 'nav') {
+    switchView(item.view);
+    return;
+  }
+  if (item.kind === 'disk') {
+    switchView('overview');
+    openDrawer(item.disk);
+    return;
+  }
+  if (item.kind === 'vd') {
+    switchView('overview');
+    const card = $('#vd-table');
+    if (card && card.scrollIntoView) card.scrollIntoView({ block: 'center' });
+  }
+}
+
+/* 铃铛统计的是"未确认告警"，不是"未读事件"。
+   运维关心的是有没有事情需要处理，而每条采集完成、每次登录都算
+   "未读事件"的话，角标永远是满的，也就等于没有信息。 */
+async function renderNotifications() {
+  const body = $('#notify-body');
+  if (!body) return;
+  let d;
+  try {
+    d = await api('/api/alerts?status=open&limit=30');
+  } catch (e) {
+    body.innerHTML = `<div class="muted" style="padding:14px 6px">加载失败：${esc(e.message)}</div>`;
+    return;
+  }
+  const alerts = d.alerts || [];
+  const counts = d.counts || {};
+  const unack = Number(counts.active || 0);
+
+  const badge = $('#notify-count');
+  if (badge) {
+    badge.textContent = unack > 99 ? '99+' : String(unack);
+    badge.classList.toggle('hidden', unack === 0);
+  }
+
+  if (!alerts.length) {
+    body.innerHTML = '<div class="muted" style="padding:14px 6px">没有需要处理的告警</div>';
+    return;
+  }
+  body.innerHTML =
+    alerts
+      .map(a => {
+        const lv = String(a.level || 'warning');
+        const tone = lv === 'error' ? 'crit' : lv === 'warning' ? 'warn' : 'info';
+        const text = { crit: '错误', warn: '警告', info: '信息' }[tone] || lv;
+        const acked = a.status === 'acknowledged';
+        return `<div class="pop-item${acked ? '' : ' unread'}">
+        <span class="badge ${tone}">${text}</span>
+        <span class="pop-msg">${esc(a.title || a.key)}${Number(a.count) > 1 ? ` ×${esc(a.count)}` : ''}</span>
+        <span class="pop-time">${esc(a.last_seen || '')}${acked ? ' · 已确认' : ''}</span>
+      </div>`;
+      })
+      .join('') +
+    '<div class="pop-foot"><button class="btn sm ghost" id="pop-goto-alerts">前往告警中心</button></div>';
+  const go = $('#pop-goto-alerts');
+  if (go) {
+    go.addEventListener('click', () => {
+      $('#notify-panel').classList.add('hidden');
+      switchView('overview');
+      const card = $('#card-alerts');
+      if (card && card.scrollIntoView) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+  }
+}
+
+const TASK_STATUS_TEXT = {
+  queued: '排队中',
+  running: '执行中',
+  succeeded: '已完成',
+  failed: '失败',
+};
+
+function taskTone(status) {
+  const s = String(status || '');
+  if (s === 'succeeded') return 'ok';
+  if (s === 'failed') return 'crit';
+  return 'info';
+}
+
+function fmtDuration(t) {
+  const a = t.started_at || t.created_at;
+  const b = t.finished_at;
+  if (!a || !b) return '';
+  const toSec = s => {
+    const m = String(s).match(/(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})/);
+    if (!m) return null;
+    return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) / 1000;
+  };
+  const x = toSec(a);
+  const y = toSec(b);
+  if (x == null || y == null) return '';
+  const d = Math.max(0, Math.round(y - x));
+  if (d < 60) return d + ' 秒';
+  if (d < 3600) return Math.floor(d / 60) + ' 分 ' + (d % 60) + ' 秒';
+  return Math.floor(d / 3600) + ' 小时 ' + Math.floor((d % 3600) / 60) + ' 分';
+}
+
+async function renderTaskList() {
+  const box = $('#task-list');
+  if (!box) return;
+  let d;
+  try {
+    d = await api(`/api/tasks?limit=80&status=${encodeURIComponent(_taskFilter)}`);
+  } catch (e) {
+    box.innerHTML = stateFromError(e);
+    return;
+  }
+  const tasks = d.tasks || [];
+  applyTaskBadge(d.stats || {});
+
+  if (!tasks.length) {
+    box.innerHTML = stateBlock('empty', '还没有任务记录', '执行一次阵列或磁盘操作后，这里会留下完整留痕。');
+    return;
+  }
+
+  const expanded = _taskExpandedId;
+  box.innerHTML = tasks
+    .map(t => {
+      const tone = taskTone(t.status);
+      const statusText = TASK_STATUS_TEXT[t.status] || t.status;
+      const running = t.status === 'running' || t.status === 'queued';
+      const pct = t.progress == null ? (t.status === 'succeeded' ? 100 : 0) : t.progress;
+      const dur = fmtDuration(t);
+      const attempt = Number(t.attempt || 1) > 1 ? ` · 第 ${t.attempt} 次` : '';
+      const isOpen = expanded != null && Number(expanded) === Number(t.id);
+      return `<div class="task-card ${tone}" data-id="${esc(t.id)}">
+        <div class="task-card-head">
+          <span class="badge ${tone}">${esc(statusText)}</span>
+          <span class="task-card-title">${esc(t.title || t.kind)}</span>
+          <span class="task-card-time mono">${esc(t.created_at || '')}</span>
+        </div>
+        ${t.target ? `<div class="task-card-target mono">${esc(t.target)}${esc(attempt)}</div>` : ''}
+        ${running || (t.progress != null && t.status === 'running')
+          ? `<div class="task-bar"><i style="width:${pct}%"></i></div>`
+          : ''}
+        ${t.message ? `<div class="task-card-msg ${tone}">${esc(t.message)}</div>` : ''}
+        <div class="task-detail${isOpen ? '' : ' hidden'}" data-detail="${esc(t.id)}"></div>
+      </div>`;
+    })
+    .join('');
+
+  $$('#task-list .task-card').forEach(card =>
+    card.addEventListener('click', ev => {
+      if (ev.target.closest && ev.target.closest('button')) return;
+      toggleTaskDetail(Number(card.dataset.id));
+    })
+  );
+
+  // 抽屉每 2.5 秒轮询一次会重建列表。展开状态必须存在模块变量里、
+  // 重渲染后还原，否则用户正在看输出时详情会自己收起来。
+  if (expanded != null) {
+    const el = $(`#task-list .task-detail[data-detail="${expanded}"]`);
+    if (el) renderTaskDetailInto(el, Number(expanded));
+  }
+}
+
+function toggleTaskDetail(id) {
+  _taskExpandedId = _taskExpandedId === id ? null : id;
+  renderTaskList();
+}
+
+async function renderTaskDetailInto(el, id) {
+  el.innerHTML = '<div class="loading-line">加载中…</div>';
+  let t;
+  try {
+    const d = await api('/api/tasks/' + id);
+    t = d.task;
+  } catch (e) {
+    el.innerHTML = stateFromError(e);
+    return;
+  }
+  if (!t) return;
+  const dur = fmtDuration(t);
+  const params = t.params && Object.keys(t.params).length
+    ? JSON.stringify(t.params, null, 1)
+    : '—';
+  el.innerHTML = `
+    <dl class="kv task-kv">
+      <dt>操作者</dt><dd>${esc(t.operator || '—')}</dd>
+      <dt>开始</dt><dd>${esc(t.started_at || '—')}</dd>
+      <dt>结束</dt><dd>${esc(t.finished_at || (t.status === 'running' ? '进行中' : '—'))}</dd>
+      <dt>耗时</dt><dd>${esc(dur || '—')}</dd>
+      <dt>命令</dt><dd class="mono">${esc(t.command || '—')}</dd>
+    </dl>
+    <details class="task-sect"><summary>参数</summary><pre class="smart-pre">${esc(params)}</pre></details>
+    ${t.output ? `<details class="task-sect"><summary>执行输出</summary><pre class="smart-pre">${esc(t.output)}</pre></details>` : ''}
+    ${t.status === 'failed' && t.retryable
+      ? `<div class="task-actions"><button class="btn sm" data-retry="${esc(t.id)}">重试此任务</button>
+         <span class="tiny">该操作可安全重跑</span></div>`
+      : ''}
+    ${t.status === 'failed' && !t.retryable
+      ? '<div class="tiny task-hint">此操作不可重试：重复执行可能造成额外影响，请人工确认当前状态后再手动操作。</div>'
+      : ''}`;
+  const rb = el.querySelector('[data-retry]');
+  if (rb) {
+    rb.addEventListener('click', async ev => {
+      ev.stopPropagation();
+      btnLoading(rb, true);
+      try {
+        const r = await api(`/api/tasks/${t.id}/retry`, { method: 'POST' });
+        if (r && r.ok === false) throw new Error(r.error || '重试失败');
+        toast(`任务已重新提交（#${r.task && r.task.id}）`, 'ok');
+        await renderTaskList();
+      } catch (e) {
+        toast(e.message, 'error');
+      } finally {
+        btnLoading(rb, false);
+      }
+    });
+  }
+}
+
+function applyTaskBadge(stats) {
+  const badge = $('#task-count');
+  if (!badge) return;
+  const active = Number(stats.active || 0);
+  const failed = Number(stats.failed || 0);
+  // 有任务在跑就报运行中；没有在跑但有失败，则报失败数——
+  // 后者才是真正需要人介入的状态。
+  if (active > 0) {
+    badge.textContent = active > 99 ? '99+' : String(active);
+    badge.className = 'tb-badge info';
+  } else if (failed > 0) {
+    badge.textContent = failed > 99 ? '99+' : String(failed);
+    badge.className = 'tb-badge';
+  } else {
+    badge.textContent = '0';
+    badge.className = 'tb-badge hidden';
+  }
+}
+
+async function refreshTaskBadge() {
+  try {
+    const d = await api('/api/tasks?limit=1&status=all');
+    applyTaskBadge(d.stats || {});
+  } catch (e) {
+    /* 后端不可用时静默：顶栏角标不该刷 toast */
+  }
+}
+
+/* 刷新顶栏三个入口的计数（状态刷新后调用） */
+async function refreshConsoleBadges() {
+  await renderNotifications();
+  await refreshTaskBadge();
+  if ($('#task-drawer') && $('#task-drawer').classList.contains('open')) {
+    await renderTaskList();
+  }
+}
+
+function bindConsoleUI() {
+  const search = $('#btn-search');
+  if (search) search.addEventListener('click', cmdkOpen);
+  const cmdkScrim = $('#cmdk-scrim');
+  if (cmdkScrim) cmdkScrim.addEventListener('click', cmdkClose);
+
+  const input = $('#cmdk-input');
+  if (input) {
+    input.addEventListener('input', () => cmdkRender(input.value));
+    input.addEventListener('keydown', ev => {
+      if (ev.key === 'ArrowDown') {
+        ev.preventDefault();
+        if (_cmdkItems.length) cmdkHighlight((_cmdkIndex + 1) % _cmdkItems.length);
+      } else if (ev.key === 'ArrowUp') {
+        ev.preventDefault();
+        if (_cmdkItems.length) cmdkHighlight((_cmdkIndex - 1 + _cmdkItems.length) % _cmdkItems.length);
+      } else if (ev.key === 'Enter') {
+        ev.preventDefault();
+        cmdkRun(_cmdkItems[_cmdkIndex]);
+      } else if (ev.key === 'Escape') {
+        ev.preventDefault();
+        cmdkClose();
+      }
+    });
+  }
+
+  document.addEventListener('keydown', ev => {
+    const tag = (ev.target && ev.target.tagName) || '';
+    const typing = /INPUT|TEXTAREA|SELECT/.test(tag) || (ev.target && ev.target.isContentEditable);
+    if ((ev.metaKey || ev.ctrlKey) && String(ev.key).toLowerCase() === 'k') {
+      ev.preventDefault();
+      if (cmdkIsOpen()) cmdkClose();
+      else cmdkOpen();
+      return;
+    }
+    if (ev.key === '/' && !typing && !cmdkIsOpen()) {
+      ev.preventDefault();
+      cmdkOpen();
+      return;
+    }
+    if (ev.key === 'Escape' && cmdkIsOpen()) cmdkClose();
+  });
+
+  const notifyBtn = $('#btn-notify');
+  if (notifyBtn) {
+    notifyBtn.addEventListener('click', ev => {
+      ev.stopPropagation();
+      const panel = $('#notify-panel');
+      const willOpen = panel.classList.contains('hidden');
+      panel.classList.toggle('hidden', !willOpen);
+      if (willOpen) {
+        const r = notifyBtn.getBoundingClientRect();
+        panel.style.top = `${Math.round(r.bottom + 8)}px`;
+        panel.style.right = `${Math.round(Math.max(12, window.innerWidth - r.right))}px`;
+        renderNotifications();
+      }
+    });
+  }
+  const readBtn = $('#btn-notify-read');
+  if (readBtn) {
+    readBtn.addEventListener('click', async () => {
+      try {
+        const r = await api('/api/alerts/ack_all', { method: 'POST' });
+        toast(`已确认 ${r.acknowledged || 0} 条告警`, 'ok');
+        await renderNotifications();
+        await loadAlertCenter();
+      } catch (e) {
+        toast(e.message, 'error');
+      }
+    });
+  }
+  document.addEventListener('click', ev => {
+    const panel = $('#notify-panel');
+    if (!panel || panel.classList.contains('hidden')) return;
+    if (panel.contains(ev.target) || (ev.target.closest && ev.target.closest('#btn-notify'))) return;
+    panel.classList.add('hidden');
+  });
+
+  const taskBtn = $('#btn-tasks');
+  const taskOpen = () => {
+    $('#task-scrim').classList.remove('hidden');
+    $('#task-drawer').classList.add('open');
+    renderTaskList();
+    startTaskPoll();
+  };
+  const taskClose = () => {
+    $('#task-scrim').classList.add('hidden');
+    $('#task-drawer').classList.remove('open');
+    _taskExpandedId = null;
+    stopTaskPoll();
+  };
+  if (taskBtn) taskBtn.addEventListener('click', taskOpen);
+  if ($('#task-close')) $('#task-close').addEventListener('click', taskClose);
+  if ($('#task-scrim')) $('#task-scrim').addEventListener('click', taskClose);
+  $$('#task-filter .chip').forEach(ch =>
+    ch.addEventListener('click', () => {
+      $$('#task-filter .chip').forEach(c => c.classList.toggle('active', c === ch));
+      _taskFilter = ch.dataset.tlevel || 'all';
+      renderTaskList();
+    })
+  );
+}
+
 function bindUI() {
   // 侧边栏导航
   $$('.nav-btn').forEach(b => b.addEventListener('click', () => switchView(b.dataset.view)));
@@ -2456,7 +6332,10 @@ function bindUI() {
       ? `检测到外来配置：${esc(c.foreign_desc)}。导入后控制器将恢复原阵列（DG/VD），原有数据可继续访问。`
       : `确认导入外来 (Foreign) 配置？该操作会把外部虚拟盘配置导入当前控制器，使其恢复可见与可访问。检测到 ${count} 组外来配置。`;
     confirmModal('载入外部配置', `<p>${desc}</p><p class="tiny">导入完成后将自动刷新状态，原 UGood+F 标记的磁盘会回到原阵列。</p>`, '确认导入', true, async () => {
-      const r = await api('/api/foreign_import', { method: 'POST', body: { acknowledge: true } });
+    const r = await api('/api/foreign_import', {
+      method: 'POST',
+      body: { acknowledge: true, ctrl: Number(data.ctrl != null ? data.ctrl : 0) },
+    });
       if (r && r.ok === false) throw new Error(r.error || '导入失败');
       toast('外来配置已导入', 'ok');
       await loadStatus();
@@ -2488,6 +6367,14 @@ function bindUI() {
         auth_mode: r.auth_mode || 'local',
         manage_users: r.manage_users !== false,
       };
+      // 登录响应只带基础字段，权限矩阵在 /api/me 里。必须重新拉一次：
+      // 拿登录响应拼 state.me 会让 perms 缺失，afterLogin 退到默认的
+      // ['view']，结果是管理员登录后也看不到任何管理入口。
+      try {
+        state.me = await api('/api/me');
+      } catch (e) {
+        /* 拉取失败时保留登录响应里的基础信息，至少能进入只读界面 */
+      }
       await afterLogin();
     } catch (e) {
       $('#login-error').textContent = e.message || '登录失败';
@@ -2511,6 +6398,181 @@ function bindUI() {
     $$('#chart-range .chip').forEach(c => c.classList.toggle('active', c === ch));
     state.hours = Number(ch.dataset.hours);
     loadHistory();
+  }));
+
+  // 告警中心：状态筛选、批量确认、维护窗口
+  // 报表中心：周期切换与导出
+  $$('#report-period .chip').forEach(ch => ch.addEventListener('click', () => {
+    $$('#report-period .chip').forEach(c => c.classList.toggle('active', c === ch));
+    _reportPeriod = ch.dataset.period || 'day';
+    loadReports();
+  }));
+  const repOpen = $('#btn-report-open');
+  if (repOpen) repOpen.addEventListener('click', () => window.open(reportUrl(), '_blank'));
+  const repHtml = $('#btn-report-html');
+  if (repHtml) repHtml.addEventListener('click', () => {
+    window.location.href = reportUrl('&download=1');
+  });
+  const repCsv = $('#btn-report-csv');
+  if (repCsv) repCsv.addEventListener('click', () => {
+    window.location.href = reportUrl('&format=csv');
+  });
+  const rsched = $('#btn-report-sched-save');
+  if (rsched) rsched.addEventListener('click', rschSave);
+  const rsend = $('#btn-report-send');
+  if (rsend) rsend.addEventListener('click', rschSendNow);
+
+  // 性能中心：实时刷新、指标与时间窗切换、设备曲线显隐
+  const perfRefresh = $('#btn-perf-refresh');
+  if (perfRefresh) perfRefresh.addEventListener('click', () => loadPerfLive());
+  const iodBtn = $('#btn-iodiag');
+  if (iodBtn) iodBtn.addEventListener('click', runIoDiagnosis);
+  const benchStart = $('#btn-bench-start');
+  if (benchStart) benchStart.addEventListener('click', startIoBench);
+  const benchCancel = $('#btn-bench-cancel');
+  if (benchCancel) benchCancel.addEventListener('click', async () => {
+    try {
+      await api('/api/io/bench/cancel', { method: 'POST' });
+      toast('已请求取消，临时文件会被清理', 'ok');
+      await loadIoBench();
+    } catch (e) { toast(e.message, 'error'); }
+  });
+  $$('#perf-metric .chip').forEach(ch => ch.addEventListener('click', () => {
+    $$('#perf-metric .chip').forEach(c => c.classList.toggle('active', c === ch));
+    state.perfMetric = ch.dataset.metric || 'iops';
+    loadPerfTrend();
+  }));
+  $$('#perf-range .chip').forEach(ch => ch.addEventListener('click', () => {
+    $$('#perf-range .chip').forEach(c => c.classList.toggle('active', c === ch));
+    state.perfHours = Number(ch.dataset.hours) || 24;
+    loadPerfTrend();
+  }));
+  const devChips = $('#perf-dev-chips');
+  if (devChips) devChips.addEventListener('click', (ev) => {
+    const btn = ev.target.closest('.perf-dev-chip');
+    if (!btn) return;
+    const name = btn.dataset.dev;
+    const i = _perfDevices.indexOf(name);
+    if (i >= 0) _perfDevices.splice(i, 1);
+    else _perfDevices.push(name);
+    loadPerfTrend();
+  });
+  startPerfAuto();
+
+  const dbStart = $('#btn-dbackup-start');
+  if (dbStart) dbStart.addEventListener('click', startDataBackup);
+  $$('[data-pick]').forEach(b => b.addEventListener('click', () => pickServerDir(b.dataset.pick)));
+  const dbSched = $('#btn-db-sched-save');
+  if (dbSched) dbSched.addEventListener('click', saveBackupSchedule);
+  const dbList = $('#btn-dbackup-list');
+  if (dbList) dbList.addEventListener('click', loadBackupArchives);
+
+  const capRefresh = $('#btn-cap-refresh');
+  if (capRefresh) capRefresh.addEventListener('click', () => loadCapacityForecast());
+  const hwRefresh = $('#btn-hw-refresh');
+  if (hwRefresh) hwRefresh.addEventListener('click', () => loadHardware(true));
+  const polRefresh = $('#btn-policy-refresh');
+  if (polRefresh) polRefresh.addEventListener('click', () => loadCtrlPolicy());
+  const phyBtn = $('#btn-phy');
+  if (phyBtn) phyBtn.addEventListener('click', loadPhyCounters);
+
+  // 多机管理：筛选、全选、批量动作
+  const hostSearch = $('#host-search');
+  if (hostSearch) hostSearch.addEventListener('input', () => {
+    _hostFilter.q = hostSearch.value.trim();
+    if (_hostsPayload) renderHosts(_hostsPayload);
+  });
+  const hostStatus = $('#host-status');
+  if (hostStatus) hostStatus.addEventListener('change', () => {
+    _hostFilter.status = hostStatus.value;
+    if (_hostsPayload) renderHosts(_hostsPayload);
+  });
+  const hostGroup = $('#host-group');
+  if (hostGroup) hostGroup.addEventListener('change', () => {
+    _hostFilter.group = hostGroup.value;
+    if (_hostsPayload) renderHosts(_hostsPayload);
+  });
+  const hostAll = $('#host-check-all');
+  if (hostAll) hostAll.addEventListener('change', () => {
+    const list = ((_hostsPayload || {}).hosts || []).filter(hostMatches);
+    _hostFilter.sel = hostAll.checked ? new Set(list.map(h => Number(h.id))) : new Set();
+    if (_hostsPayload) renderHosts(_hostsPayload);
+  });
+  ['enable', 'disable', 'group'].forEach((act) => {
+    const btn = $('#btn-host-' + act);
+    if (btn) btn.addEventListener('click', () => bulkHostAction(act));
+  });
+  const sesRefresh = $('#btn-ses-refresh');
+  if (sesRefresh) sesRefresh.addEventListener('click', () => loadEnclosure());
+
+  // 维护计划：保存开关、增删计划、立即执行
+  const maintSaveBtn = $('#btn-maint-save');
+  if (maintSaveBtn) maintSaveBtn.addEventListener('click', () => maintSave(maintCurrentPlans()));
+  const maintAddBtn = $('#btn-maint-add');
+  if (maintAddBtn) maintAddBtn.addEventListener('click', maintAdd);
+  const maintTb = $('#maint-table tbody');
+  if (maintTb) maintTb.addEventListener('click', async (ev) => {
+    const runBtn = ev.target.closest('[data-maint-run]');
+    const delBtn = ev.target.closest('[data-maint-del]');
+    if (runBtn) {
+      btnLoading(runBtn, true);
+      try {
+        const r = await api('/api/maintenance/run', {
+          method: 'POST',
+          body: { id: Number(runBtn.dataset.maintRun) },
+        });
+        toast(r.ok ? `已下发：${r.message}` : `执行失败：${r.message}`, r.ok ? 'ok' : 'error');
+        await loadMaintenance();
+      } catch (e) {
+        toast(e.message, 'error');
+      } finally {
+        btnLoading(runBtn, false);
+      }
+      return;
+    }
+    if (delBtn) {
+      const id = Number(delBtn.dataset.maintDel);
+      const plans = maintCurrentPlans().filter(p => Number(p.id) !== id);
+      await maintSave(plans);
+    }
+  });
+
+  $$('#alert-status-filter .chip').forEach(ch => ch.addEventListener('click', () => {
+    $$('#alert-status-filter .chip').forEach(c => c.classList.toggle('active', c === ch));
+    _alertStatus = ch.dataset.astatus || 'open';
+    loadAlertCenter();
+  }));
+  const ackAll = $('#btn-alert-ackall');
+  if (ackAll) ackAll.addEventListener('click', async () => {
+    btnLoading(ackAll, true);
+    try {
+      const r = await api('/api/alerts/ack_all', { method: 'POST' });
+      toast(`已确认 ${r.acknowledged || 0} 条告警`, 'ok');
+      await loadAlertCenter();
+    } catch (e) {
+      toast(e.message, 'error');
+    } finally {
+      btnLoading(ackAll, false);
+    }
+  });
+  const silenceBtn = $('#btn-alert-silence');
+  if (silenceBtn) silenceBtn.addEventListener('click', () => openSilenceModal('all'));
+  const ackAllTop = $('#btn-alert-ackall');
+  if (ackAllTop) ackAllTop.classList.toggle('hidden', !state.canOperate);
+  if (silenceBtn) silenceBtn.classList.toggle('hidden', !state.canOperate);
+  const auditBtn = $('#btn-audit-export');
+  if (auditBtn) {
+    auditBtn.classList.toggle('hidden', !state.canAudit);
+    auditBtn.addEventListener('click', () => {
+      window.location.href = '/api/audit/export';
+    });
+  }
+
+  // 磁盘健康 TOP：切换排序口径
+  $$('#health-metric .chip').forEach(ch => ch.addEventListener('click', () => {
+    $$('#health-metric .chip').forEach(c => c.classList.toggle('active', c === ch));
+    _healthMetric = ch.dataset.metric || 'wear';
+    loadDiskHealth();
   }));
 
   // 控制器事件
@@ -2684,7 +6746,7 @@ async function loadFsUsage() {
   let data;
   try { data = await api('/api/storage/usage'); }
   catch (e) {
-    $('#fs-usage-body').innerHTML = `<div class="loading-line">加载失败：${esc(e.message)}</div>`;
+    $('#fs-usage-body').innerHTML = stateFromError(e);
     return;
   }
   state.fsUsage = data.filesystems || [];
@@ -2695,7 +6757,7 @@ async function loadFsUsage() {
 function renderFsCard() {
   const list = (state.fsUsage || []).filter(fs => !fs.hidden);
   const body = $('#fs-usage-body');
-  if (!list.length) { body.innerHTML = '<div class="loading-line">暂无文件系统数据</div>'; return; }
+  if (!list.length) { body.innerHTML = stateBlock('empty', '还没有文件系统样本', '采集器刚启动时，需要等待一轮采集。'); return; }
   const wrap = document.createElement('div');
   wrap.className = 'meter-rows';
   list.forEach(fs => {
@@ -2725,7 +6787,7 @@ function renderFsTable() {
   const all = state.fsUsage;
   if (!all) return;
   const list = all.filter(fs => state.showHiddenFs || !fs.hidden);
-  if (!list.length) { tb.innerHTML = '<tr><td colspan="8" class="muted">暂无文件系统数据</td></tr>'; return; }
+  if (!list.length) { tb.innerHTML = '<tr><td colspan="8">' + stateBlock('empty', '还没有文件系统样本', '采集器刚启动时，需要等待一轮采集。', '', true) + '</td></tr>'; return; }
   tb.innerHTML = '';
   list.forEach(fs => {
     const pct = Number(fs.use_percent) || 0;
@@ -2836,7 +6898,7 @@ async function loadNfs() {
   tb.innerHTML = '<tr><td colspan="4" class="muted">加载中…</td></tr>';
   let data;
   try { data = await api('/api/nfs/exports'); }
-  catch (e) { tb.innerHTML = `<tr><td colspan="4" class="muted">加载失败：${esc(e.message)}</td></tr>`; return; }
+  catch (e) { tb.innerHTML = `<tr><td colspan="4">${stateFromError(e)}</td></tr>`; return; }
   state.nfsLoaded = true;
   $('#nfs-unavailable').classList.toggle('hidden', !!data.available);
   $('#btn-nfs-install').classList.toggle('hidden', !state.isAdmin);
@@ -2847,7 +6909,7 @@ async function loadNfs() {
   (data.exports || []).forEach(ex => {
     (ex.clients || []).forEach(c => rows.push({ path: ex.path, host: c.host, options: c.options }));
   });
-  if (!rows.length) { tb.innerHTML = '<tr><td colspan="4" class="muted">暂无 NFS 共享</td></tr>'; return; }
+  if (!rows.length) { tb.innerHTML = '<tr><td colspan="4">' + stateBlock('empty', '还没有 NFS 共享', '点击上方「新增共享」导出一个目录。', '', true) + '</td></tr>'; return; }
   tb.innerHTML = '';
   rows.forEach(r => {
     const tr = document.createElement('tr');
@@ -2896,7 +6958,7 @@ async function loadBcache() {
     data = r[0];
     devData = r[1];
   } catch (e) {
-    body.innerHTML = `<div class="muted">加载失败：${esc(e.message)}</div>`;
+    body.innerHTML = stateFromError(e);
     return;
   }
   state.bcacheLoaded = true;
@@ -2908,6 +6970,7 @@ async function loadBcache() {
   const okBadge = '<span class="badge ok">就绪</span>';
   const noBadge = '<span class="badge">未就绪</span>';
   const cacheOffline = csets.some(c => c.cache_offline);
+  const cacheUnreg = csets.find(c => c.cache_present_unregistered && c.detected_cache_device) || null;
   body.innerHTML = `
     <div class="rt-kv" style="margin-top:0">
       <div class="item"><div class="v">${data.available ? '有' : '无'}</div><div class="k">bcache-tools</div></div>
@@ -2918,7 +6981,9 @@ async function loadBcache() {
     <div class="banner" style="margin-top:14px;${ready ? 'border-color:rgba(53,196,139,.3);background:var(--ok-bg);' : ''}">
       ${ready ? okBadge + ' <span>bcache 环境已就绪。</span>' : noBadge + ' <span style="flex:1">尚未安装 bcache-tools 或未加载内核模块，管理员可点击右上角“准备环境”。</span>'}
     </div>
-    ${cacheOffline ? `<div class="banner" style="margin-top:10px;border-color:color-mix(in srgb, var(--crit) 45%, transparent);background:var(--crit-bg)">
+    ${cacheUnreg ? `<div class="banner" style="margin-top:10px;border-color:color-mix(in srgb, var(--warn) 45%, transparent);background:var(--warn-bg)">
+      <span class="badge warn">缓存盘未注册</span><span>检测到缓存盘 ${esc(cacheUnreg.detected_cache_device)} 已在系统中，但尚未注册到 bcache（当前无缓存）。点击下方「重新注册并恢复缓存」即可恢复加速。</span>
+    </div>` : cacheOffline ? `<div class="banner" style="margin-top:10px;border-color:color-mix(in srgb, var(--crit) 45%, transparent);background:var(--crit-bg)">
       <span class="badge crit">缓存盘离线</span><span>检测到缓存盘已不在系统中（bcache 已降级为 no cache）。请检查缓存盘连接，恢复后可重新注册并绑定。</span>
     </div>` : ''}
     ${csets.length ? `<div class="tiny" style="margin-top:14px">缓存集统计：</div>
@@ -2945,7 +7010,9 @@ async function loadBcache() {
         };
         const cacheTotalBytes = (Number(ci.nbuckets) || 0) * parseSize(ci.bucket_size);
         const capFmt = bytes => bytes > 0 ? `≈${fmtBytes(bytes)}B` : '—';
-        const avail = offline ? null : Number(c.cache_available_percent);
+        const unregistered = !!c.cache_present_unregistered;
+        const noLive = offline || unregistered;
+        const avail = noLive ? null : Number(c.cache_available_percent);
         const usage = avail != null && avail >= 0 ? (100 - avail) : null;
         const cards = [
           { cap: true },
@@ -2957,11 +7024,11 @@ async function loadBcache() {
           if (x.hitCard) {
             return `<div class="stat-mini">
               <span class="stat-mini-k">缓存命中率</span>
-              <span class="stat-mini-v" data-hit-key="ratio">${offline ? '—' : (totalStats.cache_hit_ratio == null ? '—' : `${totalStats.cache_hit_ratio}%`)}</span>
+              <span class="stat-mini-v" data-hit-key="ratio">${noLive ? '—' : (totalStats.cache_hit_ratio == null ? '—' : `${totalStats.cache_hit_ratio}%`)}</span>
               <span class="stat-mini-metrics">
-                <span><em>cache_hits</em><b data-hit-key="cache_hits">${offline ? '—' : fmtNum(totalStats.cache_hits)}</b></span>
-                <span><em>cache_bypass_hits</em><b data-hit-key="cache_bypass_hits">${offline ? '—' : fmtNum(totalStats.cache_bypass_hits)}</b></span>
-                <span><em>cache_miss</em><b data-hit-key="cache_miss">${offline ? '—' : fmtNum(missOf(totalStats))}</b></span>
+                <span><em>cache_hits</em><b data-hit-key="cache_hits">${noLive ? '—' : fmtNum(totalStats.cache_hits)}</b></span>
+                <span><em>cache_bypass_hits</em><b data-hit-key="cache_bypass_hits">${noLive ? '—' : fmtNum(totalStats.cache_bypass_hits)}</b></span>
+                <span><em>cache_miss</em><b data-hit-key="cache_miss">${noLive ? '—' : fmtNum(missOf(totalStats))}</b></span>
               </span>
               <span class="stat-mini-picker">
                 <button type="button" class="active" data-hit-period="total" onclick="switchBcacheHitPeriod('${esc(uuid)}','total',this)">累计</button>
@@ -2989,7 +7056,7 @@ async function loadBcache() {
             </div>`;
           }
           if (x.bucketCard) {
-            const row = (label, val) => `<span><em>${label}</em><b>${offline ? '—' : `${fmtNum(val)}%`}</b></span>`;
+            const row = (label, val) => `<span><em>${label}</em><b>${noLive ? '—' : `${fmtNum(val)}%`}</b></span>`;
             return `<div class="stat-mini bucket">
               <span class="stat-mini-k">缓存桶构成</span>
               <span class="stat-mini-metrics">
@@ -3001,18 +7068,18 @@ async function loadBcache() {
             </div>`;
           }
           if (x.cap) {
-            const unusedPct = offline ? null : Number(ci.bucket_unused);
-            const cleanPct = offline ? null : Number(ci.bucket_clean);
-            const rowCap = (pct) => (offline || pct == null || isNaN(pct))
+            const unusedPct = noLive ? null : Number(ci.bucket_unused);
+            const cleanPct = noLive ? null : Number(ci.bucket_clean);
+            const rowCap = (pct) => (noLive || pct == null || isNaN(pct))
               ? '—'
               : `${fmtNum(pct)}% · ${capFmt(cacheTotalBytes * pct / 100)}`;
             return `<div class="stat-mini cap">
               <span class="stat-mini-k">缓存容量</span>
               <span class="stat-mini-cap-vals">
-                <span class="free"><b>${offline ? '—' : `${avail}%`}</b><i>可用·含可回收</i></span>
-                <span class="used"><b>${offline ? '—' : `${usage}%`}</b><i>脏标记·待GC回收</i></span>
+                <span class="free"><b>${noLive ? '—' : `${avail}%`}</b><i>可用·含可回收</i></span>
+                <span class="used"><b>${noLive ? '—' : `${usage}%`}</b><i>脏标记·待GC回收</i></span>
               </span>
-              <span class="stat-mini-bar">${offline ? '' : `<i style="width:${Math.max(0, Math.min(100, usage))}%"></i>`}</span>
+              <span class="stat-mini-bar">${noLive ? '' : `<i style="width:${Math.max(0, Math.min(100, usage))}%"></i>`}</span>
               <span class="stat-mini-metrics">
                 <span><em>总容量</em><b>${capFmt(cacheTotalBytes)}</b></span>
                 <span><em>空桶（真空闲）</em><b>${rowCap(unusedPct)}</b></span>
@@ -3155,7 +7222,7 @@ function appendBcacheControls(body, data, devData) {
   const blockDevs = (devData && devData.devices) || [];
   const usable = d => !d.mounted && !d.in_bcache;
   const freeCache = blockDevs.filter(d => usable(d) && !d.has_partitions && (Number(d.rota) === 0 || /nvme/i.test(d.device)));
-  const freeBacking = blockDevs.filter(usable);
+  const freeBacking = blockDevs.filter(d => usable(d) && d.bcache_role !== 'cache');
   const bcCands = blockDevs.filter(d => !d.in_bcache && d.bcache_role);
   const cacheCands = bcCands.filter(d => d.bcache_role === 'cache');
   const backingCands = bcCands.filter(d => d.bcache_role !== 'cache');
@@ -3176,9 +7243,13 @@ function appendBcacheControls(body, data, devData) {
   let html = '';
 
   if (admin && ready) {
+    const unregCset = (data.cache_sets || []).find(c => c.cache_present_unregistered && c.detected_cache_device);
     const poolCache = freeCache.length ? freeCache : (noActiveSet ? cacheCands : []);
     const poolBacking = freeBacking.length ? freeBacking : (noActiveSet ? backingCands : []);
-    if (poolCache.length && poolBacking.length) {
+    if (unregCset) {
+      html += `<div class="tiny" style="margin-top:12px">检测到缓存盘 <span class="mono">${esc(unregCset.detected_cache_device)}</span> 已在系统中但尚未注册（缓存集 ${esc((unregCset.uuid || '').slice(0, 8))}… 当前无缓存）：</div>
+        <div class="bcache-ops"><button class="btn sm primary" data-bcache-recover>重新注册并恢复缓存</button></div>`;
+    } else if (poolCache.length && poolBacking.length) {
       const cacheOpts = poolCache.map(d =>
         `<option value="${esc(d.path)}">${esc(d.device)} · ${fmtSize(d.size)} · ${esc(d.model || d.tran || 'SSD')}${d.fstype || d.bcache_role ? ' · 旧数据(将被清空)' : ''}</option>`).join('');
       const backOpts = poolBacking.map(d =>
@@ -3196,7 +7267,8 @@ function appendBcacheControls(body, data, devData) {
         </div>`;
     } else {
       const csetList = data.cache_sets || [];
-      const degraded = csetList.some(c => c.cache_offline) || devs.some(x => /no cache/i.test(String(x.state || '')));
+      const degraded = csetList.some(c => c.cache_offline || c.cache_present_unregistered)
+        || devs.some(x => /no cache/i.test(String(x.state || '')));
       const needBacking = !devs.length || devs.some(x => /no cache/i.test(String(x.state || '')));
       let showReattach = false;
       try { showReattach = localStorage.getItem('lsi-bcache-stopped') === '1'; } catch (e) { /* 忽略 */ }
@@ -3209,7 +7281,7 @@ function appendBcacheControls(body, data, devData) {
           </div>`).join('') + '</div>';
       } else {
         if (degraded && csetList.length && cacheCands.length) {
-          html += '<div class="tiny" style="margin-top:12px">检测到缓存盘已恢复，可重新接入：</div><div class="bcache-ops"><button class="btn sm primary" data-bcache-recover>恢复缓存</button></div>';
+          html += '<div class="tiny" style="margin-top:12px">检测到可用于恢复的缓存盘：</div><div class="bcache-ops"><button class="btn sm primary" data-bcache-recover>重新注册并恢复缓存</button></div>';
         } else if (needBacking && csetList.length && backingCands.length) {
           html += '<div class="tiny" style="margin-top:12px">检测到已有缓存集，可接入 backing：</div><div class="bcache-ops"><button class="btn sm primary" data-bcache-recover>接入 backing 并恢复缓存</button></div>';
         } else {
@@ -3323,11 +7395,20 @@ function appendBcacheControls(body, data, devData) {
   const recoverBtn = $('#bcache-body').querySelector('[data-bcache-recover]');
   if (recoverBtn) {
     recoverBtn.addEventListener('click', async () => {
+      btnLoading(recoverBtn, true);
+      toast('正在重新注册缓存盘并恢复缓存，可能需要几十秒，请勿关闭页面…');
       try {
         const r = await api('/api/bcache/recover', { method: 'POST' });
         toast(r.message || '缓存已恢复', 'ok');
         await loadBcache();
-      } catch (e) { toast(e.message, 'error'); }
+      } catch (e) {
+        toast(e.message, 'error');
+        try { await loadBcache(); } catch (_) { /* 忽略 */ }
+        const again = $('#bcache-body').querySelector('[data-bcache-recover]');
+        if (again) btnLoading(again, false);
+      } finally {
+        btnLoading(recoverBtn, false);
+      }
     });
   }
 
@@ -3606,8 +7687,10 @@ async function renderBcacheTopology(csets, devs) {
   const cacheDev = cacheInfo.device || '—';
   const backing = stats.backing_device ? '/dev/' + stats.backing_device : '—';
   const d = devs[0];
+  const unreg = !!cset.cache_present_unregistered;
   const avail = Number(cset.cache_available_percent);
-  const used = avail >= 0 ? (100 - avail) : null;
+  const used = !unreg && avail >= 0 ? (100 - avail) : null;
+  const availText = unreg ? '未注册' : `${avail}%`;
   const uuid = cset.uuid || '';
   const wrap = document.createElement('div');
   wrap.id = 'bcache-topology-wrap';
@@ -3616,7 +7699,7 @@ async function renderBcacheTopology(csets, devs) {
     <div class="bc-topo-line">
       <div class="bc-node"><span class="bc-node-k">缓存盘</span><span class="bc-node-v mono">${esc(cacheDev)}</span><span class="bc-node-s">discard ${esc(cacheInfo.discard || '—')}</span></div>
       <span class="bc-link">→</span>
-      <div class="bc-node bc-node-set"><span class="bc-node-k">缓存集</span><span class="bc-node-v mono">${esc((uuid || '').slice(0, 8))}…</span><span class="bc-node-s">可用 ${esc(avail)}%${used != null ? ` · 占用 ${used}%` : ''}</span></div>
+      <div class="bc-node bc-node-set"><span class="bc-node-k">缓存集</span><span class="bc-node-v mono">${esc((uuid || '').slice(0, 8))}…</span><span class="bc-node-s">可用 ${esc(availText)}${used != null ? ` · 占用 ${used}%` : ''}</span></div>
       <span class="bc-link">→</span>
       <div class="bc-node"><span class="bc-node-k">backing</span><span class="bc-node-v mono">${esc(backing)}</span></div>
       <span class="bc-link">→</span>
@@ -3800,7 +7883,9 @@ async function loadCtlEvents() {
   const pre = $('#ctl-pre');
   try {
     const q = encodeURIComponent(state.ctlQuery || '');
-    const d = await api('/api/controller_events?lines=' + state.ctlLines + (q ? '&q=' + q : ''));
+    const ctrls = state.status ? ctrlListOf(state.status) : [];
+    const cid = ctrls.length ? Number((state.status.controller || {}).ctrl != null ? state.status.controller.ctrl : ctrls[0].ctrl) : 0;
+    const d = await api('/api/controller_events?ctrl=' + cid + '&lines=' + state.ctlLines + (q ? '&q=' + q : ''));
     pre.textContent = d.output || '（无输出）';
     $('#ctl-total').textContent = d.total_lines != null
       ? (state.ctlQuery ? `匹配 ${d.total_lines} 行` : `共 ${d.total_lines} 行`) : '';

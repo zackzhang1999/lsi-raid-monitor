@@ -31,10 +31,101 @@ CREATE TABLE IF NOT EXISTS samples (
     dedupe TEXT NOT NULL UNIQUE
 );
 CREATE INDEX IF NOT EXISTS idx_samples_kind_ts ON samples(kind, ts_epoch);
+-- 操作任务台账：危险操作不再同步等待 storcli，而是登记为任务后台执行，
+-- 每条记录都留存操作者/参数/命令/返回码，是售后追溯的依据。
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    target TEXT,
+    params TEXT NOT NULL,
+    command TEXT,
+    status TEXT NOT NULL,
+    retryable INTEGER NOT NULL DEFAULT 0,
+    attempt INTEGER NOT NULL DEFAULT 1,
+    parent_id INTEGER,
+    operator TEXT,
+    progress INTEGER,
+    message TEXT,
+    output TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    ts_epoch INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, id);
+-- 告警生命周期：从"一次性标记位"升级为有身份的实体，
+-- 才能做到确认、恢复通知与维护窗口静默。
+CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key TEXT NOT NULL UNIQUE,
+    scope TEXT NOT NULL,
+    level TEXT NOT NULL,
+    title TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    status TEXT NOT NULL,
+    count INTEGER NOT NULL DEFAULT 1,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    last_notified TEXT,
+    notify_count INTEGER NOT NULL DEFAULT 0,
+    acknowledged_by TEXT,
+    acknowledged_at TEXT,
+    resolved_at TEXT,
+    ts_epoch INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status, level);
+CREATE TABLE IF NOT EXISTS alert_silences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope TEXT NOT NULL,
+    reason TEXT,
+    created_by TEXT,
+    created_at TEXT NOT NULL,
+    ends_at TEXT NOT NULL,
+    ts_epoch INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+-- 多机管理：中心节点登记被管节点，采集其状态快照。
+-- 单机场景下这张表是空的，功能不启用即可，不影响任何现有行为。
+CREATE TABLE IF NOT EXISTS hosts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    address TEXT NOT NULL,
+    token TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    note TEXT,
+    local INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS host_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    host_id INTEGER NOT NULL,
+    ts TEXT NOT NULL,
+    ts_epoch INTEGER NOT NULL,
+    online INTEGER NOT NULL,
+    error TEXT,
+    data TEXT,
+    UNIQUE(host_id, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_host_samples ON host_samples(host_id, ts_epoch);
+-- 控制器配置快照：用来发现"有人改了阵列配置"以及换卡后恢复。
+-- 只存归一化后的配置项——温度、运行时长这类每轮都在变的值不能进，
+-- 否则每次快照都不一样，漂移检测就永远在误报。
+CREATE TABLE IF NOT EXISTS ctrl_configs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ctrl INTEGER NOT NULL,
+    ts TEXT NOT NULL,
+    ts_epoch INTEGER NOT NULL,
+    hash TEXT NOT NULL,
+    data TEXT NOT NULL,
+    operator TEXT,
+    note TEXT,
+    reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ctrl_configs ON ctrl_configs(ctrl, id DESC);
 """
 
 # 历史 CSV 文件名 -> 样本类型
@@ -136,16 +227,29 @@ def history(kind: str, since_epoch: int) -> list[dict]:
     return out
 
 
-def disk_times(eid, slot) -> tuple[int | None, int | None, int]:
-    """返回某块盘的首次出现、最近出现时间（unix 秒）与样本条数。"""
+def disk_times(eid, slot, ctrl=None) -> tuple[int | None, int | None, int]:
+    """返回某块盘的首次出现、最近出现时间（unix 秒）与样本条数。
+
+    多控制器下 (eid, slot) 会重复，必须带 ctrl 一起判定，否则两张卡上
+    同槽位的盘会被算成同一块。ctrl 为 None 时退化为旧行为；
+    传入 ctrl 时同时接纳没有 ctrl 字段的历史样本——那些样本产生于
+    只采集单一控制器的版本，归属到当前卡是安全的。
+    """
+    sql = (
+        "SELECT MIN(ts_epoch) AS first_seen, MAX(ts_epoch) AS last_seen, COUNT(*) AS n "
+        "FROM samples WHERE kind = 'disks' "
+        "AND CAST(json_extract(data, '$.eid') AS TEXT) = ? "
+        "AND CAST(json_extract(data, '$.slot') AS TEXT) = ?"
+    )
+    params: list = [str(eid), str(slot)]
+    if ctrl is not None:
+        sql += (
+            " AND (json_extract(data, '$.ctrl') IS NULL"
+            " OR CAST(json_extract(data, '$.ctrl') AS TEXT) = ?)"
+        )
+        params.append(str(ctrl))
     try:
-        row = get_conn().execute(
-            "SELECT MIN(ts_epoch) AS first_seen, MAX(ts_epoch) AS last_seen, COUNT(*) AS n "
-            "FROM samples WHERE kind = 'disks' "
-            "AND CAST(json_extract(data, '$.eid') AS TEXT) = ? "
-            "AND CAST(json_extract(data, '$.slot') AS TEXT) = ?",
-            (str(eid), str(slot)),
-        ).fetchone()
+        row = get_conn().execute(sql, tuple(params)).fetchone()
     except Exception:
         return None, None, 0
     if not row:

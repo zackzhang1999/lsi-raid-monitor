@@ -33,6 +33,10 @@ DEFAULT_CONFIG = {
     "backlog_bytes": 536870912,       # 脏数据积压超过 512MB 告警
 }
 
+# 小于该值的脏计数不触发"滞留"告警：bcache 在内核里可能长期保留几 KB 的
+# 脏计数（state 已是 clean、journal replay 0 keys），属正常残留。
+DIRTY_STUCK_MIN_BYTES = 1024 * 1024
+
 
 def load_config() -> dict:
     cfg = dict(DEFAULT_CONFIG)
@@ -146,6 +150,13 @@ def evaluate():
             cur["hit_alerted"] = False
         csets[key] = cur
 
+    # 缓存盘缺席（掉线或存在但未注册）时，dirty_data 是停住的旧计数、回写本就无法
+    # 进行，这类情况由"缓存盘掉线/未注册"告警覆盖，避免再报"回写卡住"误导用户。
+    cache_missing = any(
+        c.get("cache_offline") or c.get("cache_present_unregistered")
+        for c in status.get("cache_sets", [])
+    )
+
     for d in status.get("devices", []):
         key = d.get("name", "")
         prev = devices.get(key, {})
@@ -153,22 +164,29 @@ def evaluate():
         dirty = _parse_size(d.get("dirty_data"))
         cur["dirty"] = dirty
         if dirty > 0:
-            dirty_since = prev.get("dirty_since") or now
-            cur["dirty_since"] = dirty_since
-            stuck_min = (now - dirty_since) / 60
-            if stuck_min >= int(cfg["dirty_stuck_minutes"]) and not prev.get("stuck_alerted"):
-                lsi_alert._alert(
-                    "bcache 脏数据长时间不下降",
-                    f"{key} 脏数据 {d.get('dirty_data')} 持续 {int(stuck_min)} 分钟未下降，回写可能卡住。",
-                )
-                cur["stuck_alerted"] = True
-            if dirty > int(cfg["backlog_bytes"]) and not prev.get("backlog_alerted"):
-                lsi_alert._alert(
-                    "bcache 回写积压",
-                    f"{key} 脏数据积压达 {d.get('dirty_data')}，超过阈值 {cfg['backlog_bytes']} 字节。",
-                    "warning",
-                )
-                cur["backlog_alerted"] = True
+            if cache_missing:
+                cur["dirty_since"] = now
+                cur["stuck_alerted"] = False
+                cur["backlog_alerted"] = False
+            else:
+                dirty_since = prev.get("dirty_since") or now
+                cur["dirty_since"] = dirty_since
+                stuck_min = (now - dirty_since) / 60
+                if (dirty >= DIRTY_STUCK_MIN_BYTES
+                        and stuck_min >= int(cfg["dirty_stuck_minutes"])
+                        and not prev.get("stuck_alerted")):
+                    lsi_alert._alert(
+                        "bcache 脏数据长时间不下降",
+                        f"{key} 脏数据 {d.get('dirty_data')} 持续 {int(stuck_min)} 分钟未下降，回写可能卡住。",
+                    )
+                    cur["stuck_alerted"] = True
+                if dirty > int(cfg["backlog_bytes"]) and not prev.get("backlog_alerted"):
+                    lsi_alert._alert(
+                        "bcache 回写积压",
+                        f"{key} 脏数据积压达 {d.get('dirty_data')}，超过阈值 {cfg['backlog_bytes']} 字节。",
+                        "warning",
+                    )
+                    cur["backlog_alerted"] = True
         else:
             cur["dirty_since"] = None
             cur["stuck_alerted"] = False

@@ -1,0 +1,163 @@
+{
+  "__comment": "DataMax-LSI Grafana 面板。导入方式：Grafana → Dashboards → Import → 上传本文件，然后选择已配置的 Prometheus 数据源。面板按'先看有没有事，再看哪里有事，最后看趋势'排列。",
+  "title": "DataMax-LSI 存储监控",
+  "uid": "datamax-lsi",
+  "tags": ["storage", "raid", "datamax"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": { "from": "now-24h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "label": "存储节点",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "query": "label_values(datamax_up, instance)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "整机健康",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "max(datamax_health{instance=~\"$instance\"})", "refId": "A" }],
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "正常", "color": "green" } } },
+            { "type": "value", "options": { "1": { "text": "警告", "color": "orange" } } },
+            { "type": "value", "options": { "2": { "text": "严重", "color": "red" } } }
+          ],
+          "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 }, { "color": "red", "value": 2 } ] }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "未处理告警",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "sum(datamax_alerts{status=\"open\", instance=~\"$instance\"})", "refId": "A" }],
+      "options": { "colorMode": "background", "graphMode": "area" },
+      "fieldConfig": { "defaults": { "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 }, { "color": "red", "value": 5 } ] } } }
+    },
+    {
+      "type": "stat",
+      "title": "异常磁盘",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "sum(datamax_disk_unhealthy{instance=~\"$instance\"})", "refId": "A" }],
+      "options": { "colorMode": "background" },
+      "fieldConfig": { "defaults": { "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } }
+    },
+    {
+      "type": "stat",
+      "title": "失败任务（24h）",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "sum(datamax_tasks{status=\"failed\", instance=~\"$instance\"})", "refId": "A" }],
+      "options": { "colorMode": "background" },
+      "fieldConfig": { "defaults": { "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } }
+    },
+    {
+      "type": "stat",
+      "title": "跨控制器一致性",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "min(datamax_consistency_ok{instance=~\"$instance\"})", "refId": "A" }],
+      "options": { "colorMode": "background" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "1": { "text": "一致", "color": "green" } } },
+            { "type": "value", "options": { "0": { "text": "存在差异", "color": "orange" } } }
+          ]
+        }
+      }
+    },
+    {
+      "type": "table",
+      "title": "磁盘状态分布",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "sum by (state) (datamax_disks_by_state{instance=~\"$instance\"})", "refId": "A", "format": "table", "instant": true }],
+      "transformations": [{ "id": "organize", "options": { "excludeByName": { "Time": true }, "renameByName": { "state": "状态", "Value": "数量" } } }]
+    },
+    {
+      "type": "timeseries",
+      "title": "控制器温度",
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "datamax_controller_roc_temperature_celsius{instance=~\"$instance\"}", "legendFormat": "{{instance}} C{{ctrl}}", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "celsius", "custom": { "lineWidth": 2, "fillOpacity": 8 } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "磁盘温度 TOP",
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "topk(8, datamax_disk_temperature_celsius{instance=~\"$instance\"})", "legendFormat": "{{instance}} C{{ctrl}}:E{{enclosure}}:S{{slot}}", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "celsius", "custom": { "lineWidth": 1.5, "fillOpacity": 0 } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "文件系统使用率",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [{ "expr": "datamax_filesystem_used_percent{instance=~\"$instance\"}", "legendFormat": "{{instance}} {{mountpoint}}", "refId": "A" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "max": 100,
+          "custom": { "lineWidth": 2, "fillOpacity": 6 },
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 80 }, { "color": "red", "value": 90 } ] }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "缓存命中率（按窗口）",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "datamax_bcache_hit_ratio_percent{window=\"hour\", instance=~\"$instance\"}", "legendFormat": "{{cache_device}} 1h", "refId": "A" },
+        { "expr": "datamax_bcache_hit_ratio_percent{window=\"day\", instance=~\"$instance\"}", "legendFormat": "{{cache_device}} 1d", "refId": "B" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "custom": { "lineWidth": 2, "fillOpacity": 0 } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "磁盘坏道计数（重映射 / 待定）",
+      "description": "这两条线只要抬头就要安排换盘：绝对值不可怕，持续增长才可怕。",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 17 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "datamax_disk_reallocated_sectors{instance=~\"$instance\"} > 0", "legendFormat": "重映射 {{instance}} C{{ctrl}}:S{{slot}}", "refId": "A" },
+        { "expr": "datamax_disk_pending_sectors{instance=~\"$instance\"} > 0", "legendFormat": "待定 {{instance}} C{{ctrl}}:S{{slot}}", "refId": "B" }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "lineWidth": 2, "fillOpacity": 0, "drawStyle": "line" } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "缓存可用比例与脏数据",
+      "description": "writeback 模式下缓存可用比例下降意味着脏数据在堆积，掉电风险随之上升。",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 17 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "expr": "datamax_bcache_cache_available_percent{instance=~\"$instance\"}", "legendFormat": "{{cache_device}} 可用", "refId": "A" },
+        { "expr": "datamax_bcache_dirty_bucket_percent{instance=~\"$instance\"}", "legendFormat": "{{cache_device}} 脏数据桶", "refId": "B" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent", "custom": { "lineWidth": 2, "fillOpacity": 0 } } }
+    }
+  ]
+}

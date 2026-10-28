@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import subprocess
+import subprocess
 
 ALLOWED_FS = ("ext4", "xfs")
 
@@ -154,13 +155,54 @@ def mount_device(device: str, mountpoint: str) -> tuple[bool, str]:
     if dev.get("mountpoint"):
         mounts.append(dev["mountpoint"])
     if mounts:
-        return False, f"设备已挂载于 {mounts[0]}"
+        mp = mounts[0]
+        # 已挂载时也要看它是读还是写——只读挂载共享出去同样写不进去，
+        # 而原来的提示只说"已挂载"，等于把问题藏起来了。
+        opts = ""
+        try:
+            rr = subprocess.run(["findmnt", "-rn", "-o", "OPTIONS", "--target", mp],
+                                capture_output=True, text=True, timeout=10)
+            opts = (rr.stdout or "").strip().splitlines()[0] if rr.stdout.strip() else ""
+        except Exception:
+            pass
+        if "ro" in [o.strip() for o in opts.split(",")]:
+            return False, (
+                f"设备已挂载于 {mp}，但为**只读**（{opts}）。"
+                "若是 NTFS，通常是卷带脏标记：先在服务器上 umount，再执行 ntfsfix 后重新挂载。"
+            )
+        return False, f"设备已挂载于 {mp}（读写）"
     os.makedirs(mountpoint, exist_ok=True)
     rc, _, serr = _run(["mount", device, mountpoint])
     invalidate_cache()
     if rc != 0:
         return False, serr.strip() or "mount 失败"
-    return True, f"已挂载到 {mountpoint}"
+    # 只检查退出码是不够的：NTFS 卷有脏标记/休眠残留时，ntfs-3g 会**成功**
+    # 挂载为只读并返回 0。这里必须回读实际挂载选项，否则界面会显示"已挂载"，
+    # 而用户随后发现到处都写不进去——这正是本次 NFS 写不进去的根因。
+    opts = ""
+    try:
+        rr = subprocess.run(
+            ["findmnt", "-rn", "-o", "OPTIONS", "--target", mountpoint],
+            capture_output=True, text=True, timeout=10,
+        )
+        opts = (rr.stdout or "").strip().splitlines()[0] if rr.stdout.strip() else ""
+    except Exception:
+        pass
+    if "ro" in [o.strip() for o in opts.split(",")]:
+        hint = ""
+        try:
+            blk = subprocess.run(["blkid", "-o", "value", "-s", "TYPE", device],
+                                 capture_output=True, text=True, timeout=10).stdout.strip()
+        except Exception:
+            blk = ""
+        if blk == "ntfs":
+            hint = "（NTFS 卷存在脏标记，常见于 Windows 快速启动或休眠后未正常关机。"
+            hint += "请先在服务器上 umount 后执行 ntfsfix，再重新挂载。）"
+        return False, (
+            f"设备已挂载到 {mountpoint}，但文件系统是**只读**的{hint}。"
+            f"当前挂载选项：{opts or '未知'}。只读状态下 NFS/SMB 共享出去后客户端无法写入。"
+        )
+    return True, f"已挂载到 {mountpoint}（读写）"
 
 
 def umount_device(device: str) -> tuple[bool, str]:

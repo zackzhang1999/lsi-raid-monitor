@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DataMax-LSI 授权签发台</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --canvas: #eef1f5; --surface: #fcfdff; --surface-2: #f4f6fa; --surface-3: #eceff4;
+    --ink: #131a24; --ink-soft: #5d6a7b; --ink-faint: #8b95a3;
+    --border: #e2e7ee; --border-strong: #d3dae4;
+    --primary: #2767e8; --primary-soft: rgba(39,103,232,.11);
+    --ok: #14805d; --ok-bg: rgba(20,128,93,.1);
+    --warn: #ad6100; --warn-bg: rgba(209,120,0,.12);
+    --crit: #c84646; --crit-bg: rgba(200,70,70,.1);
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --canvas: #0a0d12; --surface: #0f141b; --surface-2: #141b24; --surface-3: #1a222d;
+      --ink: #e9edf3; --ink-soft: #9aa5b2; --ink-faint: #677384;
+      --border: #1d2631; --border-strong: #2b3644;
+      --primary: #4f8cff; --primary-soft: rgba(79,140,255,.14);
+      --ok: #35c48b; --ok-bg: rgba(53,196,139,.12);
+      --warn: #f0a24a; --warn-bg: rgba(240,162,74,.12);
+      --crit: #ef7a7a; --crit-bg: rgba(239,122,122,.12);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 28px 20px 64px;
+    font: 400 14px/1.6 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--canvas); color: var(--ink);
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  header { margin-bottom: 22px; }
+  h1 { margin: 0 0 6px; font-size: 21px; letter-spacing: -.01em; }
+  .sub { color: var(--ink-soft); font-size: 13px; }
+  .cols { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 20px; align-items: start; }
+  @media (max-width: 980px) { .cols { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 14px; padding: 20px; margin-bottom: 20px;
+  }
+  .card h2 { margin: 0 0 4px; font-size: 14.5px; }
+  .card .hint { margin: 0 0 16px; font-size: 12px; color: var(--ink-faint); line-height: 1.7; }
+  label { display: block; font-size: 12px; font-weight: 600; color: var(--ink-soft); margin: 0 0 6px; }
+  input, select, textarea {
+    width: 100%; font: inherit; color: inherit;
+    background: var(--surface-2); border: 1px solid var(--border-strong);
+    border-radius: 10px; padding: 9px 11px; margin-bottom: 14px;
+  }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
+  textarea { font-family: var(--mono); font-size: 12px; min-height: 92px; resize: vertical; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+    height: 36px; padding: 0 15px; font: inherit; font-size: 13px; font-weight: 600;
+    color: var(--ink); background: var(--surface-2);
+    border: 1px solid var(--border-strong); border-radius: 10px; cursor: pointer;
+    transition: background .16s, border-color .16s, transform .16s;
+  }
+  .btn:hover { background: var(--surface-3); }
+  .btn:active { transform: scale(.98); }
+  .btn.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+  .btn.primary:hover { filter: brightness(1.07); }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+  .btns { display: flex; flex-wrap: wrap; gap: 9px; }
+  .note {
+    font-size: 12px; line-height: 1.7; border-radius: 10px; padding: 10px 12px; margin-bottom: 14px;
+    background: var(--surface-2); color: var(--ink-soft); border-left: 3px solid var(--border-strong);
+  }
+  .note.warn { background: var(--warn-bg); border-left-color: var(--warn); color: var(--warn); }
+  .note.ok { background: var(--ok-bg); border-left-color: var(--ok); color: var(--ok); }
+  .note.crit { background: var(--crit-bg); border-left-color: var(--crit); color: var(--crit); }
+  .fp {
+    font-family: var(--mono); font-size: 11.5px; word-break: break-all;
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px; margin-bottom: 14px; color: var(--ink-soft);
+  }
+  .fp b { color: var(--ink); }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 5px 12px; font-size: 12.5px; }
+  .kv dt { color: var(--ink-faint); }
+  .kv dd { margin: 0; font-family: var(--mono); }
+  .chk { display: flex; align-items: center; gap: 8px; font-size: 12.5px; font-weight: 400; color: var(--ink-soft); margin-bottom: 14px; }
+  .chk input { width: auto; margin: 0; }
+  .out { font-family: var(--mono); font-size: 11.5px; white-space: pre-wrap; word-break: break-all;
+    background: var(--surface-3); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px; max-height: 320px; overflow: auto; margin-bottom: 14px; }
+  .muted { color: var(--ink-faint); }
+  code { font-family: var(--mono); font-size: 12px; background: var(--surface-3); padding: 1px 5px; border-radius: 5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>DataMax-LSI 授权签发台</h1>
+    <p class="sub">
+      全部计算在<strong>本机浏览器</strong>内完成：私钥不经过任何服务器、不上传、不落盘（除非你主动勾选记住）。
+      本页面本身可以放在任何地方打开——本地文件、内网静态站、甚至离线拷到别人机器上。
+    </p>
+  </header>
+
+  <div class="cols">
+    <!-- 左栏：密钥 + 签发 -->
+    <div>
+      <div class="card">
+        <h2>1. 签名私钥</h2>
+        <p class="hint">
+          选 <code>private.pem</code>，或直接把 PEM 文本粘进来。
+          私钥决定"是谁签的"——产品里内置的公钥必须与它配对，否则授权装不进去。
+        </p>
+        <div id="keyStatus" class="note">尚未载入私钥。</div>
+        <div id="keyFp"></div>
+        <input type="file" id="keyFile" accept=".pem,.key,text/plain" />
+        <label for="keyText">或粘贴私钥文本（PKCS#8 PEM）</label>
+        <textarea id="keyText" placeholder="-----BEGIN PRIVATE KEY-----&#10;...&#10;-----END PRIVATE KEY-----"></textarea>
+        <div class="btns">
+          <button class="btn" id="btnLoadKey">载入私钥</button>
+          <button class="btn" id="btnClearKey">清除</button>
+        </div>
+        <label class="chk" style="margin-top:14px">
+          <input type="checkbox" id="rememberKey" />
+          <span>在这台浏览器记住私钥（localStorage）</span>
+        </label>
+        <div class="note warn">
+          勾选后私钥会存在本机浏览器里，下次打开免粘贴。仅限你自己的受控设备使用——
+          共享电脑、公用平板上不要勾。
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>2. 签发内容</h2>
+        <p class="hint">这些字段会被签名保护，装到客户机后无法篡改（改一个字签名即失效）。</p>
+        <label for="licensee">被授权方</label>
+        <input id="licensee" placeholder="某某数据中心 / 某某公司" />
+        <div class="row">
+          <div>
+            <label for="edition">版本</label>
+            <select id="edition">
+              <option value="community">社区版</option>
+              <option value="pro">专业版</option>
+              <option value="enterprise" selected>企业版</option>
+            </select>
+          </div>
+          <div>
+            <label for="days">有效天数（0 = 永久）</label>
+            <input id="days" type="number" min="0" value="365" />
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label for="seats">可管理设备数</label>
+            <input id="seats" type="number" min="1" value="1" />
+          </div>
+          <div>
+            <label for="serial">序列号（留空自动生成）</label>
+            <input id="serial" placeholder="DMX-2026-0001" />
+          </div>
+        </div>
+        <label for="issued">签发日期</label>
+        <input id="issued" type="date" />
+        <div class="btns">
+          <button class="btn primary" id="btnIssue" disabled>生成授权文件</button>
+          <button class="btn" id="btnFillDemo">填入示例</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 右栏：结果 + 校验 -->
+    <div>
+      <div class="card">
+        <h2>3. 授权文件</h2>
+        <p class="hint">生成后会自动用派生出的公钥复验一次——序列化规则和产品端不一致的话，这里就能发现，不用等客户装上才报错。</p>
+        <div id="issueStatus" class="note">还没有生成。</div>
+        <div id="outMeta"></div>
+        <div class="out" id="outJson">—</div>
+        <div class="btns">
+          <button class="btn" id="btnCopy" disabled>复制</button>
+          <button class="btn" id="btnDownload" disabled>下载 license.json</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>4. 校验已有授权</h2>
+        <p class="hint">装上之前先在这里验一遍，或者用来核对客户发回来的授权文件有没有被改过。</p>
+        <label for="verifyPub">公钥（public.b64，单行 base64）</label>
+        <input id="verifyPub" placeholder="73DC2BMX...=" />
+        <label for="verifyDoc">授权文件内容</label>
+        <textarea id="verifyDoc" placeholder='{"payload":{...},"sig":"..."}'></textarea>
+        <div class="btns">
+          <button class="btn" id="btnVerify">校验</button>
+          <button class="btn" id="btnUseOwnPub">用当前私钥对应的公钥</button>
+        </div>
+        <div id="verifyStatus" class="note" style="margin-top:14px; margin-bottom:0">等待校验。</div>
+      </div>
+
+      <div class="card">
+        <h2>5. 操作要点</h2>
+        <p class="hint" style="margin:0">
+          · 私钥对应产品里的 <code>PUBLIC_KEY_B64</code>。换密钥后必须同步替换该常量，否则所有授权都会被判「签名无效」。<br />
+          · 交付给客户的机器上<strong>不应该留私钥</strong>——有私钥就能签出任意授权。<br />
+          · 授权只覆盖功能开关，到期后产品退回社区版而不是停机：拿客户的生产数据催款不体面，也留不住客户。<br />
+          · 运行环境缺少 <code>cryptography</code> 时，产品会拒绝一切签名授权，只保留社区版与试用期。
+        </p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* 签发逻辑全部在浏览器里跑，用的是 WebCrypto 的原生 Ed25519。
+   不引入任何第三方库：这是签发私钥的地方，多一个依赖就多一份"它到底
+   有没有把密钥送出去"的疑问，而这份疑问没法向自己证明。 */
+
+const $ = (s) => document.querySelector(s);
+const b64ToBytes = (b64) => {
+  const bin = atob(b64.replace(/\s+/g, ''));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+};
+const bytesToB64 = (bytes) => {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s);
+};
+const b64urlToB64 = (u) => u.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(u.length / 4) * 4, '=');
+const b64ToB64url = (b) => b.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+/* 从 PEM 里抠出 DER。头尾行、空行、缩进都要能容忍——
+   从邮件里复制出来的 PEM 常常带这些。 */
+function pemToDer(pem) {
+  const m = pem.match(/-----BEGIN [^-]+-----([\s\S]*?)-----END [^-]+-----/);
+  const body = m ? m[1] : pem;
+  const clean = body.replace(/[\s\r\n]+/g, '');
+  if (!clean) throw new Error('没有找到 PEM 内容');
+  return b64ToBytes(clean);
+}
+
+/* 与 Python 端 json.dumps(..., sort_keys=True, separators=(",",":"), ensure_ascii=False)
+   严格等价。签名是对"字节"做的，两端序列化规则只要差一点，
+   签出来的东西产品就验不过——这是这类手工实现最容易翻车的地方。 */
+function canonical(v) {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return '[' + v.map(canonical).join(',') + ']';
+  return '{' + Object.keys(v).sort()
+    .map((k) => JSON.stringify(k) + ':' + canonical(v[k])).join(',') + '}';
+}
+
+/* 浏览器只在"安全上下文"里提供 crypto.subtle：https、localhost、以及
+   file:// 都算，而 http://192.168.x.x 这类不算。所以用内网地址直接打开
+   这个页面时加密接口一定是缺的——这是浏览器策略，不是页面写错了。
+   两种情况的处置完全不同，提示必须分开说，否则人会去怀疑浏览器版本。 */
+const SECURE = (() => {
+  try { return !!(window.isSecureContext && window.crypto && crypto.subtle); }
+  catch (e) { return false; }
+})();
+
+const INSECURE_NOTE =
+  '当前页面不是安全上下文，浏览器停用了网页加密接口（crypto.subtle）。'
+  + '把本文件下载到本地、双击打开（file:// 方式）即可正常签发，或改用 HTTPS 访问。'
+  + '用 http:// + 内网 IP 打开时浏览器一定会拦——这是浏览器策略，不是页面坏了。';
+
+const OLD_BROWSER_NOTE =
+  '这个浏览器版本不支持 Ed25519（需 Chrome 137+ / Safari 17+ / Firefox 129+）。'
+  + '请改用 tools/license_tool.py 命令行签发。';
+
+let privKey = null;      // CryptoKey
+let pubB64 = '';         // 由私钥派生出的公钥（与产品内置常量同格式）
+let licenseJson = '';    // 最近一次生成的授权文件
+
+function setNote(el, text, kind) {
+  el.className = 'note' + (kind ? ' ' + kind : '');
+  el.textContent = text;
+}
+
+/* http 下用不了加密接口时，顺手把文件本身给出去——本地双击打开就能用，
+   不用再去服务器目录里翻这个 HTML。两处 !SECURE 分支都要调，放在一个
+   函数里，免得将来只加了一处。 */
+function offerSelfDownload() {
+  if ($('#btnSelfDownload')) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'btns';
+  wrap.style.marginBottom = '14px';
+  wrap.innerHTML = '<button class="btn primary" id="btnSelfDownload">把签发台下载到本地</button>';
+  $('#keyStatus').insertAdjacentElement('afterend', wrap);
+  $('#btnSelfDownload').addEventListener('click', () => {
+    const html = '<!DOCTYPE html>\n' + document.documentElement.outerHTML;
+    const blob = new Blob([html], { type: 'text/html' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'license-signer.html';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+}
+
+async function loadPrivateKey(pem) {
+  const der = pemToDer(pem);
+  // extractable=true 只为读出公钥部分做指纹；密钥本身依然只在本页内存里。
+  const key = await crypto.subtle.importKey('pkcs8', der, { name: 'Ed25519' }, true, ['sign']);
+  privKey = key;
+  const jwk = await crypto.subtle.exportKey('jwk', key);
+  if (!jwk || !jwk.x) throw new Error('无法从私钥导出公钥部分');
+  pubB64 = b64urlToB64(jwk.x);
+  return pubB64;
+}
+
+function renderKeyState() {
+  if (!privKey) {
+    setNote($('#keyStatus'), '尚未载入私钥。', '');
+    $('#keyFp').innerHTML = '';
+    $('#btnIssue').disabled = true;
+    return;
+  }
+  setNote($('#keyStatus'), '私钥已载入，可以签发。', 'ok');
+  $('#keyFp').innerHTML =
+    `<div class="fp">此私钥对应的公钥（base64）：<br /><b>${pubB64}</b><br />`
+    + `<span class="muted">产品里 license_mgr.py 的 PUBLIC_KEY_B64 必须与这一行完全一致，否则客户机上会判「签名无效」。</span></div>`;
+  $('#btnIssue').disabled = false;
+}
+
+async function handleKey(text) {
+  if (!SECURE) {
+    setNote($('#keyStatus'), INSECURE_NOTE, 'warn');
+    offerSelfDownload();
+    return false;
+  }
+  try {
+    await loadPrivateKey(text);
+    renderKeyState();
+    if ($('#rememberKey').checked) {
+      try { localStorage.setItem('dmx-signer-key', text); } catch (e) { /* 隐私模式下会失败 */ }
+    } else {
+      try { localStorage.removeItem('dmx-signer-key'); } catch (e) {}
+    }
+    return true;
+  } catch (e) {
+    setNote($('#keyStatus'), '私钥无法解析：' + e.message, 'crit');
+    privKey = null; pubB64 = '';
+    renderKeyState();
+    return false;
+  }
+}
+
+function todayStr() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+function addDays(dateStr, days) {
+  const d = new Date(dateStr + 'T00:00:00');
+  d.setDate(d.getDate() + Number(days));
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/* 自动序列号：用签发日期 + 随机数，不用"客户名哈希"。
+   后者依赖运行时哈希种子，同一个客户名两次签发会得到不同编号，
+   做授权台账时对不上。 */
+function autoSerial(issued) {
+  const rnd = Math.floor(Math.random() * 100000);
+  return `DMX-${issued.replace(/-/g, '').slice(0, 8)}-${String(rnd).padStart(5, '0')}`;
+}
+
+async function issue() {
+  if (!privKey) return;
+  const licensee = $('#licensee').value.trim();
+  if (!licensee) {
+    setNote($('#issueStatus'), '请填写被授权方——授权文件里没有主体名称，出问题时就说不清是给谁的。', 'warn');
+    return;
+  }
+  const issued = $('#issued').value || todayStr();
+  const days = Number($('#days').value || 0);
+  const payload = {
+    product: 'DataMax-LSI',
+    licensee,
+    edition: $('#edition').value,
+    seats: Math.max(1, Number($('#seats').value || 1)),
+    serial: $('#serial').value.trim() || autoSerial(issued),
+    issued_at: issued,
+    expires_at: days > 0 ? addDays(issued, days) : '',
+  };
+  const data = new TextEncoder().encode(canonical(payload));
+  const sig = await crypto.subtle.sign({ name: 'Ed25519' }, privKey, data);
+  licenseJson = JSON.stringify({ payload, sig: bytesToB64(new Uint8Array(sig)) }, null, 2);
+  $('#outJson').textContent = licenseJson;
+  $('#btnCopy').disabled = false;
+  $('#btnDownload').disabled = false;
+  $('#outMeta').innerHTML = `<dl class="kv">
+    <dt>被授权方</dt><dd>${payload.licensee}</dd>
+    <dt>版本</dt><dd>${payload.edition}</dd>
+    <dt>设备数</dt><dd>${payload.seats}</dd>
+    <dt>序列号</dt><dd>${payload.serial}</dd>
+    <dt>有效期</dt><dd>${payload.expires_at || '永久'}</dd>
+  </dl>`;
+
+  // 立即用派生出的公钥复验：能挡住"序列化规则与产品端不一致"这类
+  // 本地看不出来、到客户那儿才炸的问题。
+  try {
+    const ok = await verifyDoc({ payload, sig: bytesToB64(new Uint8Array(sig)) }, pubB64);
+    setNote($('#issueStatus'), ok
+      ? '已生成，并用本私钥对应的公钥复验通过。'
+      : '已生成，但自检未通过——请不要发给客户，先检查序列化规则。',
+      ok ? 'ok' : 'crit');
+  } catch (e) {
+    setNote($('#issueStatus'), '已生成，但自检报错：' + e.message, 'warn');
+  }
+}
+
+async function verifyDoc(doc, pubB64Text) {
+  const raw = b64ToBytes(pubB64Text);
+  const key = await crypto.subtle.importKey('raw', raw, { name: 'Ed25519' }, false, ['verify']);
+  const data = new TextEncoder().encode(canonical(doc.payload));
+  return crypto.subtle.verify({ name: 'Ed25519' }, key, b64ToBytes(doc.sig), data);
+}
+
+async function doVerify() {
+  try {
+    const doc = JSON.parse($('#verifyDoc').value);
+    const pub = $('#verifyPub').value.trim();
+    if (!pub) { setNote($('#verifyStatus'), '请先填入公钥。', 'warn'); return; }
+    const ok = await verifyDoc(doc, pub);
+    if (!ok) { setNote($('#verifyStatus'), '签名无效：文件被改过，或公钥与签发私钥不配对。', 'crit'); return; }
+    const exp = doc.payload && doc.payload.expires_at;
+    const expired = exp ? new Date(exp + 'T23:59:59') < new Date() : false;
+    const who = (doc.payload && doc.payload.licensee) || '（未署名）';
+    setNote($('#verifyStatus'),
+      expired ? `签名有效，但已于 ${exp} 到期（被授权方 ${who}）。` : `签名有效，被授权方 ${who}${exp ? '，有效期至 ' + exp : '，永久授权'}。`,
+      expired ? 'warn' : 'ok');
+  } catch (e) {
+    setNote($('#verifyStatus'), '校验失败：' + e.message, 'crit');
+  }
+}
+
+$('#issued').value = todayStr();
+
+$('#btnLoadKey').addEventListener('click', () => {
+  const text = $('#keyText').value.trim();
+  if (!text) { setNote($('#keyStatus'), '请先选择私钥文件或粘贴私钥文本。', 'warn'); return; }
+  handleKey(text);
+});
+$('#keyFile').addEventListener('change', async (ev) => {
+  const f = ev.target.files && ev.target.files[0];
+  if (!f) return;
+  const text = await f.text();
+  $('#keyText').value = text;
+  handleKey(text);
+});
+$('#btnClearKey').addEventListener('click', () => {
+  privKey = null; pubB64 = ''; $('#keyText').value = ''; $('#keyFile').value = '';
+  try { localStorage.removeItem('dmx-signer-key'); } catch (e) {}
+  renderKeyState();
+});
+$('#rememberKey').addEventListener('change', (ev) => {
+  if (!ev.target.checked) { try { localStorage.removeItem('dmx-signer-key'); } catch (e) {} }
+});
+$('#btnIssue').addEventListener('click', issue);
+$('#btnFillDemo').addEventListener('click', () => {
+  $('#licensee').value = $('#licensee').value || '示例客户';
+  $('#edition').value = 'enterprise';
+  $('#days').value = 365;
+  $('#seats').value = 1;
+  $('#serial').value = '';
+});
+$('#btnCopy').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(licenseJson); setNote($('#issueStatus'), '已复制到剪贴板。', 'ok'); }
+  catch (e) { setNote($('#issueStatus'), '复制失败，请手动选中文本复制。', 'warn'); }
+});
+$('#btnDownload').addEventListener('click', () => {
+  const blob = new Blob([licenseJson], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'license.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+$('#btnVerify').addEventListener('click', doVerify);
+$('#btnUseOwnPub').addEventListener('click', () => {
+  if (pubB64) { $('#verifyPub').value = pubB64; setNote($('#verifyStatus'), '已填入当前私钥对应的公钥。', ''); }
+  else setNote($('#verifyStatus'), '还没有载入私钥。', 'warn');
+});
+
+/* 启动自检：先确认这个浏览器能不能做 Ed25519，不能就直说，
+   而不是等用户填完表单点生成才报错。 */
+(async () => {
+  if (!SECURE) {
+    setNote($('#keyStatus'), INSECURE_NOTE, 'warn');
+    offerSelfDownload();
+    return;
+  }
+  try {
+    const probe = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']);
+    const sig = await crypto.subtle.sign({ name: 'Ed25519' }, probe.privateKey, new TextEncoder().encode('probe'));
+    const ok = await crypto.subtle.verify({ name: 'Ed25519' }, probe.publicKey, sig, new TextEncoder().encode('probe'));
+    if (!ok) throw new Error('自检未通过');
+    let remembered = '';
+    try { remembered = localStorage.getItem('dmx-signer-key') || ''; } catch (e) {}
+    if (remembered) {
+      $('#keyText').value = remembered;
+      $('#rememberKey').checked = true;
+      await handleKey(remembered);
+    } else {
+      setNote($('#keyStatus'), '环境自检通过（支持 Ed25519）。请载入签名私钥。', '');
+    }
+  } catch (e) {
+    // 走到这里说明上下文是安全的，那就只剩浏览器版本问题
+    setNote($('#keyStatus'), OLD_BROWSER_NOTE + '（自检报错：' + e.message + '）', 'crit');
+  }
+})();
+</script>
+</body>
+</html>

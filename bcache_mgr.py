@@ -154,25 +154,38 @@ def bcache_devices() -> list[dict]:
                 cache_info: dict = {}
                 cache_link = os.path.join(base, "cache0")
                 cache_offline = False
+                recorded_dev = ""
                 if os.path.islink(cache_link):
                     m = re.search(r"/block/([^/]+)/", os.readlink(cache_link))
                     if m:
-                        dev = m.group(1)
-                        cb = f"/sys/block/{dev}/bcache"
-                        cache_info["device"] = f"/dev/{dev}"
-                        if not os.path.isdir(cb):
-                            cache_offline = True
-                            for key in ("nbuckets", "bucket_size", "block_size", "discard"):
-                                cache_info[key] = None
-                        else:
-                            for key in ("nbuckets", "bucket_size", "block_size", "discard"):
-                                cache_info[key] = _read(os.path.join(cb, key))
-                            ps = _read(os.path.join(cb, "priority_stats"))
-                            if ps:
-                                for pkey in ("Unused", "Clean", "Dirty", "Metadata"):
-                                    pm = re.search(rf"{pkey}:\s*([0-9.]+)%", ps)
-                                    if pm:
-                                        cache_info["bucket_" + pkey.lower()] = pm.group(1)
+                        recorded_dev = m.group(1)
+                        cache_info["device"] = f"/dev/{recorded_dev}"
+                if recorded_dev and os.path.isdir(f"/sys/block/{recorded_dev}/bcache"):
+                    cb = f"/sys/block/{recorded_dev}/bcache"
+                    for key in ("nbuckets", "bucket_size", "block_size", "discard"):
+                        cache_info[key] = _read(os.path.join(cb, key))
+                    ps = _read(os.path.join(cb, "priority_stats"))
+                    if ps:
+                        for pkey in ("Unused", "Clean", "Dirty", "Metadata"):
+                            pm = re.search(rf"{pkey}:\s*([0-9.]+)%", ps)
+                            if pm:
+                                cache_info["bucket_" + pkey.lower()] = pm.group(1)
+                else:
+                    # 记录里的缓存盘不在了：按 cset.uuid 反查系统里是否存在
+                    # "在系统中但未注册"的缓存盘（掉线重插后盘符可能变化）
+                    detected = find_unregistered_cache_for(name)
+                    if detected:
+                        cache_info["device"] = detected
+                        cache_info["unregistered"] = True
+                        cache_info.update(_super_spec(detected))
+                        for key in ("block_size", "discard"):
+                            cache_info.setdefault(key, None)
+                        info["cache_present_unregistered"] = True
+                        info["detected_cache_device"] = detected
+                    else:
+                        cache_offline = True
+                        for key in ("nbuckets", "bucket_size", "block_size", "discard"):
+                            cache_info[key] = None
                 info["cache_offline"] = cache_offline
                 info["cache_info"] = cache_info
                 csets.append(info)
@@ -618,6 +631,61 @@ def _super_role(path: str) -> str:
     return ""
 
 
+def _super_cset_uuid(path: str) -> str | None:
+    """读取设备 bcache 超级块里记录的缓存集 UUID。"""
+    rc, out, _ = _run(["bcache-super-show", path], timeout=15)
+    if rc != 0:
+        return None
+    m = re.search(r"cset\.uuid\s+([0-9a-fA-F-]{36})", out)
+    return m.group(1) if m else None
+
+
+def _super_spec(path: str) -> dict:
+    """未注册状态下，从超级块推算桶数/桶大小，供页面展示。"""
+    rc, out, _ = _run(["bcache-super-show", path], timeout=15)
+    if rc != 0:
+        return {}
+
+    def num(key: str) -> int | None:
+        m = re.search(rf"{re.escape(key)}\s+(\d+)", out)
+        return int(m.group(1)) if m else None
+
+    spb = num("dev.sectors_per_bucket")
+    cache_sectors = num("dev.cache.cache_sectors")
+    spec: dict = {}
+    if spb:
+        spec["bucket_size"] = f"{spb * 512 / 1024:.1f}k"
+        if cache_sectors:
+            spec["nbuckets"] = cache_sectors // spb
+    return spec
+
+
+def _unregistered_cache_devices() -> list[str]:
+    """系统中存在、带缓存超级块、但当前未注册进内核的整块设备。"""
+    paths = []
+    for d in block_devices():
+        path = str(d.get("path") or "")
+        if not re.fullmatch(r"/dev/(sd[a-z]+|nvme\d+n\d+)$", path):
+            continue
+        if d.get("in_bcache") or d.get("bcache_role") != "cache":
+            continue
+        paths.append(path)
+    return paths
+
+
+def find_unregistered_cache_for(cset_uuid: str) -> str | None:
+    """找到属于指定缓存集、但尚未注册的缓存盘（盘符可能与原记录不同）。
+
+    磁盘掉线后重新插回时内核可能分配新的盘符（sdc → sdd），此时缓存集里的
+    cache0 链接会指向旧名字而变成悬空链接。这里按超级块里的 cset.uuid 反查，
+    避免把"缓存盘还在、只是没注册"误判成"缓存盘已不在系统中"。
+    """
+    for path in _unregistered_cache_devices():
+        if _super_cset_uuid(path) == cset_uuid:
+            return path
+    return None
+
+
 def _super_cache_state_dirty(path: str) -> bool:
     rc, out, _ = _run(["bcache-super-show", path], timeout=15)
     if rc != 0:
@@ -793,8 +861,70 @@ def reattach(backing_path: str, cset_uuid: str) -> tuple[bool, str, str | None]:
     return True, f"{device} 已重新绑定缓存集", device
 
 
+def _recover_unregistered_cache() -> tuple[bool, str] | None:
+    """缓存盘掉线后改了盘符、只是没注册时的轻量恢复。
+
+    缓存集与 bcache 设备都还在运行时，只需把同 cset.uuid 的缓存盘重新注册
+    回内核即可，不必停止 bcache0、也不必注销缓存集。
+    返回 None 表示当前不适用这条快速路径。
+    """
+    info = bcache_devices()[0]
+    csets = info.get("cache_sets") or []
+    target = next((c for c in csets if c.get("cache_present_unregistered")
+                   and c.get("detected_cache_device")), None)
+    if not target:
+        return None
+    path = str(target["detected_cache_device"])
+    # 顺序很重要：先注册缓存盘，再看脏数据。
+    # 缓存盘缺席时 dirty_data 是停住的旧计数，永远不会下降；先注册后回写才会继续。
+    ok, msg = register_device(path)
+    if not ok:
+        return False, f"注册缓存盘 {path} 失败：{msg}"
+    recovered = False
+    for _ in range(40):
+        time.sleep(0.5)
+        cur = bcache_devices()[0]
+        cset = next((c for c in cur.get("cache_sets") or []
+                     if c.get("uuid") == target.get("uuid")), None)
+        if cset and not cset.get("cache_offline") and not cset.get("cache_present_unregistered"):
+            recovered = True
+            break
+    if not recovered:
+        # 内核可能返回 "duplicate cache set member"（旧缓存集仍在注册状态，
+        # 拒绝把该盘直接塞回去）。此时返回 None，交给下面的完整恢复流程处理。
+        return None
+    # 注册成功后，把残留的脏数据回写完（最多等 90 秒）
+    draining = False
+    for dev in bcache_devices()[0].get("devices") or []:
+        name = dev.get("name")
+        if not name or _dirty_bytes(dev.get("dirty_data")) <= 0:
+            continue
+        draining = True
+        try:
+            with open(f"/sys/block/{name}/bcache/writeback_running", "w", encoding="utf-8") as f:
+                f.write("1")
+            with open(f"/sys/block/{name}/bcache/writeback_delay", "w", encoding="utf-8") as f:
+                f.write("0")
+        except Exception:
+            pass
+        waited = 0
+        while waited < 90:
+            time.sleep(2)
+            waited += 2
+            if _dirty_bytes(_read(f"/sys/block/{name}/bcache/dirty_data")) <= 0:
+                draining = False
+                break
+    dev0 = (bcache_devices()[0].get("devices") or [{}])[0]
+    tail = "；仍有少量脏数据正在回写，稍后会自动完成" if draining else ""
+    return True, (f"缓存已恢复：{path} 已重新注册并绑定"
+                  f"（{dev0.get('device', '')} {dev0.get('state', '')}）{tail}")
+
+
 def recover() -> tuple[bool, str]:
-    """恢复 bcache：清理失效缓存集引用，注册缓存盘与 backing，再重新绑定。"""
+    """恢复 bcache：缓存盘未注册时轻量重注册，否则清理失效缓存集并重新绑定。"""
+    fast = _recover_unregistered_cache()
+    if fast is not None:
+        return fast
     devs = block_devices()
     candidates = [d for d in devs
                   if d.get("bcache_role") in ("backing", "cache") and not d.get("in_bcache")]
@@ -802,15 +932,20 @@ def recover() -> tuple[bool, str]:
         return False, "没有找到需要恢复的 bcache 盘"
     try:
         mounts: dict[str, str] = {}
+        info0 = bcache_devices()[0]
+        # 缓存盘缺席（掉线/未注册）时 dirty_data 是停住的旧计数，等多久都不会下降；
+        # 后面的"注销缓存集 → 重新注册双方"会依据缓存盘日志继续回写，因此跳过等待。
+        cache_missing = any(c.get("cache_offline") or c.get("cache_present_unregistered")
+                            for c in info0.get("cache_sets", []))
         # 1) 先把脏数据全部写回，避免注销缓存集时丢数据
-        for dev in bcache_devices()[0]["devices"]:
+        for dev in info0["devices"]:
             name = dev.get("name")
             if not name:
                 continue
             if dev.get("mounted"):
                 mounts[name] = dev["mounted"]
             dirty = _dirty_bytes(dev.get("dirty_data"))
-            if dirty > 0:
+            if dirty > 0 and not cache_missing:
                 try:
                     with open(f"/sys/block/{name}/bcache/writeback_running", "w", encoding="utf-8") as f:
                         f.write("1")
@@ -848,6 +983,14 @@ def recover() -> tuple[bool, str]:
             if os.path.exists(path):
                 with open(path, "w", encoding="utf-8") as f:
                     f.write("1")
+        # 3.5) 注销后重新计算候选：此时 backing 已从旧缓存集脱离，需要和缓存盘一起
+        #      重新注册，否则会出现"只注册了缓存盘、bcache0 起不来"的情况。
+        time.sleep(0.5)
+        candidates = [d for d in block_devices()
+                      if d.get("bcache_role") in ("backing", "cache")
+                      and not d.get("in_bcache")]
+        if not candidates:
+            return False, "旧缓存集已注销，但没有找到可重新注册的 bcache 盘"
         # 4) 重新注册缓存盘与 backing
         for d in candidates:
             ok, msg = register_device(d["path"])

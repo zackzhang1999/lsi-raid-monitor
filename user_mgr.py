@@ -80,7 +80,7 @@ def create_user(username: str, password: str, role: str = "viewer") -> tuple[boo
     username = (username or "").strip()
     if not username or not password:
         return False, "用户名和口令不能为空"
-    if role not in ("admin", "viewer"):
+    if role not in ("admin", "operator", "viewer", "auditor"):
         return False, "非法角色"
     users = load_users()
     if username in users:

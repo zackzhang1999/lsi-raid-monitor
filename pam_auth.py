@@ -1,10 +1,15 @@
 """服务器本地 PAM 认证。
 
 通过 ctypes 调用系统 libpam，验证用户名/口令；不依赖第三方 Python 包。
-角色映射：默认只有 root 是 admin；可用环境变量显式指定额外管理员：
-  LSI_PAM_ADMIN_USERS  - 逗号分隔的用户名（如 root,ops）
-  LSI_PAM_ADMIN_GROUP  - 管理员组名（不设置则只有 root/显式用户是 admin）
-其余系统用户一律视为 viewer（只读）。
+
+角色映射按优先级从高到低匹配，命中即返回：
+  admin     root；LSI_PAM_ADMIN_USERS / LSI_PAM_ADMIN_GROUP
+  operator  LSI_PAM_OPERATOR_USERS / LSI_PAM_OPERATOR_GROUP
+  auditor   LSI_PAM_AUDITOR_USERS / LSI_PAM_AUDITOR_GROUP
+其余系统用户一律 viewer（只读）。
+
+用系统组映射角色，是为了让客户复用已有的账号体系——运维组就是运维权限，
+不用在本产品里再维护一份名单。
 """
 
 from __future__ import annotations
@@ -146,14 +151,22 @@ def _in_group(username: str, group: str) -> bool:
 def user_role(username: str) -> str:
     if username == "root":
         return "admin"
-    admin_users = {
-        u.strip()
-        for u in os.environ.get("LSI_PAM_ADMIN_USERS", "").split(",")
-        if u.strip()
-    }
-    if username in admin_users:
-        return "admin"
-    admin_group = os.environ.get("LSI_PAM_ADMIN_GROUP", "")
-    if admin_group and _in_group(username, admin_group):
-        return "admin"
+
+    # 从高到低匹配：一个人同时属于运维组和审计组时，取权限更高的那个，
+    # 否则"加了个组反而降权"会让人措手不及。
+    for role, env in (
+        ("admin", "LSI_PAM_ADMIN"),
+        ("operator", "LSI_PAM_OPERATOR"),
+        ("auditor", "LSI_PAM_AUDITOR"),
+    ):
+        users = {
+            u.strip()
+            for u in os.environ.get(f"{env}_USERS", "").split(",")
+            if u.strip()
+        }
+        if username in users:
+            return role
+        group = os.environ.get(f"{env}_GROUP", "")
+        if group and _in_group(username, group):
+            return role
     return "viewer"

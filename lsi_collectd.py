@@ -14,6 +14,7 @@ import subprocess
 import csv
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -21,6 +22,10 @@ from pathlib import Path
 import lsi_alert
 # SQLite 数据底座（与 CSV 双写，供长期趋势查询）
 import db
+# 控制器配置快照与漂移检测
+import config_mgr
+# 写缓存与缓存单元保护评估
+import battery_mgr
 
 # ---- 配置 ----
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -35,6 +40,66 @@ STORCLI = os.environ.get(
 CONTROLLER = os.environ.get("LSI_CONTROLLER", "/c0")
 
 # ---- 工具函数 ----
+
+
+# 控制器清单缓存：/api/vd_detail 等接口每次请求都会枚举控制器，
+# 不加缓存会对 storcli 造成不必要的调用。
+_CTRL_CACHE: dict = {"ts": 0.0, "ids": None}
+
+
+def _controller_ids_from_overview(data: dict | None) -> list[int]:
+    """从 `storcli show J` 的 System Overview 中取出控制器编号。"""
+    try:
+        rd = data["Controllers"][0].get("Response Data", {})
+        ids = [
+            int(item["Ctl"])
+            for item in rd.get("System Overview", [])
+            if isinstance(item, dict) and item.get("Ctl") not in (None, "")
+        ]
+    except Exception:
+        ids = []
+    return sorted(set(ids))
+
+
+def list_controller_ids() -> list[int]:
+    """枚举需要采集的 RAID 控制器编号。
+
+    多卡机器上必须遍历全部控制器：只读 /c0 时，若磁盘全部挂在 /c1，页面会
+    表现为"整机无盘"——这不是显示问题，而是取数取错了卡。
+    显式设置 LSI_CONTROLLER 时退化为单卡模式，便于调试与老部署兼容。
+    """
+    env = os.environ.get("LSI_CONTROLLER", "").strip()
+    if env:
+        m = re.search(r"(\d+)", env)
+        return [int(m.group(1))] if m else [0]
+    now = time.time()
+    if _CTRL_CACHE["ids"] is not None and now - _CTRL_CACHE["ts"] < 30:
+        return list(_CTRL_CACHE["ids"])
+    ids = _controller_ids_from_overview(run_storcli("show J", timeout=30))
+    ids = ids or [0]
+    _CTRL_CACHE.update(ts=now, ids=ids)
+    return list(ids)
+
+
+def controller_overview() -> dict[int, dict]:
+    """控制器编号 -> System Overview 摘要（型号/健康/盘数），用于快速列表。"""
+    data = run_storcli("show J", timeout=30)
+    out: dict[int, dict] = {}
+    try:
+        rd = data["Controllers"][0].get("Response Data", {})
+        for item in rd.get("System Overview", []):
+            if not isinstance(item, dict) or item.get("Ctl") in (None, ""):
+                continue
+            out[int(item["Ctl"])] = {
+                "model": str(item.get("Model", "")).strip(),
+                "health": str(item.get("Hlth", "")).strip(),
+                "num_disks": _to_int(item.get("PDs"), 0),
+                "num_vds": _to_int(item.get("VDs"), 0),
+                "bbu": str(item.get("BBU", "")).strip(),
+            }
+    except Exception:
+        pass
+    return out
 
 
 def run_storcli(cmd: str, timeout: int = 45) -> dict | None:
@@ -89,10 +154,12 @@ def _response_data(data: dict | None) -> dict | None:
 # ---- 磁盘采集 ----
 
 
-def _collect_drive_bg_progress(cmd: str) -> dict[tuple[int, int], dict]:
-    """采集各物理盘后台操作进度（rebuild/copyback），返回
+def _collect_drive_bg_progress(
+    cmd: str, ctrl_id: int = 0
+) -> dict[tuple[int, int], dict]:
+    """采集指定控制器各物理盘的后台操作进度（rebuild/copyback），返回
     {(eid, slot): {"progress": int|None, "eta": str}}"""
-    data = run_storcli(f"{CONTROLLER}/eall/sall {cmd} J")
+    data = run_storcli(f"/c{ctrl_id}/eall/sall {cmd} J")
     if not is_success(data):
         return {}
     result: dict[tuple[int, int], dict] = {}
@@ -122,27 +189,27 @@ def _collect_drive_bg_progress(cmd: str) -> dict[tuple[int, int], dict]:
     return result
 
 
-def collect_rebuild() -> dict[tuple[int, int], dict]:
-    return _collect_drive_bg_progress("show rebuild")
+def collect_rebuild(ctrl_id: int = 0) -> dict[tuple[int, int], dict]:
+    return _collect_drive_bg_progress("show rebuild", ctrl_id)
 
 
-def collect_copyback() -> dict[tuple[int, int], dict]:
-    return _collect_drive_bg_progress("show copyback")
+def collect_copyback(ctrl_id: int = 0) -> dict[tuple[int, int], dict]:
+    return _collect_drive_bg_progress("show copyback", ctrl_id)
 
 
-def collect_erase() -> dict[tuple[int, int], dict]:
-    return _collect_drive_bg_progress("show erase")
+def collect_erase(ctrl_id: int = 0) -> dict[tuple[int, int], dict]:
+    return _collect_drive_bg_progress("show erase", ctrl_id)
 
 
-def collect_disks() -> list[dict]:
-    data = run_storcli(f"{CONTROLLER}/eall/sall show all J")
+def collect_disks(ctrl_id: int = 0) -> list[dict]:
+    data = run_storcli(f"/c{ctrl_id}/eall/sall show all J")
     resp = _response_data(data)
     if not resp:
         return []
 
-    rebuild_map = collect_rebuild()
-    copyback_map = collect_copyback()
-    erase_map = collect_erase()
+    rebuild_map = collect_rebuild(ctrl_id)
+    copyback_map = collect_copyback(ctrl_id)
+    erase_map = collect_erase(ctrl_id)
 
     disks = []
     # 正在后台操作（erase/rebuild 等）的盘会从 show all 列表中消失，
@@ -184,6 +251,7 @@ def collect_disks() -> list[dict]:
             er = erase_map.get((eid, slot), {})
             disks.append(
                 {
+                    "ctrl": int(ctrl),
                     "eid": eid,
                     "slot": slot,
                     "did": summary.get("DID", ""),
@@ -282,6 +350,7 @@ def _append_failed_drives(
             temperature = parse_temperature(summary.get("Drive Temperature", ""))
             disks.append(
                 {
+                    "ctrl": int(ctrl),
                     "eid": eid,
                     "slot": slot,
                     "did": summary.get("DID", ""),
@@ -339,8 +408,8 @@ def _find_temperature(obj, depth: int = 0) -> int | None:
 # ---- 控制器 / VD / BBU ----
 
 
-def collect_controller() -> dict | None:
-    data = run_storcli(f"{CONTROLLER} show all J")
+def collect_controller(ctrl_id: int = 0) -> dict | None:
+    data = run_storcli(f"/c{ctrl_id} show all J")
     if not is_success(data):
         return None
 
@@ -359,6 +428,13 @@ def collect_controller() -> dict | None:
         hwcfg = resp.get("HwCfg", {})
         roc_temp = _to_int(hwcfg.get("ROC temperature(Degree Celsius)", "")) \
             if hwcfg.get("ROC temperature(Degree Celsius)") not in (None, "") else ""
+
+        # 缓存单元是否存在。这个字段决定写缓存能不能安全开启：
+        # 没有它时固件会把写缓存临时禁用，配置成写回也只会是"临时禁用"
+        # 状态——判缓存保护是否有效，必须看这里而不是只看 bbu_state。
+        bbu_present = str(hwcfg.get("BBU", "")).strip()
+        cachevault_flash = str(hwcfg.get("CacheVault Flash Size", "")).strip()
+        onboard_mem_mb = _to_int(hwcfg.get("On Board Memory Size", 0))
 
         health = "Optimal"
         vd_states = []
@@ -379,6 +455,7 @@ def collect_controller() -> dict | None:
             bbu_temp_val = parse_temperature(cv.get("Temp", ""))
 
         return {
+            "ctrl": ctrl_id,
             "model": model,
             "fw_version": fw_version,
             "health": health,
@@ -388,6 +465,9 @@ def collect_controller() -> dict | None:
             "bbu_model": bbu_model,
             "bbu_state": bbu_state,
             "bbu_temperature": bbu_temp_val if bbu_temp_val is not None else "",
+            "bbu_present": bbu_present,
+            "cachevault_flash": cachevault_flash,
+            "onboard_memory_mb": onboard_mem_mb,
             "vd_states": "|".join(vd_states),
         }
     except Exception as e:
@@ -397,19 +477,23 @@ def collect_controller() -> dict | None:
     return None
 
 
-def collect_vds() -> list[dict]:
-    data = run_storcli(f"{CONTROLLER} show J")
+def collect_vds(ctrl_id: int = 0) -> list[dict]:
+    data = run_storcli(f"/c{ctrl_id} show J")
     if not is_success(data):
         return []
     try:
         vd_list = data["Controllers"][0].get("Response Data", {}).get("VD LIST", [])
         return [
             {
+                "ctrl": ctrl_id,
                 "dg_vd": vd.get("DG/VD", ""),
                 "type": vd.get("TYPE", ""),
                 "state": vd.get("State", ""),
                 "size": vd.get("Size", ""),
                 "name": vd.get("Name", ""),
+                # 写缓存码（如 RWB / RWTD）。缓存保护评估要靠它判断
+                # "写回是否真的生效"，否则只能再单独跑一次 storcli。
+                "cache": vd.get("Cache", ""),
             }
             for vd in vd_list
         ]
@@ -418,17 +502,27 @@ def collect_vds() -> list[dict]:
     return []
 
 
+def collect_controller_raw(ctrl_id: int = 0) -> dict | None:
+    """控制器配置原文（供配置快照归一化使用）。
+
+    与 collect_controller 用同一条命令但返回原始结构：那里只取展示需要的
+    摘要字段，配置比对需要的是全量（阵列布局、开关、盘归属）。
+    """
+    data = run_storcli(f"/c{ctrl_id} show all J", timeout=60)
+    return data if is_success(data) else None
+
+
 # ---- 磁盘详细属性 ----
 
 
-def collect_foreign_config() -> dict:
+def collect_foreign_config(ctrl_id: int = 0) -> dict:
     """检测控制器上是否存在外来阵列配置（Foreign Configuration）。
 
     从其它机器/背板迁移过来的盘带有原机的阵列元数据时，storcli 将其视为
     "外来配置"：盘状态 UGood/UBad、部分场景下 DG 列显示 F。
     返回 {"present": bool, "count": int, "description": str}。
     """
-    data = run_storcli(f"{CONTROLLER} /fall show J", timeout=30)
+    data = run_storcli(f"/c{ctrl_id} /fall show J", timeout=30)
     if not data:
         return {"present": False, "count": 0, "description": "查询失败"}
     try:
@@ -448,8 +542,8 @@ def collect_foreign_config() -> dict:
         return {"present": False, "count": 0, "description": "解析失败"}
 
 
-def collect_disk_attributes() -> list[dict]:
-    data = run_storcli(f"{CONTROLLER}/eall/sall show all J")
+def collect_disk_attributes(ctrl_id: int = 0) -> list[dict]:
+    data = run_storcli(f"/c{ctrl_id}/eall/sall show all J")
     resp = _response_data(data)
     if not resp:
         return []
@@ -487,6 +581,7 @@ def collect_disk_attributes() -> list[dict]:
 
             result.append(
                 {
+                    "ctrl": int(ctrl),
                     "eid": eid,
                     "slot": slot,
                     "did": summary.get("DID", ""),
@@ -510,10 +605,15 @@ def collect_disk_attributes() -> list[dict]:
 SMARTCTL = os.environ.get("SMARTCTL_PATH", "/usr/sbin/smartctl")
 
 
-def _smart_base_device() -> str:
-    """smartctl -d megaraid,N 需要一个透传基设备：优先 /dev/sda，
-    不存在时用 megaraid 字符设备 /dev/bus/0，再退到任意 /dev/sdX。
-    （部分系统 VD 从 /dev/sdb 开始编号，没有 /dev/sda。）"""
+def _smart_base_device(ctrl_id: int | None = None) -> str:
+    """smartctl -d megaraid,N 需要一个透传基设备。
+
+    多控制器时优先使用控制器专属的 /dev/bus/{ctrl}——两个控制器的 DID
+    命名空间互不相通，共用 /dev/sda 会读到错误的那张卡。
+    该节点不存在时退回 /dev/sda，再退到任意 /dev/sdX
+    （部分系统 VD 从 /dev/sdb 开始编号，没有 /dev/sda）。"""
+    if ctrl_id is not None and os.path.exists(f"/dev/bus/{ctrl_id}"):
+        return f"/dev/bus/{ctrl_id}"
     if os.path.exists("/dev/sda"):
         return "/dev/sda"
     if os.path.exists("/dev/bus/0"):
@@ -535,6 +635,7 @@ def collect_smart(disks: list[dict]) -> list[dict]:
         did = d.get("did")
         eid = d.get("eid")
         slot = d.get("slot")
+        disk_ctrl = _to_int(d.get("ctrl"))
         if did in (None, ""):
             continue
         try:
@@ -542,13 +643,17 @@ def collect_smart(disks: list[dict]) -> list[dict]:
         except (ValueError, TypeError):
             continue
         try:
-            cmd = f"sudo {SMARTCTL} -a -d megaraid,{did_int} {_smart_base_device()}"
+            cmd = (
+                f"sudo {SMARTCTL} -a -d megaraid,{did_int} "
+                f"{_smart_base_device(disk_ctrl)}"
+            )
             proc = subprocess.run(
                 cmd, shell=True, capture_output=True, text=True, timeout=20
             )
             output = proc.stdout
 
             smart = {
+                "ctrl": disk_ctrl,
                 "did": did_int,
                 "reallocated": 0,
                 "pending": 0,
@@ -585,7 +690,7 @@ def collect_smart(disks: list[dict]) -> list[dict]:
 
             # smartctl 透传失败（未解析出通电时长）时，回退 storcli 原始 SMART
             if smart["power_on_hours"] == 0 and eid is not None and slot is not None:
-                hex_str = _storcli_smart_hex(int(eid), int(slot))
+                hex_str = _storcli_smart_hex(disk_ctrl, int(eid), int(slot))
                 if hex_str:
                     raws = _parse_smart_hex_raw(hex_str)
                     smart["reallocated"] = max(smart["reallocated"], raws.get(5, 0))
@@ -608,7 +713,7 @@ def collect_smart(disks: list[dict]) -> list[dict]:
                 f"[{datetime.now():%H:%M:%S}] smartctl DID={did} error: {e}",
                 file=sys.stderr,
             )
-            result.append({"did": did_int, "reallocated": -1})
+            result.append({"ctrl": disk_ctrl, "did": did_int, "reallocated": -1})
 
     return result
 
@@ -649,11 +754,11 @@ def _parse_ata_table(output: str, smart: dict):
             smart["smart_temp"] = raw
 
 
-def _storcli_smart_hex(eid: int, slot: int) -> str | None:
+def _storcli_smart_hex(ctrl_id: int, eid: int, slot: int) -> str | None:
     """storcli 读取物理盘原始 SMART hex（smartctl 透传失败时的兜底）。"""
     try:
         proc = subprocess.run(
-            f"sudo {STORCLI} {CONTROLLER}/e{eid}/s{slot} show smart J",
+            f"sudo {STORCLI} /c{ctrl_id}/e{eid}/s{slot} show smart J",
             shell=True,
             capture_output=True,
             text=True,
@@ -845,6 +950,12 @@ def collect_io() -> list[dict]:
                             "sectors_written": int(parts[9]),
                             "ms_write": int(parts[10]),
                             "ios_in_progress": int(parts[11]),
+                            # 第 13/14 列是"IO 忙时长"与"加权 IO 忙时长"。
+                            # 前 12 列只够算 IOPS 和带宽，缺了这两列就算不出
+                            # 利用率与队列深度——而这两个才是判断"磁盘是不是
+                            # 到瓶颈了"的依据。
+                            "ms_io": int(parts[12]),
+                            "weighted_ms_io": int(parts[13]),
                         }
                     )
                 except ValueError:
@@ -908,8 +1019,8 @@ def _parse_props(props_list: list[dict]) -> dict:
     return result
 
 
-def collect_patrol_read() -> dict | None:
-    data = run_storcli(f"{CONTROLLER} show patrolread J")
+def collect_patrol_read(ctrl_id: int = 0) -> dict | None:
+    data = run_storcli(f"/c{ctrl_id} show patrolread J")
     if not is_success(data):
         return None
     try:
@@ -920,6 +1031,7 @@ def collect_patrol_read() -> dict | None:
         )
         p = _parse_props(props)
         return {
+            "ctrl": ctrl_id,
             "pr_mode": p.get("PR Mode", ""),
             "pr_delay": p.get("PR Execution Delay", ""),
             "pr_iterations": _to_int(p.get("PR iterations completed", 0)),
@@ -932,8 +1044,8 @@ def collect_patrol_read() -> dict | None:
     return None
 
 
-def collect_consistency_check() -> dict | None:
-    data = run_storcli(f"{CONTROLLER} show cc J")
+def collect_consistency_check(ctrl_id: int = 0) -> dict | None:
+    data = run_storcli(f"/c{ctrl_id} show cc J")
     if not is_success(data):
         return None
     try:
@@ -944,6 +1056,7 @@ def collect_consistency_check() -> dict | None:
         )
         p = _parse_props(props)
         return {
+            "ctrl": ctrl_id,
             "cc_mode": p.get("CC Operation Mode", ""),
             "cc_delay": p.get("CC Execution Delay", ""),
             "cc_next": p.get("CC Next Starttime", ""),
@@ -1077,6 +1190,7 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
 
     disk_fields = [
         "timestamp",
+        "ctrl",
         "eid",
         "slot",
         "did",
@@ -1101,6 +1215,7 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
     ]
     ctrl_fields = [
         "timestamp",
+        "ctrl",
         "model",
         "fw_version",
         "health",
@@ -1110,14 +1225,18 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
         "bbu_model",
         "bbu_state",
         "bbu_temperature",
+        "bbu_present",
+        "cachevault_flash",
+        "onboard_memory_mb",
         "vd_states",
         "foreign_present",
         "foreign_count",
         "foreign_desc",
     ]
-    vd_fields = ["timestamp", "dg_vd", "type", "state", "size", "name"]
+    vd_fields = ["timestamp", "ctrl", "dg_vd", "type", "state", "size", "name", "cache"]
     patrol_fields = [
         "timestamp",
+        "ctrl",
         "pr_mode",
         "pr_delay",
         "pr_iterations",
@@ -1127,6 +1246,7 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
     ]
     cc_fields = [
         "timestamp",
+        "ctrl",
         "cc_mode",
         "cc_delay",
         "cc_next",
@@ -1136,6 +1256,7 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
     ]
     smart_fields = [
         "timestamp",
+        "ctrl",
         "did",
         "reallocated",
         "pending",
@@ -1147,6 +1268,7 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
     ]
     attr_fields = [
         "timestamp",
+        "ctrl",
         "eid",
         "slot",
         "did",
@@ -1173,6 +1295,8 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
         "sectors_written",
         "ms_write",
         "ios_in_progress",
+        "ms_io",
+        "weighted_ms_io",
     ]
     fs_fields = [
         "timestamp",
@@ -1202,8 +1326,13 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
         "media_errors",
     ]
 
+    # 控制器清单：多卡机器必须逐张采集，只读 /c0 会漏掉整张卡
+    controller_ids = list_controller_ids()
+
     # 磁盘（每分钟追加）
-    disks = collect_disks()
+    disks = []
+    for cid in controller_ids:
+        disks.extend(collect_disks(cid))
     if disks:
         for d in disks:
             d["timestamp"] = timestamp
@@ -1217,22 +1346,44 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
             [{"timestamp": timestamp, "state": "N/A"}],
         )
 
-    # 控制器（每分钟追加）
-    ctrl = collect_controller()
-    if ctrl:
+    # 控制器（每分钟追加，每张卡一行）
+    ctrls = []
+    for cid in controller_ids:
+        ctrl = collect_controller(cid)
+        if not ctrl:
+            ctrl = {"ctrl": cid, "model": "", "fw_version": "", "health": "N/A"}
         ctrl["timestamp"] = timestamp
-    else:
-        ctrl = {"timestamp": timestamp, "health": "N/A"}
-    # 外来阵列配置状态（供 Web 显示 F 标记与"载入外部配置"入口）
-    fc = collect_foreign_config()
-    ctrl["foreign_present"] = 1 if fc.get("present") else 0
-    ctrl["foreign_count"] = fc.get("count", 0)
-    ctrl["foreign_desc"] = fc.get("description", "")
-    write_csv(date_dir, "controller.csv", ctrl_fields, [ctrl])
-    db.insert_rows("controller", [ctrl])
+        # 外来阵列配置状态（供 Web 显示 F 标记与"载入外部配置"入口）
+        fc = collect_foreign_config(cid)
+        ctrl["foreign_present"] = 1 if fc.get("present") else 0
+        ctrl["foreign_count"] = fc.get("count", 0)
+        ctrl["foreign_desc"] = fc.get("description", "")
+        ctrls.append(ctrl)
+    write_csv(date_dir, "controller.csv", ctrl_fields, ctrls)
+    db.insert_rows("controller", ctrls)
 
     # 故障邮件报警（基于本次采集结果）
-    lsi_alert.check_and_alert(disks, ctrl)
+    lsi_alert.check_and_alert(disks, ctrls)
+    # 跨控制器一致性（固件/型号）：不属于任何一块盘，必须由采集侧主动检查
+    lsi_alert.check_consistency(ctrls)
+
+    # 控制器配置快照：配置不会自己变，变了就是有人动过手或换了卡。
+    # 首次只建基线，之后有差异才留档并告警。
+    if not quick:
+        for cid in controller_ids:
+            try:
+                raw = collect_controller_raw(cid)
+                if not raw:
+                    continue
+                cfg = config_mgr.normalize(raw)
+                change = config_mgr.observe(cid, cfg)
+                if change and change.get("changes"):
+                    lsi_alert.check_config_drift(cid, change)
+            except Exception as e:
+                print(
+                    f"[{datetime.now():%H:%M:%S}] config snapshot error (C{cid}): {e}",
+                    file=sys.stderr,
+                )
 
     # 系统信息（每分钟追加）
     sys_info = collect_system_info()
@@ -1265,7 +1416,9 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
         db.insert_rows("nvme", nvme_rows)
 
     # VD（每轮追加最新快照，确保创建/删除阵列后页面即时刷新；状态变化告警每分钟检测）
-    vds = collect_vds()
+    vds = []
+    for cid in controller_ids:
+        vds.extend(collect_vds(cid))
     if vds:
         for v in vds:
             v["timestamp"] = timestamp
@@ -1275,9 +1428,37 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
     # 磁盘状态变化 / VD 变化邮件告警（基于本次采集结果）
     lsi_alert.check_state_changes(disks, vds)
 
+    # 缓存保护评估：写缓存开着但缓存单元失效会丢数据，这是存储里最安静的
+    # 一类风险——阵列状态全是 Optimal，出问题时才知道。
+    if not quick:
+        try:
+            assessments = []
+            for c in ctrls:
+                cid = c.get("ctrl")
+                assessments.append(
+                    battery_mgr.evaluate(
+                        c,
+                        [
+                            {
+                                "ctrl": v.get("ctrl"),
+                                "dg_vd": v.get("dg_vd"),
+                                "state": v.get("state"),
+                                "write_cache_raw": v.get("cache"),
+                            }
+                            for v in vds
+                            if v.get("ctrl") == cid
+                        ],
+                    )
+                )
+            battery_mgr.check_alerts(assessments)
+        except Exception as e:
+            print(f"[{datetime.now():%H:%M:%S}] cache protection check error: {e}", file=sys.stderr)
+
     # 磁盘属性（当天首次采集）
     if not (date_dir / "attributes.csv").exists():
-        attrs = collect_disk_attributes()
+        attrs = []
+        for cid in controller_ids:
+            attrs.extend(collect_disk_attributes(cid))
         if attrs:
             for a in attrs:
                 a["timestamp"] = timestamp
@@ -1298,18 +1479,26 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
             # SMART 关键属性 (5/187/188/197/198) 数值变化邮件告警
             lsi_alert.check_smart_attr_changes(smart_data)
 
-    # 巡读 / CC（每次覆盖写入）
-    pr = collect_patrol_read()
-    if pr:
-        pr["timestamp"] = timestamp
-        write_csv_once(date_dir, "patrol.csv", patrol_fields, [pr])
-        db.insert_rows("patrol", [pr])
+    # 巡读 / CC（每次覆盖写入，每张卡一行）
+    pr_rows = []
+    for cid in controller_ids:
+        pr = collect_patrol_read(cid)
+        if pr:
+            pr["timestamp"] = timestamp
+            pr_rows.append(pr)
+    if pr_rows:
+        write_csv_once(date_dir, "patrol.csv", patrol_fields, pr_rows)
+        db.insert_rows("patrol", pr_rows)
 
-    cc = collect_consistency_check()
-    if cc:
-        cc["timestamp"] = timestamp
-        write_csv_once(date_dir, "consistency.csv", cc_fields, [cc])
-        db.insert_rows("consistency", [cc])
+    cc_rows = []
+    for cid in controller_ids:
+        cc = collect_consistency_check(cid)
+        if cc:
+            cc["timestamp"] = timestamp
+            cc_rows.append(cc)
+    if cc_rows:
+        write_csv_once(date_dir, "consistency.csv", cc_fields, cc_rows)
+        db.insert_rows("consistency", cc_rows)
 
 
 if __name__ == "__main__":

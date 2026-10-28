@@ -21,6 +21,8 @@ from datetime import datetime
 from pathlib import Path
 from urllib import request as urlrequest
 
+import alert_center
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_DIR = Path(os.environ.get("LSI_DATA_DIR", str(PROJECT_ROOT / "data")))
 
@@ -34,6 +36,8 @@ DEFAULT_CONFIG = {
     "webhook_url": "",
     "temp_warn": 45,
     "temp_crit": 55,
+    # 告警持续未恢复时每隔多少分钟再提醒一次；0 = 不重复提醒
+    "escalate_minutes": 0,
     "policies": {},
 }
 
@@ -48,6 +52,8 @@ DEFAULT_POLICIES = {
     "disk_state_change": True,  # 磁盘状态变化
     "vd_state_change": True,    # 虚拟磁盘状态变化
     "smart_attr_growth": True,  # SMART 关键属性增长
+    "ctrl_consistency": True,   # 跨控制器固件/型号不一致
+    "config_drift": True,       # 控制器配置发生变更
 }
 
 # 环境变量 -> 配置字段
@@ -57,6 +63,7 @@ ENV_OVERRIDES = {
     "webhook_url": "WEBHOOK_URL",
     "temp_warn": "ALERT_TEMP_WARN",
     "temp_crit": "ALERT_TEMP_CRIT",
+    "escalate_minutes": "ALERT_ESCALATE_MINUTES",
 }
 
 
@@ -250,6 +257,39 @@ def _alert(subject: str, body: str, level: str = "error"):
             log_event("warning", f"报警 Webhook 发送失败: {err}")
 
 
+def _flag(
+    key: str,
+    subject: str,
+    body: str,
+    level: str = "error",
+    escalate_minutes: int = 0,
+):
+    """登记告警并按需通知。是否通知由告警中心判定（新告警 / 升级 / 静默）。"""
+    alert, should_notify, silence = alert_center.raise_alert(
+        key, level, subject, body, escalate_minutes=escalate_minutes
+    )
+    if should_notify:
+        _alert(subject, body, level)
+        alert_center.mark_notified(key)
+    elif silence:
+        # 静默窗口内照常记录，但不打扰人——"静默"不等于"假装没发生"
+        log_event("info", f"[维护窗口静默] {subject}")
+    return alert
+
+
+def _clear(key: str):
+    """条件消失：置为已恢复并发出恢复通知。"""
+    prev = alert_center.resolve_alert(key)
+    if prev:
+        title = prev.get("title") or key
+        _alert(
+            f"已恢复: {title}",
+            f"「{title}」于 {prev.get('first_seen', '')} 触发，现已恢复正常。",
+            "info",
+        )
+    return prev
+
+
 # ---- 状态快照（去重：只在状态变化时报警）----
 
 
@@ -274,7 +314,25 @@ def _save_state(state: dict):
 # ---- 采集器调用的检查入口 ----
 
 
-def check_and_alert(disks: list[dict], ctrl: dict | None):
+def _disk_key(d: dict) -> str:
+    """磁盘唯一键。
+
+    跨控制器必须带控制器编号：/c0/e252/s0 与 /c1/e252/s0 的槽位号会撞车，
+    只用 E:S 做键会让状态变化告警张冠李戴。
+    """
+    ctrl = d.get("ctrl", "")
+    prefix = f"C{ctrl}:" if ctrl not in ("", None) else ""
+    return f"{prefix}E{d.get('eid')}:S{d.get('slot')}"
+
+
+def _as_ctrl_list(ctrls) -> list[dict]:
+    """兼容单控制器（dict）与多控制器（list）两种入参。"""
+    if isinstance(ctrls, dict):
+        return [ctrls] if ctrls else []
+    return [c for c in (ctrls or []) if c]
+
+
+def check_and_alert(disks: list[dict], ctrls):
     """每分钟调用：温度阈值 / SMART 告警 / 预测性故障 / 控制器与 BBU 健康"""
     cfg = load_config()
     temp_warn = int(cfg.get("temp_warn", 45))
@@ -282,54 +340,63 @@ def check_and_alert(disks: list[dict], ctrl: dict | None):
     state = _load_state()
     flagged = state.setdefault("flagged", {})
 
+    escalate_minutes = int(cfg.get("escalate_minutes", 0) or 0)
+
     def flag_once(key: str, subject: str, body: str, level: str = "error"):
-        if not flagged.get(key):
-            flagged[key] = True
-            _alert(subject, body, level)
+        """登记告警；是否需要通知由告警中心判定（新告警 / 升级 / 静默）。"""
+        flagged[key] = True
+        _flag(key, subject, body, level, escalate_minutes)
 
     def unflag(key: str):
+        """条件消失：把告警置为已恢复，并发出恢复通知。"""
         flagged.pop(key, None)
+        _clear(key)
 
     for d in disks or []:
-        label = f"E{d.get('eid')}:S{d.get('slot')}"
+        label = _disk_key(d)
         temp = d.get("temperature")
+        # 告警 key 用层级结构：前缀即作用域，维护窗口可按盘 / 按卡前缀静默
+        k_temp_crit = f"disk:{label}:temp_crit"
+        k_temp_warn = f"disk:{label}:temp_warn"
+        k_smart = f"disk:{label}:smart"
+        k_pf = f"disk:{label}:pf"
         # 策略关闭时清除残留标记，重新启用后可按当前状态重新报警
         if not policy_enabled(cfg, "temp_crit"):
-            unflag(f"temp_crit_{label}")
+            unflag(k_temp_crit)
         if not policy_enabled(cfg, "temp_warn"):
-            unflag(f"temp_warn_{label}")
+            unflag(k_temp_warn)
         if isinstance(temp, int):
             if temp >= temp_crit and policy_enabled(cfg, "temp_crit"):
                 flag_once(
-                    f"temp_crit_{label}",
+                    k_temp_crit,
                     f"磁盘 {label} 温度临界 {temp}°C",
                     f"磁盘 {label} ({d.get('model', '')}) 温度 {temp}°C，超过临界阈值 {temp_crit}°C。",
                 )
             elif temp >= temp_warn and policy_enabled(cfg, "temp_warn"):
                 flag_once(
-                    f"temp_warn_{label}",
+                    k_temp_warn,
                     f"磁盘 {label} 温度偏高 {temp}°C",
                     f"磁盘 {label} ({d.get('model', '')}) 温度 {temp}°C，超过警告阈值 {temp_warn}°C。",
                     "warning",
                 )
-                unflag(f"temp_crit_{label}")
+                unflag(k_temp_crit)
             else:
-                unflag(f"temp_warn_{label}")
-                unflag(f"temp_crit_{label}")
+                unflag(k_temp_warn)
+                unflag(k_temp_crit)
 
         if not policy_enabled(cfg, "smart_alert"):
-            unflag(f"smart_{label}")
+            unflag(k_smart)
         elif str(d.get("smart_alert", "")).strip() == "Yes":
             flag_once(
-                f"smart_{label}",
+                k_smart,
                 f"磁盘 {label} SMART 告警",
                 f"磁盘 {label} ({d.get('model', '')}) SMART alert flagged by drive。",
             )
         else:
-            unflag(f"smart_{label}")
+            unflag(k_smart)
 
         if not policy_enabled(cfg, "predictive_failure"):
-            unflag(f"pf_{label}")
+            unflag(k_pf)
         else:
             try:
                 pf = int(d.get("predictive_failure") or 0)
@@ -337,39 +404,160 @@ def check_and_alert(disks: list[dict], ctrl: dict | None):
                 pf = 0
             if pf > 0:
                 flag_once(
-                    f"pf_{label}",
+                    k_pf,
                     f"磁盘 {label} 预测性故障计数 {pf}",
                     f"磁盘 {label} ({d.get('model', '')}) Predictive Failure Count = {pf}。",
                 )
             else:
-                unflag(f"pf_{label}")
+                unflag(k_pf)
 
-    if ctrl:
+    # 控制器健康 / BBU：每张卡独立判定与独立标记，多卡机器上
+    # 一张卡正常不能掩盖另一张卡的异常。
+    for ctrl in _as_ctrl_list(ctrls):
+        cid = ctrl.get("ctrl", "")
+        cid_key = cid if cid not in ("", None) else 0
+        tag = f"C{cid}" if cid not in ("", None) else "控制器"
+        k_health = f"controller:{cid_key}:health"
+        k_bbu = f"controller:{cid_key}:bbu"
+
         health = str(ctrl.get("health", "")).strip()
         if not policy_enabled(cfg, "ctrl_health"):
-            unflag("ctrl_health")
-        elif health and health not in ("Optimal", "N/A"):
+            unflag(k_health)
+        elif health and health not in ("Optimal", "Opt", "N/A"):
             flag_once(
-                "ctrl_health",
-                f"控制器健康异常: {health}",
-                f"控制器 {ctrl.get('model', '')} 健康状态为 {health}。",
+                k_health,
+                f"{tag} 健康异常: {health}",
+                f"{tag} {ctrl.get('model', '')} 健康状态为 {health}。",
             )
         else:
-            unflag("ctrl_health")
+            unflag(k_health)
 
         bbu = str(ctrl.get("bbu_state", "")).strip()
         if not policy_enabled(cfg, "bbu_state"):
-            unflag("bbu_state")
+            unflag(k_bbu)
         elif bbu and bbu not in ("Optimal", "Opt", "OK"):
             flag_once(
-                "bbu_state",
-                f"BBU/缓存单元异常: {bbu}",
-                f"BBU {ctrl.get('bbu_model', '')} 状态为 {bbu}。",
+                k_bbu,
+                f"{tag} BBU/缓存单元异常: {bbu}",
+                f"{tag} BBU {ctrl.get('bbu_model', '')} 状态为 {bbu}。",
             )
         else:
-            unflag("bbu_state")
+            unflag(k_bbu)
 
     _save_state(state)
+
+
+def check_consistency(ctrls) -> list[dict]:
+    """跨控制器一致性检查：固件版本、型号是否统一。
+
+    多卡机器上固件不一致会显著增加故障排查与厂商支持的成本，但这个问题
+    不属于任何一块盘——只放在页面上展示的话，不打开页面就永远不会知道。
+    所以由采集侧主动检查并纳入告警闭环。
+    """
+    cfg = load_config()
+    lists = _as_ctrl_list(ctrls)
+    if len(lists) < 2:
+        # 控制器数量降到 1 张（例如换卡后只剩一张）时，之前基于多卡判定出的
+        # 一致性问题已经不存在，必须清掉——否则那条"固件版本不一致"会永久
+        # 挂在页面上，而它描述的两张卡早已不在同一台机器里。
+        for key in ("system:consistency:fw_mismatch", "system:consistency:model_mixed"):
+            _clear(key)
+        return []
+
+    def _values(*fields: str) -> dict:
+        """按候选字段名取值。采集器输出的是 fw_version，而 build_status
+        对外暴露的是 fw——两处字段名不同，只认一个会静默取不到值。"""
+        out = {}
+        for c in lists:
+            v = ""
+            for f in fields:
+                v = str(c.get(f) or "").strip()
+                if v:
+                    break
+            if v:
+                cid = c.get("ctrl", "")
+                out[cid if cid not in ("", None) else 0] = v
+        return out
+
+    issues = []
+    fws = _values("fw", "fw_version")
+    if len(set(fws.values())) > 1:
+        detail = "、".join(f"C{k} = {v}" for k, v in sorted(fws.items(), key=lambda x: str(x[0])))
+        issues.append(
+            {
+                "key": "system:consistency:fw_mismatch",
+                "level": "warning",
+                "title": "控制器固件版本不一致",
+                "detail": detail,
+                "hint": "固件不一致会让故障排查与厂商支持变复杂，建议统一到同一版本。",
+            }
+        )
+
+    models = _values("model")
+    if len(set(models.values())) > 1:
+        detail = "、".join(f"C{k} = {v}" for k, v in sorted(models.items(), key=lambda x: str(x[0])))
+        issues.append(
+            {
+                "key": "system:consistency:model_mixed",
+                "level": "info",
+                "title": "控制器型号不一致",
+                "detail": detail,
+                "hint": "混合型号在扩容与故障替换时需要额外确认兼容性。",
+            }
+        )
+
+    seen = set()
+    escalate = int(cfg.get("escalate_minutes", 0) or 0)
+    if policy_enabled(cfg, "ctrl_consistency"):
+        for it in issues:
+            _flag(
+                it["key"],
+                it["title"],
+                f"{it['detail']}。{it['hint']}",
+                it["level"],
+                escalate,
+            )
+            seen.add(it["key"])
+
+    # 问题消失（或策略被关闭）时清掉残留告警，否则会永远挂在那里
+    for key in ("system:consistency:fw_mismatch", "system:consistency:model_mixed"):
+        if key not in seen:
+            _clear(key)
+
+    return issues
+
+
+def check_config_drift(ctrl_id: int, change: dict) -> None:
+    """控制器配置发生变更时告警。
+
+    这是这套系统里最"值钱"的一类告警：阵列配置不会自己变，变了要么是
+    计划内的变更（需要留档），要么是意外或换卡（需要立刻处理）。
+    两种情况都需要人马上看到，而不是等下一次出故障时才发现。
+    """
+    cfg = load_config()
+    if not policy_enabled(cfg, "config_drift"):
+        _clear(f"controller:{ctrl_id}:config_drift")
+        return
+
+    changes = change.get("changes") or []
+    if not changes:
+        return
+    high = [c for c in changes if c.get("impact") == "high"]
+    lines = [
+        f"{c.get('label')}: {c.get('from')} → {c.get('to')}" for c in changes[:12]
+    ]
+    detail = "；".join(lines)
+    if len(changes) > 12:
+        detail += f"（另有 {len(changes) - 12} 项）"
+    level = "error" if high else "warning"
+    _flag(
+        f"controller:{ctrl_id}:config_drift",
+        f"C{ctrl_id} 控制器配置发生变更（{len(changes)} 项）",
+        f"{detail}。上次快照 {change.get('prev_ts', '')}。"
+        f"若为计划内变更请记录；若非预期，请立即核查。",
+        level,
+        int(cfg.get("escalate_minutes", 0) or 0),
+    )
 
 
 def check_state_changes(disks: list[dict], vds: list[dict]):
@@ -383,7 +571,7 @@ def check_state_changes(disks: list[dict], vds: list[dict]):
 
     cur_disks = {}
     for d in disks or []:
-        label = f"E{d.get('eid')}:S{d.get('slot')}"
+        label = _disk_key(d)
         st = str(d.get("state", "")).strip()
         if st and st != "N/A":
             cur_disks[label] = st
@@ -399,6 +587,9 @@ def check_state_changes(disks: list[dict], vds: list[dict]):
     cur_vds = {}
     for v in vds or []:
         key = str(v.get("dg_vd", ""))
+        cid = v.get("ctrl", "")
+        if cid not in ("", None):
+            key = f"C{cid}:{key}"
         st = str(v.get("state", "")).strip()
         if key and st:
             cur_vds[key] = st
@@ -433,18 +624,22 @@ def check_smart_attr_changes(smart_data: list[dict]):
         did = str(s.get("did", ""))
         if not did:
             continue
-        cur[did] = {k: int(s.get(k) or 0) for k in watch}
-        old = prev.get(did)
+        # 带控制器编号做键：不同控制器的 DID 命名空间互不相通，
+        # 只用 DID 有可能把两张卡的盘混成同一块。
+        cid = s.get("ctrl", "")
+        key = f"C{cid}:D{did}" if cid not in ("", None) else f"D{did}"
+        cur[key] = {k: int(s.get(k) or 0) for k in watch}
+        old = prev.get(key)
         if old:
-            grown = [k for k in watch if cur[did][k] > int(old.get(k) or 0)]
+            grown = [k for k in watch if cur[key][k] > int(old.get(k) or 0)]
             # 策略关闭时仍更新快照，避免重新启用后补报历史增长
             if grown and growth_policy:
                 detail = ", ".join(
-                    f"{k}: {old.get(k, 0)} → {cur[did][k]}" for k in grown
+                    f"{k}: {old.get(k, 0)} → {cur[key][k]}" for k in grown
                 )
                 _alert(
-                    f"磁盘 DID={did} SMART 关键属性增长",
-                    f"磁盘 DID={did} SMART 属性变化：{detail}。",
+                    f"磁盘 {key} SMART 关键属性增长",
+                    f"磁盘 {key} SMART 属性变化：{detail}。",
                 )
     state["smart_attrs"] = cur
     _save_state(state)
