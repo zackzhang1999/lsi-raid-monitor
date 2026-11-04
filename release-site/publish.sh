@@ -18,10 +18,10 @@ if [[ -n "$SSH_KEY" ]]; then
   SSH_ARGS+=(-i "$SSH_KEY")
 fi
 
-rsync -rlptz --no-owner --no-group --chmod=D755,F644 \
+rsync -rlptz --no-owner --no-group --exclude='._*' --chmod=D755,F644 \
   -e "ssh ${SSH_ARGS[*]}" \
   "$SITE_DIR/site/" "$TARGET/site/"
-rsync -rlptz --no-owner --no-group --chmod=F644 \
+rsync -rlptz --no-owner --no-group --exclude='._*' --chmod=F644 \
   -e "ssh ${SSH_ARGS[*]}" \
   "$SITE_DIR/server.py" "$SITE_DIR/releases.json" \
   "$SITE_DIR"/datamax-lsi-*.tar.gz \
