@@ -14,14 +14,16 @@ ignored by Git. `releases.json` is updated with its SHA-256 and byte size.
 
 ## Publish
 
-The target directory is `/opt/lsi-full` on the hub server. The static service
-listens on TCP 9004.
+The default target is the write-only `/opt/lsi-full` publishing account on
+`hub.amax.xyz`. The static service listens on TCP 9004.
 
 ```bash
-DATAMAX_RELEASE_TARGET=root@hub.amax.xyz:/opt/lsi-full \
-DATAMAX_RELEASE_SSH_KEY=/root/.ssh/datamax-release_ed25519 \
 bash publish.sh
 ```
+
+`DATAMAX_RELEASE_TARGET` and `DATAMAX_RELEASE_SSH_KEY` may be overridden for
+another host. The publishing key is restricted by `rrsync -wo` to the release
+directory and cannot install system packages or start application services.
 
 The public package intentionally does not contain Broadcom `storcli64`.
 Provide a licensed copy through `install.sh --storcli-source`.
