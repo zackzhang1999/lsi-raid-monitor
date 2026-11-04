@@ -1,0 +1,26 @@
+[Unit]
+Description=DataMax-LSI 存储管理系统
+Documentation=file:///opt/lsi-raid-monitor/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/lsi-raid-monitor
+EnvironmentFile=-/etc/datamax-lsi.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/lsi-raid-monitor/run.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+LimitNOFILE=65536
+TasksMax=512
+UMask=0077
+SyslogIdentifier=datamax-lsi
+
+# 服务需要 root 访问 /dev、/sys、挂载、PAM 和 storcli。
+# 不要添加 NoNewPrivileges/ProtectSystem/ProtectDevices，否则阵列控制会失效。
+
+[Install]
+WantedBy=multi-user.target

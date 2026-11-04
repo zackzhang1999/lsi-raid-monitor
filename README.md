@@ -122,9 +122,9 @@
 | `lsi_alert.py` | 报警引擎：策略开关、状态去重、sendmail 发信、事件日志 |
 | `user_mgr.py` | 用户体系：PBKDF2 口令哈希、admin/viewer 角色 |
 | `storage_mgr.py` | 存储管理：lsblk 枚举、mount/umount/mkfs、NFS exports 管理 |
-| `install.sh` | 一键安装：拷贝到 `/opt`、装依赖、注册 systemd 服务 |
-| `run.sh` | 生产模式启动脚本（waitress，缺依赖时回退 Flask 内置服务器） |
-| `deploy/lsi-raid-web.service` | systemd 单元示例 |
+| `install.sh` | 一键安装：依赖、虚拟环境、数据保留、服务注册、健康检查与失败回滚 |
+| `run.sh` | 生产模式启动脚本（优先使用项目内 `.venv` 和 waitress） |
+| `deploy/datamax-lsi.service` | systemd 单元示例；正式安装由脚本按路径和端口生成 |
 | `web/` | 前端静态资源（templates + css/js/vendor） |
 
 ## 3. 功能总览
@@ -193,24 +193,27 @@
 
 | 项目 | 要求 |
 | --- | --- |
-| 操作系统 | Linux（需 systemd 用于一键安装；手动部署无硬性要求） |
-| Python | ≥ 3.9 |
-| Python 包 | `flask>=3.0`、`waitress>=3.0` |
-| 必备工具 | `storcli64`（Broadcom StorCLI）—— 监控本体依赖 |
+| 操作系统 | Debian/Ubuntu、RHEL/CentOS/Rocky/AlmaLinux、openSUSE（一键安装需要 systemd） |
+| Python | ≥ 3.9；安装器会在系统缺少时自动安装 |
+| Python 包 | `flask>=3.0,<4.0`、`waitress>=3.0,<4.0`，安装到项目独立 `.venv` |
+| 必备工具 | `storcli64`（Broadcom StorCLI）—— 需从 Broadcom 合法获取，项目不重新分发 |
 | 强烈建议 | `smartmontools`（smartctl）—— 缺失则 SMART 数据为空 |
 | 邮件报警 | `sendmail`（本地 MTA，如 postfix/postfix-sendmail） |
 | NVMe 功能 | `nvme-cli`（nvme list） |
 | 存储管理 | `lsblk`、`parted`、`mkfs.ext4`/`mkfs.xfs`、`blkid`（按需） |
 
-安装 storcli64（示例来源）：
+安装 StorCLI。可预装到系统：
 
 ```bash
-wget http://amax.xyz:10001/share/select?code=WQZ8R -O "storcli64"
-chmod +x storcli64
-cp storcli64 /usr/local/bin/
+sudo install -m 755 /path/to/storcli64 /usr/local/bin/storcli64
 ```
 
-> storcli 也可直接放在项目根目录下，采集器优先使用项目内的副本（或通过 `STORCLI_PATH` 指定任意路径）。
+也可把 `storcli64` 放在安装包根目录或 `tools/` 下。安装器会自动接管并写入
+`/etc/datamax-lsi.env`，也支持显式指定：
+
+```bash
+sudo bash install.sh --storcli-source /path/to/storcli64
+```
 
 ## 5. 安装部署
 
@@ -221,23 +224,39 @@ sudo bash install.sh
 ```
 
 脚本行为：
-1. 前置检查：root 权限、Python≥3.9、systemd、storcli64/smartctl/sudo 是否就绪（缺失仅告警不阻断）、端口占用检查；
-2. 把项目拷贝到 `/opt/lsi-raid-monitor`（排除 `.git/data/charts/dist/__pycache__/storcli.log*` 等；目标目录已有 `data/` 时保留，即**重复执行即为无损升级**）;
-3. 安装 Python 依赖（新发行版 PEP 668 环境自动加 `--break-system-packages` 重试）;
-4. 生成并注册 systemd 服务 `lsi-raid-web`，开机自启、崩溃 5 秒后自动拉起;
-5. 打印访问地址与服务管理命令。
+1. 检查 root、systemd、端口、磁盘工具和 StorCLI；
+2. 自动补齐 Python、smartmontools、PAM 等基础依赖，不升级系统现有软件包；
+3. 在 `/opt/lsi-raid-monitor/.venv` 创建隔离 Python 环境，不污染系统 Python；
+4. 构建新版本快照，保留已有 `data/`、PAM 角色映射和其他环境配置；
+5. 注册 `datamax-lsi.service`，设置开机自启和异常自动拉起；
+6. 启动后请求首页做真实健康检查；升级失败会恢复上一版程序和 systemd 单元。
 
 安装完成后验证：
 
 ```bash
-systemctl status lsi-raid-web      # 服务状态
-journalctl -u lsi-raid-web -f      # 实时日志
+systemctl status datamax-lsi
+journalctl -u datamax-lsi -f
+curl -I http://127.0.0.1:5200/
 ```
+
+常用安装参数：
+
+```bash
+sudo bash install.sh --port 8080
+sudo bash install.sh --install-dir /srv/datamax-lsi --data-dir /var/lib/datamax-lsi
+sudo bash install.sh --install-extras  # 追加 fio、bcache、NVMe、IPMI、XFS 等工具
+sudo bash install.sh --check        # 只检查环境，不修改系统
+sudo bash install.sh --help
+```
+
+离线环境可先准备系统包与 Python wheel，再通过
+`--no-system-deps --skip-pip` 安装预置镜像。
 
 ### 5.2 手动部署
 
 ```bash
-pip3 install -r requirements.txt
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 ```
 
 方式 A —— 使用内置采集线程（推荐，无需 cron）：
@@ -249,8 +268,10 @@ pip3 install -r requirements.txt
 方式 B —— 注册 systemd 服务：
 
 ```bash
-sudo cp deploy/lsi-raid-web.service /etc/systemd/system/
-sudo systemctl enable --now lsi-raid-web
+sudo cp deploy/datamax-lsi.service /etc/systemd/system/
+sudo cp deploy/datamax-lsi.env.example /etc/datamax-lsi.env
+sudo chmod 600 /etc/datamax-lsi.env
+sudo systemctl enable --now datamax-lsi
 ```
 
 方式 C —— 开发调试：
@@ -596,16 +617,16 @@ data/
 
 ```bash
 # 服务管理
-sudo systemctl restart lsi-raid-web
-sudo systemctl stop lsi-raid-web
+sudo systemctl restart datamax-lsi
+sudo systemctl stop datamax-lsi
 
 # 升级：拉取新代码后在源目录重复执行即可（data/ 不动）
 sudo bash install.sh
 
 # 修改端口：安装脚本读取 LSI_WEB_PORT
 LSI_WEB_PORT=8080 sudo -E bash install.sh
-# 已装好的可直接编辑 /etc/systemd/system/lsi-raid-web.service 后
-sudo systemctl daemon-reload && sudo systemctl restart lsi-raid-web
+# 已装好的可直接编辑 /etc/datamax-lsi.env 后
+sudo systemctl daemon-reload && sudo systemctl restart datamax-lsi
 
 # 备份：只需打包数据目录（含配置、事件、用户、密钥）
 tar czf lsi-backup.tgz /opt/lsi-raid-monitor/data
@@ -622,7 +643,7 @@ cd /opt/lsi-raid-monitor && python3 lsi_collectd.py --force
 ## 16. 故障排查 FAQ
 
 **Q1 页面一直显示“加载中…”或接口 500**
-`journalctl -u lsi-raid-web -n 100` 看报错。最常见原因是 storcli 不在预期路径：`which storcli64` 核对，必要时设 `STORCLI_PATH`。
+`journalctl -u datamax-lsi -n 100` 看报错。最常见原因是 storcli 不在预期路径：`which storcli64` 核对，必要时修改 `/etc/datamax-lsi.env` 中的 `STORCLI_PATH`。
 
 **Q2 温度/错误计数全空，日志里有 `storcli error`**
 多为 sudo 权限问题。以服务运行的用户执行 `sudo /usr/local/bin/storcli64 /c0 show` 验证，按 §5.3 配置免密。

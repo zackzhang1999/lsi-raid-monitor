@@ -8,3 +8,6 @@ __pycache__/
 *.pyc
 .env
 dist/
+release-site/*.tar.gz
+release-site/*.tar.gz.sha256
+.deploy-backups/

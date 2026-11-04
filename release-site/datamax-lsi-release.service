@@ -1,0 +1,24 @@
+[Unit]
+Description=DataMax-LSI Release Page (port 9004)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/lsi-full
+Environment=DATAMAX_RELEASE_ROOT=/opt/lsi-full
+Environment=DATAMAX_RELEASE_STATIC=/opt/lsi-full/site
+Environment=DATAMAX_RELEASE_PORT=9004
+ExecStart=/usr/bin/python3 /opt/lsi-full/server.py
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/lsi-full
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

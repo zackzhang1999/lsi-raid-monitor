@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
-# LSI RAID 监控一键启动脚本（生产模式，使用 waitress）
-set -euo pipefail
-cd "$(dirname "$0")"
+# DataMax-LSI 前台启动脚本（waitress）
+set -Eeuo pipefail
+cd -- "$(dirname -- "$0")"
 
 export LSI_DATA_DIR="${LSI_DATA_DIR:-$PWD/data}"
 export LSI_WEB_HOST="${LSI_WEB_HOST:-0.0.0.0}"
 export LSI_WEB_PORT="${LSI_WEB_PORT:-5200}"
 
-if python3 -c "import waitress" 2>/dev/null; then
-    exec python3 -m waitress --host="$LSI_WEB_HOST" --port="$LSI_WEB_PORT" web_server:app
+if [[ -x "$PWD/.venv/bin/python" ]]; then
+    PYTHON="$PWD/.venv/bin/python"
+elif python3 -c "import flask, waitress" 2>/dev/null; then
+    PYTHON="$(command -v python3)"
 else
-    echo "waitress 未安装，回退到 Flask 内置服务器（建议 pip3 install -r requirements.txt）" >&2
-    exec python3 web_server.py
+    echo "Python 依赖不完整。请运行 sudo bash install.sh 或 pip3 install -r requirements.txt" >&2
+    exit 1
 fi
+
+exec "$PYTHON" -m waitress \
+    --host="$LSI_WEB_HOST" \
+    --port="$LSI_WEB_PORT" \
+    --threads="${WAITRESS_THREADS:-8}" \
+    web_server:app

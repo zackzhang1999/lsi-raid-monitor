@@ -1,2 +1,2 @@
-flask>=3.0
-waitress>=3.0
+flask>=3.0,<4.0
+waitress>=3.0,<4.0

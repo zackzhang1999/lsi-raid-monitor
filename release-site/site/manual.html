@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="DataMax-LSI 完整使用手册：安装、PAM 登录、阵列监控、文件管理、bcache、备份、性能测试、告警、报表与多机管理。">
+  <meta name="theme-color" content="#0b1310">
+  <title>DataMax-LSI 使用手册</title>
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body class="manual-page">
+  <a class="skip-link" href="#manual-content">跳到手册正文</a>
+  <header class="manual-header">
+    <a class="brand" href="/">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="5" rx="1.5"/><rect x="3" y="11" width="18" height="5" rx="1.5"/><rect x="3" y="18" width="18" height="2.8" rx="1.4"/></svg>
+      </span>
+      <span><strong>DataMax-LSI</strong><small>完整使用手册</small></span>
+    </a>
+    <div class="manual-actions">
+      <a class="button button-quiet" href="/">返回发布页</a>
+      <a class="button button-primary" href="/#download" data-download>下载安装包</a>
+    </div>
+  </header>
+
+  <div class="manual-shell">
+    <aside class="manual-toc">
+      <input class="manual-search" type="search" placeholder="搜索手册内容" aria-label="搜索手册内容">
+      <p>目录 · VERSION <span data-latest-version>1.10.27</span></p>
+      <nav aria-label="手册目录">
+        <a href="#before-install">安装前准备</a>
+        <a href="#install">安装与启动</a>
+        <a href="#login">首次登录与权限</a>
+        <a href="#workspace">界面与状态阅读</a>
+        <a href="#overview">监控概览</a>
+        <a href="#raid">磁盘与阵列运维</a>
+        <a href="#storage">文件、缓存与共享</a>
+        <a href="#backup">数据备份与恢复</a>
+        <a href="#performance">性能测试与诊断</a>
+        <a href="#operations">运维中心</a>
+        <a href="#alerts-reports">告警与报表</a>
+        <a href="#hosts">多机与接口</a>
+        <a href="#security">安全与日常维护</a>
+        <a href="#troubleshooting">故障排查</a>
+      </nav>
+    </aside>
+
+    <article class="manual-article" id="manual-content">
+      <p class="manual-kicker">DATAMAX-LSI · OPERATIONS MANUAL</p>
+      <h1>从第一次登录，到一次安全的磁盘更换。</h1>
+      <p class="manual-lead">
+        本手册面向首次接触 DataMax-LSI 的运维人员和售后工程师。按页面顺序操作即可完成部署、
+        日常巡检、故障判断、危险操作与数据恢复。涉及磁盘、阵列、格式化和缓存销毁的章节请先读完整步骤。
+      </p>
+      <div class="manual-meta">
+        <span>适用版本 <b data-latest-version>1.10.27</b></span>
+        <span>Linux · systemd</span>
+        <span>建议阅读 20 分钟</span>
+      </div>
+
+      <section id="before-install">
+        <h2>安装前准备</h2>
+        <p>DataMax-LSI 运行在连接 RAID 卡的存储服务器上。Web 服务默认监听 <code>5200</code> 端口，数据默认写入安装目录下的 <code>data/</code>。</p>
+        <table class="manual-table">
+          <thead><tr><th>项目</th><th>要求</th><th>检查命令</th></tr></thead>
+          <tbody>
+            <tr><td>操作系统</td><td>Ubuntu / Debian / RHEL 系 / openSUSE，需 systemd</td><td><code>systemctl --version</code></td></tr>
+            <tr><td>Python</td><td>3.9 或更高</td><td><code>python3 --version</code></td></tr>
+            <tr><td>StorCLI</td><td>Broadcom MegaRAID 对应版本，需单独取得</td><td><code>storcli64 show</code></td></tr>
+            <tr><td>SMART</td><td>smartmontools，安装器会补齐</td><td><code>smartctl --version</code></td></tr>
+            <tr><td>磁盘空间</td><td>建议系统盘至少保留 2 GB</td><td><code>df -h /</code></td></tr>
+          </tbody>
+        </table>
+        <div class="manual-note">
+          <strong>不要直接覆盖生产数据目录。</strong>
+          安装器会保留已有 <code>data/</code>、PAM 映射和自定义环境配置；仍建议在升级前单独备份
+          <code>/opt/lsi-raid-monitor/data</code>。
+        </div>
+      </section>
+
+      <section id="install">
+        <h2>安装与启动</h2>
+        <p>将发布页下载的安装包上传到服务器，完成校验后解压。StorCLI 不随公开安装包重新分发，可以使用系统已有版本，也可以在安装时显式传入。</p>
+        <pre class="manual-code"><code>sha256sum datamax-lsi-1.10.27.tar.gz
+tar -xzf datamax-lsi-1.10.27.tar.gz
+cd datamax-lsi-1.10.27
+sudo bash install.sh --storcli-source /path/to/storcli64</code></pre>
+        <p>安装器会检查 Python 和端口、创建独立虚拟环境、安装 Web 依赖、保留旧数据、注册并启动
+          <code>datamax-lsi.service</code>，最后访问本机首页进行健康检查。</p>
+        <pre class="manual-code"><code>systemctl status datamax-lsi
+journalctl -u datamax-lsi -f
+curl -I http://127.0.0.1:5200/</code></pre>
+        <h3>常用安装选项</h3>
+        <table class="manual-table">
+          <thead><tr><th>参数</th><th>用途</th></tr></thead>
+          <tbody>
+            <tr><td><code>--port 8080</code></td><td>改变 Web 端口</td></tr>
+            <tr><td><code>--data-dir /var/lib/datamax-lsi</code></td><td>把数据目录移出应用目录</td></tr>
+            <tr><td><code>--install-extras</code></td><td>追加 fio、bcache、NVMe、IPMI、XFS 等工具</td></tr>
+            <tr><td><code>--check</code></td><td>只做环境检查，不修改系统</td></tr>
+            <tr><td><code>--allow-missing-storcli</code></td><td>硬件尚未到货时先安装只读界面</td></tr>
+          </tbody>
+        </table>
+        <div class="manual-note">
+          默认只补基础依赖并且不升级系统现有软件包。需要完整性能、bcache 和硬件传感器能力时，使用
+          <code>--install-extras</code>，或在对应功能页按需安装。
+        </div>
+      </section>
+
+      <section id="login">
+        <h2>首次登录与权限</h2>
+        <p>系统使用服务器本地 PAM 认证，不维护独立网页面板密码。首次打开浏览器访问
+          <code>http://服务器IP:5200</code>，输入 Linux 系统用户名和密码。</p>
+        <figure class="manual-figure">
+          <img src="/assets/screens/screens/00-login.png" alt="DataMax-LSI 登录页面">
+          <figcaption>登录使用服务器本地账号；口令由系统 PAM 校验。</figcaption>
+        </figure>
+        <p>角色按以下优先级映射：</p>
+        <ol>
+          <li><strong>admin：</strong><code>root</code>，以及 <code>LSI_PAM_ADMIN_USERS</code> 或 <code>LSI_PAM_ADMIN_GROUP</code> 命中的用户。</li>
+          <li><strong>operator：</strong>由 <code>LSI_PAM_OPERATOR_USERS/GROUP</code> 指定，可执行运维操作。</li>
+          <li><strong>auditor：</strong>由 <code>LSI_PAM_AUDITOR_USERS/GROUP</code> 指定，用于审计查看。</li>
+          <li><strong>viewer：</strong>其他系统账号，只能查看，不能修改配置或执行危险操作。</li>
+        </ol>
+        <p>映射配置位于 <code>/etc/datamax-lsi.env</code>。修改后重启服务生效。</p>
+      </section>
+
+      <section id="workspace">
+        <h2>界面与状态阅读</h2>
+        <p>左侧导航分为监控概览、文件管理、性能中心、日志中心、运维中心、用户与授权、报表中心和多机管理。每个页面再按标签分组，避免把长页面堆成一条没有边界的流水账。</p>
+        <p>状态使用固定语义：青绿色代表正常，琥珀色代表需要关注，红色代表严重或失败。磁盘状态保留 StorCLI 原始词，如 <code>Onln</code>、<code>UGood</code>、<code>Offln</code>、<code>Failed</code>，并在旁边显示中文解释。</p>
+        <div class="manual-note">
+          页面每 60 秒刷新状态，系统资源每 5 秒刷新。页面数据与“最后采集时间”以服务器时钟为准；
+          时间跨度超过采集间隔两倍时，界面会提示数据过期。
+        </div>
+      </section>
+
+      <section id="overview">
+        <h2>监控概览</h2>
+        <p>“总览”是值班接班的第一屏。先看综合健康评分与“运行态势”，再决定进入告警、容量或磁盘标签。</p>
+        <figure class="manual-figure">
+          <img src="/assets/screens/screens/01-overview.png" alt="监控概览页面">
+          <figcaption>总览包含综合健康、系统资源、文件系统、资产规模、容量水位和近 24 小时变化。</figcaption>
+        </figure>
+        <h3>标签说明</h3>
+        <ul>
+          <li><strong>总览：</strong>优先关注、容量预测、控制器与阵列保护状态。</li>
+          <li><strong>系统与文件：</strong>CPU、内存、负载、文件系统用量和主机信息。</li>
+          <li><strong>告警与健康：</strong>未处理告警、确认、维护窗口、磁盘磨损排行。</li>
+          <li><strong>磁盘与阵列：</strong>槽位拓扑、虚拟磁盘、物理磁盘、NVMe 明细。</li>
+          <li><strong>维护与趋势：</strong>温度 / IO / 文件系统趋势、巡读和一致性检查。</li>
+          <li><strong>授权：</strong>版本能力、离线授权安装与移除。</li>
+        </ul>
+      </section>
+
+      <section id="raid">
+        <h2>磁盘与阵列运维</h2>
+        <p>物理盘表是判断换盘的主要入口。关注槽位、状态、温度、ME/OE/PF、重建与预测等级。点击磁盘可以查看 SMART、所在阵列和可用动作。</p>
+        <figure class="manual-figure">
+          <img src="/assets/screens/screens/02-overview-disks.png" alt="虚拟磁盘、物理磁盘与机箱槽位">
+          <figcaption>虚拟盘与物理盘并列；橙色、红色状态同时出现在磁盘表和机箱盘位。</figcaption>
+        </figure>
+        <h3>安全换盘步骤</h3>
+        <ol>
+          <li>确认故障盘槽位、序列号和 DG/VD 成员关系，避免凭盘符判断。</li>
+          <li>如果阵列尚可运行，先检查热备策略；只有专用或全局热备盘会自动接替。</li>
+          <li>记录配置快照与任务编号，再进行离线、定位灯或更换操作。</li>
+          <li>新盘插入后确认状态为 <code>UGood</code> 或 <code>Onln</code>，再把盘加入阵列或设为热备。</li>
+          <li>在重建进度中持续查看百分比、速率和预计时间，不要在重建中重启控制器。</li>
+        </ol>
+        <div class="manual-note">
+          不是所有未配置盘都会自动参与重建。只有虚拟盘成员或被明确设置为热备的盘才应参与；
+          发现无关磁盘进入重建时，应立即停止并检查阵列成员与热备配置。
+        </div>
+      </section>
+
+      <section id="storage">
+        <h2>文件、缓存与共享</h2>
+        <p>文件管理页面从块设备开始，展示系统盘、虚拟盘、bcache 卷和挂载点。格式化和初始化会破坏数据，必须先确认盘符、挂载状态和备份。</p>
+        <figure class="manual-figure">
+          <img src="/assets/screens/screens/03-storage.png" alt="文件管理、bcache 和 NFS 页面">
+          <figcaption>文件系统、SSD 缓存加速、NFS 共享与容量预测。</figcaption>
+        </figure>
+        <h3>bcache 使用顺序</h3>
+        <ol>
+          <li>用 SSD / NVMe 创建缓存集，明确 backing 数据盘和 cache 缓存盘。</li>
+          <li>新建缓存集会清理所用设备的旧文件系统标记；已有数据的盘必须先备份。</li>
+          <li>缓存模式优先从 <code>writethrough</code> 开始，确认稳定后再切到 <code>writeback</code>。</li>
+          <li>切换出 writeback 前先确认脏数据回写，缓存盘掉线时不要直接销毁缓存集。</li>
+          <li>缓存盘永久丢失时，使用应急只读回环偏移方式挂载 backing 数据盘，先保全数据。</li>
+        </ol>
+        <p>NFS 共享可指定客户端网段、读写模式和同步选项。Web 中的挂载结果会回读 <code>findmnt</code>，如果分区被系统挂成只读，客户端写入会被明确拒绝并显示真实原因。</p>
+      </section>
+
+      <section id="backup">
+        <h2>数据备份与恢复</h2>
+        <p>数据备份使用文件级 tar 与 zstd，支持全量、增量链、本地目录、NFS 挂载和远程 SSH。备份源端只读，恢复默认先执行 dry-run，不覆盖目标现有文件。</p>
+        <figure class="manual-figure">
+          <img src="/assets/screens/screens/04-backup.png" alt="数据备份与恢复界面">
+          <figcaption>备份目的地、策略、恢复链和演练状态在同一个标签内。</figcaption>
+        </figure>
+        <h3>一次完整备份</h3>
+        <ol>
+          <li>在路径选择器中选择源目录和目标目录，不要手工输入一个未挂载的路径。</li>
+          <li>首次运行全量；后续可按备份链运行增量，保留策略会按链计算。</li>
+          <li>归档完成后查看 manifest、SHA-256 和一致性等级。</li>
+          <li>需要恢复时先执行预览，确认变更数量、覆盖策略和目标位置。</li>
+          <li>定期执行恢复演练；失败会进入告警，不会静默跳过。</li>
+        </ol>
+      </section>
+
+      <section id="performance">
+        <h2>性能测试与诊断</h2>
+        <p>性能中心用于回答“为什么现在很慢”。慢盘诊断是只读分析，基准测试才写入文件；两者在界面上有明确区分。</p>
+        <figure class="manual-figure">
+          <img src="/assets/screens/screens/05-perf.png" alt="性能中心和 IO 基准测试">
+          <figcaption>IOPS、带宽、延迟、利用率和队列深度共同判断瓶颈。</figcaption>
+        </figure>
+        <h3>基准测试注意事项</h3>
+        <ul>
+          <li>确认目标设备不是 USB 系统盘，生产盘测试前必须评估业务影响。</li>
+          <li>顺序与随机测试分别设置块大小、线程数和队列深度。</li>
+          <li>需要可比较结果时使用相同预热时间，并按需选择页缓存丢弃。</li>
+          <li>测试文件由模块创建和清理；不要在测试过程中手动删除临时目录。</li>
+        </ul>
+      </section>
+
+      <section id="operations">
+        <h2>运维中心</h2>
+        <p>运维中心承载机箱盘位、硬件传感器、SES 背板、维护计划、控制器策略、PHY 错误与配置快照。</p>
+        <figure class="manual-figure">
+          <img src="/assets/screens/screens/06-ops.png" alt="运维中心与机箱盘位可视化">
+          <figcaption>整机盘位面板支持 2U8、2U12、4U16、4U24 等规格，并接入真实 SES 槽位。</figcaption>
+        </figure>
+        <h3>异步任务</h3>
+        <p>危险操作会生成任务记录。打开右侧任务中心可查看当前步骤、进度、命令输出和失败原因。只有标记为可重试的任务才提供重试按钮。</p>
+        <h3>维护计划</h3>
+        <p>巡读、一致性检查和 SMART 自检可以按日、周、月安排。执行前确认业务峰谷，并在控制器策略中设置合理的重建和巡检速率限制。</p>
+      </section>
+
+      <section id="alerts-reports">
+        <h2>告警与报表</h2>
+        <p>告警设置支持温度阈值、SMART、预测性故障、控制器、BBU、磁盘和阵列状态变化。告警确认只会停止重复提醒，不会修复硬件。</p>
+        <p>维护窗口会记录告警但仍静默通知，适合换盘、背板维修和计划性重启。Webhook 可以接钉钉、飞书或企业微信机器人。</p>
+        <figure class="manual-figure">
+          <img src="/assets/screens/screens/08-reports.png" alt="运行报表与定时投递">
+          <figcaption>日报、周报、月报可导出 HTML/CSV，也可以定时发送到邮箱。</figcaption>
+        </figure>
+      </section>
+
+      <section id="hosts">
+        <h2>多机与接口</h2>
+        <p>多机管理通过每台机器上的采集令牌汇总状态。节点可按分组、在线状态和未处理告警筛选，中心节点可以汇总告警并执行有限的管理动作。</p>
+        <p>系统同时暴露 Prometheus 指标、REST API 和 Grafana 面板。自动化系统应使用只读或最小权限账号，不要把 PAM 管理员口令写入脚本。</p>
+        <figure class="manual-figure">
+          <img src="/assets/screens/screens/09-hosts.png" alt="多机管理页面">
+          <figcaption>多机列表、统一告警和采集状态；分享截图前请遮蔽节点令牌。</figcaption>
+        </figure>
+      </section>
+
+      <section id="security">
+        <h2>安全与日常维护</h2>
+        <ul>
+          <li>默认 HTTP 适合受控内网。对外提供服务时应在前面部署 HTTPS 反向代理并设置安全 Cookie。</li>
+          <li>服务需要 root 访问 <code>/dev</code>、<code>/sys</code>、PAM、挂载和 StorCLI；不要用普通用户启动完整控制面。</li>
+          <li>只给操作员分配 PAM 组权限，审计账号使用 viewer / auditor 角色。</li>
+          <li>每周查看未处理告警、容量预测、SMART 增长和最近失败任务。</li>
+          <li>每月导出一次配置快照，并演练一次数据恢复。</li>
+        </ul>
+        <h3>配置与备份位置</h3>
+        <table class="manual-table">
+          <tbody>
+            <tr><th>应用目录</th><td><code>/opt/lsi-raid-monitor</code></td></tr>
+            <tr><th>运行配置</th><td><code>/etc/datamax-lsi.env</code></td></tr>
+            <tr><th>数据目录</th><td><code>/opt/lsi-raid-monitor/data</code></td></tr>
+            <tr><th>systemd 服务</th><td><code>datamax-lsi.service</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="troubleshooting">
+        <h2>故障排查</h2>
+        <h3>页面打不开</h3>
+        <ol>
+          <li><code>systemctl status datamax-lsi</code> 看服务是否运行。</li>
+          <li><code>ss -ltnp | grep 5200</code> 确认端口和进程。</li>
+          <li><code>journalctl -u datamax-lsi -n 100</code> 查看 Python 或启动错误。</li>
+          <li>检查防火墙是否放行访问来源到 TCP 5200。</li>
+        </ol>
+        <h3>磁盘数据为空</h3>
+        <p>先执行 <code>storcli64 show</code>，再确认 <code>/etc/datamax-lsi.env</code> 中的 <code>STORCLI_PATH</code>。StorCLI 版本与控制器代际不匹配时，命令可能返回 0 但内部状态为 Failure。</p>
+        <h3>登录失败</h3>
+        <p>确认使用 Linux 系统账号，并检查 <code>LSI_PAM_SERVICE</code> 是否为系统可用的 PAM 服务。root 通常映射为 admin；其他用户默认至少具有 viewer 只读权限。</p>
+        <h3>升级失败</h3>
+        <p>安装器会停止新服务并恢复上一版应用与 systemd 单元，数据目录不删除。检查终端输出的备份路径，以及 <code>/var/log/syslog</code> 或 <code>journalctl</code> 中的错误。</p>
+      </section>
+
+      <div class="manual-next">
+        <a href="/">返回发布页</a>
+        <a href="/#download" data-download>下载当前版本</a>
+      </div>
+    </article>
+  </div>
+</body>
+</html>
