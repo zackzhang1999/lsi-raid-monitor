@@ -11,3 +11,4 @@ dist/
 release-site/*.tar.gz
 release-site/*.tar.gz.sha256
 .deploy-backups/
+._*
