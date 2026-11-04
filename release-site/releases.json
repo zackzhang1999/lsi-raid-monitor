@@ -5,10 +5,10 @@
       "version": "1.10.28",
       "date": "2026-11-04",
       "file": "datamax-lsi-1.10.28.tar.gz",
-      "sha256": "24675cea10b4dbd116b2f7414eee1a5e45bf2199165a124546b58927afbfb46e",
-      "size": 2796423,
-      "notes": "首个公开发布版：增强一键安装、运维能力与完整使用手册",
-      "commit": "fbf3bd4"
+      "sha256": "42dbbe402d674e3fac2aa21294c872e297bd262e5af92d825f68a29af600e4d7",
+      "size": 2796413,
+      "notes": "首个公开发布版：一键安装、发布页与完整使用手册",
+      "commit": "b519910"
     }
   ]
 }
