@@ -362,6 +362,54 @@
           <!-- 四个状态卡 -->
           <div class="grid grid-stats" id="stat-cards"></div>
 
+          <!-- 运行态势：把当前风险、容量水位、资产规模与近 24 小时变化
+               放在同一个视野内，避免总览只剩健康分和基础设施读数。 -->
+          <div class="card overview-situation" id="card-overview-situation">
+            <div class="card-head">
+              <div>
+                <div class="eyebrow">Operations brief</div>
+                <strong>运行态势</strong>
+              </div>
+              <div class="card-head-actions">
+                <span class="badge" id="overview-situation-badge">加载中</span>
+                <span class="tiny" id="overview-situation-time"></span>
+              </div>
+            </div>
+            <div class="overview-situation-grid" role="status" aria-live="polite">
+              <section class="overview-pane">
+                <div class="overview-pane-head">
+                  <span>优先关注</span>
+                  <span class="tiny" id="overview-priority-count">正在汇总</span>
+                </div>
+                <div class="overview-priority-list" id="overview-priority-list">
+                  <div class="loading-line">加载中…</div>
+                </div>
+              </section>
+              <section class="overview-pane">
+                <div class="overview-pane-head">
+                  <span>容量水位</span>
+                  <span class="tiny" id="overview-capacity-note">近 14 天趋势</span>
+                </div>
+                <div id="overview-capacity-body"><div class="loading-line">加载中…</div></div>
+              </section>
+              <section class="overview-pane">
+                <div class="overview-pane-head">
+                  <span>资产与保护</span>
+                  <span class="tiny" id="overview-asset-note"></span>
+                </div>
+                <div id="overview-asset-body"><div class="loading-line">加载中…</div></div>
+              </section>
+            </div>
+            <div class="overview-activity-strip" id="overview-activity-strip">
+              <span class="overview-activity-label">近 24 小时</span>
+              <span class="overview-activity-item">新增告警 <b id="overview-alerts-opened">—</b></span>
+              <span class="overview-activity-item">已恢复 <b id="overview-alerts-resolved">—</b></span>
+              <span class="overview-activity-item">运维操作 <b id="overview-tasks-total">—</b></span>
+              <span class="overview-activity-item">SMART 属性增长 <b id="overview-smart-growth">—</b></span>
+              <span class="overview-activity-item">缓存小时命中率 <b id="overview-cache-hit">—</b></span>
+            </div>
+          </div>
+
           <!-- 告警中心（含跨控制器一致性检查） -->
           <div class="card" id="card-alerts">
             <div class="card-head">

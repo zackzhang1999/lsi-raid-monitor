@@ -177,6 +177,10 @@ const state = {
   authRequired: true,
   isAdmin: false,
   status: null,
+  overviewReport: null,
+  overviewForecast: null,
+  overviewLoadedAt: 0,
+  overviewLoading: false,
   alertCfg: null,
   view: 'overview',
   hours: 24,
@@ -436,6 +440,10 @@ async function afterLogin() {
   await loadAll();
   if (state.refreshTimer) clearInterval(state.refreshTimer);
   state.refreshTimer = setInterval(() => loadStatus().catch(() => {}), 60000);
+  if (state.overviewTimer) clearInterval(state.overviewTimer);
+  state.overviewTimer = setInterval(() => {
+    if (!document.hidden) loadOverviewSituation().catch(() => {});
+  }, 300000);
   if (state.realtimeTimer) clearInterval(state.realtimeTimer);
   state.realtimeTimer = setInterval(() => {
     if (!document.hidden) loadRealtime().catch(() => {});
@@ -447,7 +455,7 @@ async function loadAll() {
     loadStatus(), loadAlertConfig(), loadCollectionConfig(), loadHistory(),
     loadEvents(), loadRealtime(), loadFsUsage(), loadVdDetail(), loadCtlEvents(),
     loadAlarm(), loadJbod(), loadAlertCenter(), loadDiskHealth(),
-    loadLicense(),
+    loadLicense(), loadOverviewSituation(),
   ]);
   // 顶栏计数依赖事件流，放在状态之后刷新，避免与 loadStatus 抢 state
   refreshConsoleBadges().catch(() => {});
@@ -525,6 +533,7 @@ async function loadAlertCenter() {
   $$('#alert-list [data-silence]').forEach(b =>
     b.addEventListener('click', () => openSilenceModal(b.dataset.silence))
   );
+  renderOverviewSituation();
 }
 
 function renderSilenceBanner(silences) {
@@ -683,6 +692,7 @@ async function loadStatus() {
   renderPhysicalDisks(st);
   renderNvmeDisks(st);
   renderSystem(st);
+  renderOverviewSituation();
   // 控制器检测到外来配置时显示「载入外部配置」按钮
   const hasForeign = !!(st.controller && st.controller.foreign_present);
   const btnImport = $('#btn-vd-import');
@@ -962,6 +972,203 @@ function renderStatCards(st) {
       <div class="stat-value">${k.value}</div>
       <div class="stat-sub">${k.sub}</div>
     </div>`).join('');
+}
+
+/* ---------- 总览 · 运行态势 ----------
+   总览标签不是报表的缩略版，而是接班时的第一屏：先告诉用户哪里需要
+   处理，再给出容量、资产和最近一天的变化。数据来自已有接口，不新增
+   后端采集任务，也不执行任何写操作。 */
+async function loadOverviewSituation() {
+  if (state.overviewLoading) return;
+  state.overviewLoading = true;
+  try {
+    const [report, forecast] = await Promise.allSettled([
+      api('/api/reports/summary?period=day'),
+      api('/api/capacity/forecast'),
+    ]);
+    if (report.status === 'fulfilled' && report.value && report.value.report) {
+      state.overviewReport = report.value.report;
+    }
+    if (forecast.status === 'fulfilled' && forecast.value) {
+      state.overviewForecast = forecast.value;
+    }
+    state.overviewLoadedAt = Date.now();
+    renderOverviewSituation();
+  } finally {
+    state.overviewLoading = false;
+  }
+}
+
+function overviewTone(level) {
+  if (level === 'error' || level === 'crit') return 'crit';
+  if (level === 'warning' || level === 'warn') return 'warn';
+  return 'info';
+}
+
+function overviewRelativeTime(value) {
+  const d = toDate(value);
+  if (!d) return '';
+  const minutes = Math.max(0, Math.round((Date.now() - d.getTime()) / 60000));
+  if (minutes < 1) return '刚刚';
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  return `${Math.round(hours / 24)} 天前`;
+}
+
+function renderOverviewSituation() {
+  const card = $('#card-overview-situation');
+  if (!card) return;
+  const st = state.status;
+  const report = state.overviewReport;
+  const forecast = state.overviewForecast;
+  const priorityBox = $('#overview-priority-list');
+  const capacityBox = $('#overview-capacity-body');
+  const assetBox = $('#overview-asset-body');
+  if (!st && !report) return;
+
+  const activeAlerts = ((_alertData && _alertData.alerts) || [])
+    .filter(a => a.status !== 'resolved')
+    .sort((a, b) => {
+      const rank = { error: 0, warning: 1, info: 2 };
+      return (rank[a.level] == null ? 3 : rank[a.level]) - (rank[b.level] == null ? 3 : rank[b.level]);
+    });
+  const issues = activeAlerts.map(a => ({
+    level: a.level,
+    title: a.title || a.key || '未命名告警',
+    meta: a.last_seen ? `最近 ${overviewRelativeTime(a.last_seen)}` : '来自告警中心',
+  }));
+
+  const raid = (report && report.raid) || {};
+  const degraded = Number(raid.degraded) || (st ? (st.virtual_disks || []).filter(v => stateTone(v.state) === 'crit').length : 0);
+  if (degraded > 0) {
+    issues.push({ level: 'error', title: `${degraded} 个虚拟磁盘处于非最优状态`, meta: '阵列冗余能力可能已下降' });
+  }
+  const consistency = (st && st.consistency && st.consistency.issues) || [];
+  consistency.slice(0, 2).forEach(i => issues.push({
+    level: i.level || 'warning',
+    title: i.title || '跨控制器一致性异常',
+    meta: i.detail || i.hint || '',
+  }));
+  const failedTasks = Number(report && report.tasks && report.tasks.failed) || 0;
+  if (failedTasks > 0) {
+    issues.push({ level: 'error', title: `近 24 小时有 ${failedTasks} 次运维操作失败`, meta: '请打开右侧任务中心查看输出并重试' });
+  }
+
+  const hasCritical = issues.some(i => overviewTone(i.level) === 'crit');
+  const hasWarning = issues.some(i => overviewTone(i.level) === 'warn');
+  const badge = $('#overview-situation-badge');
+  badge.className = 'badge ' + (hasCritical ? 'crit' : hasWarning ? 'warn' : 'ok');
+  badge.textContent = hasCritical ? '存在风险' : hasWarning ? '需要关注' : '运行平稳';
+  $('#overview-situation-time').textContent = report && report.meta && report.meta.generated_at
+    ? `近 24 小时 · ${report.meta.generated_at.slice(11, 16)} 更新`
+    : '实时汇总';
+
+  $('#overview-priority-count').textContent = issues.length ? `${issues.length} 项待关注` : '无需处理';
+  if (!issues.length) {
+    priorityBox.innerHTML = `<div class="overview-clear">
+      <span class="overview-clear-mark"></span>
+      <span><strong>当前没有待处理风险</strong><small>阵列、告警与最近运维均处于正常状态</small></span>
+    </div>`;
+  } else {
+    const visible = issues.slice(0, 4);
+    priorityBox.innerHTML = visible.map(i => {
+      const tone = overviewTone(i.level);
+      const label = tone === 'crit' ? '错误' : tone === 'warn' ? '警告' : '信息';
+      return `<div class="overview-priority-item">
+        <span class="badge ${tone}">${label}</span>
+        <span class="overview-priority-copy">
+          <strong>${esc(i.title)}</strong>
+          ${i.meta ? `<small>${esc(i.meta)}</small>` : ''}
+        </span>
+      </div>`;
+    }).join('') + (issues.length > visible.length
+      ? `<div class="overview-priority-more">另有 ${issues.length - visible.length} 项，请到「告警与健康」查看</div>`
+      : '');
+  }
+
+  const mounts = ((forecast && forecast.items) || [])
+    .filter(x => x && x.mountpoint && !String(x.mountpoint).startsWith('/boot') && !String(x.fstype || '').startsWith('squash'))
+    .sort((a, b) => (Number(b.use_percent) || 0) - (Number(a.use_percent) || 0))
+    .slice(0, 3);
+  if (!mounts.length) {
+    capacityBox.innerHTML = stateBlock('empty', '暂无容量样本', '下一轮文件系统采集完成后会显示趋势。', '', true);
+  } else {
+    capacityBox.innerHTML = `<div class="overview-capacity-list">${mounts.map(x => {
+      const pct = Math.max(0, Math.min(100, Number(x.use_percent) || 0));
+      const tone = pct >= 90 ? 'crit' : pct >= 75 ? 'warn' : 'ok';
+      let eta = '趋势平稳';
+      if (x.days_to_90 != null) {
+        eta = Number(x.days_to_90) <= 0
+          ? `已接近 90%${x.eta_90 ? ` · ${esc(x.eta_90)}` : ''}`
+          : `距 90% 约 ${esc(x.days_to_90)} 天`;
+      }
+      return `<div class="overview-capacity-row">
+        <div class="overview-capacity-head">
+          <span class="overview-path">${esc(x.mountpoint)}</span>
+          <span class="mono">${esc(pct.toFixed(1))}%</span>
+        </div>
+        <div class="overview-capacity-bar"><i class="${tone}" style="width:${pct}%"></i></div>
+        <div class="overview-capacity-meta">
+          <span>可用 ${esc(fmtBytes(x.avail))}</span>
+          <span class="${tone === 'crit' ? 'text-crit' : tone === 'warn' ? 'text-warn' : ''}">${eta}</span>
+        </div>
+      </div>`;
+    }).join('')}</div>`;
+  }
+  $('#overview-capacity-note').textContent = forecast && forecast.window_days
+    ? `近 ${forecast.window_days} 天趋势`
+    : '容量趋势';
+
+  const ctrls = (st && st.controllers && st.controllers.length)
+    ? st.controllers
+    : (st && st.controller ? [st.controller] : []);
+  const disks = (st && st.physical_disks) || [];
+  const vds = (st && st.virtual_disks) || [];
+  const online = disks.filter(d => stateTone(d.state) === 'ok').length;
+  const controllerRows = ctrls.slice(0, 4).map(c => {
+    const tone = ctrlHealthTone(c.health);
+    const text = ctrlHealthText(c.health);
+    return `<div class="overview-controller-row">
+      <span class="overview-controller-id mono">C${esc(c.ctrl != null ? c.ctrl : c.index || 0)}</span>
+      <span class="overview-controller-model">${esc(c.model || 'RAID 控制器')}</span>
+      <span class="badge ${tone}">${esc(text)}</span>
+      <span class="tiny mono">${c.num_disks != null ? esc(c.num_disks) + ' 盘' : ''}${c.roc_temp != null ? ' · ' + esc(c.roc_temp) + '°C' : ''}</span>
+    </div>`;
+  }).join('');
+  const maint = ctrls[0] && (ctrls[0].maintenance || {}) || (st && st.maintenance) || {};
+  const nextMaint = (maint.patrol_read && maint.patrol_read.next) || '';
+  assetBox.innerHTML = `
+    <div class="overview-asset-counts">
+      <div><b>${ctrls.length || '—'}</b><span>控制器</span></div>
+      <div><b>${disks.length}</b><span>物理磁盘</span></div>
+      <div><b>${vds.length}</b><span>虚拟磁盘</span></div>
+      <div><b>${online}</b><span>在线磁盘</span></div>
+    </div>
+    <div class="overview-controller-list">${controllerRows || '<div class="muted">控制器数据加载中</div>'}</div>
+    <div class="overview-protection-row">
+      <span>阵列冗余</span>
+      <span class="badge ${degraded ? 'crit' : 'ok'}">${degraded ? `${degraded} 个降级` : `${vds.length || 0} 个阵列正常`}</span>
+    </div>
+    <div class="overview-protection-row">
+      <span>跨控制器配置</span>
+      <span class="badge ${consistency.length ? 'warn' : 'ok'}">${consistency.length ? `${consistency.length} 项差异` : '一致'}</span>
+    </div>
+    <div class="overview-protection-row">
+      <span>下次自动巡检</span>
+      <span class="mono tiny">${esc(nextMaint || '未配置')}</span>
+    </div>`;
+  $('#overview-asset-note').textContent = ctrls.length > 1 ? `${ctrls.length} 张控制器并列` : '';
+
+  const alerts = (report && report.alerts) || {};
+  const tasks = (report && report.tasks) || {};
+  const disksReport = (report && report.disks) || {};
+  const bcache = ((report && report.bcache && report.bcache.devices) || [])[0] || {};
+  $('#overview-alerts-opened').textContent = alerts.opened != null ? alerts.opened : '—';
+  $('#overview-alerts-resolved').textContent = alerts.resolved != null ? alerts.resolved : '—';
+  $('#overview-tasks-total').textContent = tasks.total != null ? tasks.total : '—';
+  $('#overview-smart-growth').textContent = Array.isArray(disksReport.smart_growth) ? disksReport.smart_growth.length : '—';
+  $('#overview-cache-hit').textContent = bcache.latest_hour != null ? `${bcache.latest_hour}%` : '—';
 }
 
 /* ---------- 磁盘槽位拓扑 ---------- */
@@ -3281,6 +3488,9 @@ function switchView(v) {
     $('#view-' + name).classList.toggle('hidden', name !== v);
   });
   if (v === 'overview') tabifyOverview(); else tabifyView(v);
+  if (v === 'overview' && Date.now() - state.overviewLoadedAt > 300000) {
+    loadOverviewSituation().catch(() => {});
+  }
   if (v === 'storage' && !state.storageLoaded) loadStorage();
   if (v === 'storage' && !state.fsUsage) loadFsUsage();
   if (v === 'storage' && !state.nfsLoaded) loadNfs();
@@ -3329,12 +3539,12 @@ function tabifyOverview() {
   const kids = [...view.children].filter(el => el.nodeType === 1);
   if (kids.length < 6) return;
   const groups = [
-    { label: '总览', idx: [0, 2] },
-    { label: '系统与文件', idx: [1, 11] },
-    { label: '告警与健康', idx: [3, 4] },
-    { label: '磁盘与阵列', idx: [5, 8, 9, 10] },
-    { label: '维护与趋势', idx: [6, 7] },
-    { label: '授权', idx: [12] },
+    { label: '总览', idx: [0, 2, 3] },
+    { label: '系统与文件', idx: [1, 12] },
+    { label: '告警与健康', idx: [4, 5] },
+    { label: '磁盘与阵列', idx: [6, 9, 10, 11] },
+    { label: '维护与趋势', idx: [7, 8] },
+    { label: '授权', idx: [13] },
   ];
   const bar = document.createElement('div');
   bar.className = 'subtabs';
