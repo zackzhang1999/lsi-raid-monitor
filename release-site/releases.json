@@ -1,6 +1,15 @@
 {
-  "latest": "1.10.30",
+  "latest": "1.10.31",
   "releases": [
+    {
+      "version": "1.10.31",
+      "date": "2026-11-05",
+      "file": "datamax-lsi-1.10.31.tar.gz",
+      "sha256": "ab58e796427a45bee717be268121b2ee30aec648360af1b65cd9c0bf49822981",
+      "size": 2680607,
+      "notes": "支持远程 SSH 备份目标填写与格式校验",
+      "commit": "71c2b7f"
+    },
     {
       "version": "1.10.30",
       "date": "2026-11-05",
