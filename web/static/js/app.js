@@ -5442,6 +5442,77 @@ async function pickServerDir(inputId) {
 
 /* ---------- 数据备份与恢复 ---------- */
 
+const DB_DESTINATION_UI = {
+  local: {
+    placeholder: '/mnt/backup',
+    note: '本地挂载目录',
+  },
+  nfs: {
+    placeholder: '/mnt/nfs-backup',
+    note: 'NFS 挂载目录',
+  },
+  ssh: {
+    placeholder: 'user@host:/data/backup',
+    note: '格式：user@host:/path · 需配置免密 SSH',
+  },
+};
+const _dbTargetValues = { local: '', nfs: '', ssh: '' };
+let _dbDestinationKind = '';
+
+function clearBackupTargetError() {
+  const input = $('#db-target');
+  const error = $('#db-target-error');
+  if (input) input.removeAttribute('aria-invalid');
+  if (error) error.textContent = '';
+}
+
+function syncBackupDestination() {
+  const select = $('#db-kind');
+  const input = $('#db-target');
+  const picker = $('#db-target-picker');
+  const browse = $('#db-target-browse');
+  const note = $('#db-target-mode');
+  if (!select || !input || !picker || !browse || !note) return;
+
+  if (_dbDestinationKind) _dbTargetValues[_dbDestinationKind] = input.value;
+  const kind = DB_DESTINATION_UI[select.value] ? select.value : 'local';
+  const ui = DB_DESTINATION_UI[kind];
+  const ssh = kind === 'ssh';
+
+  input.readOnly = !ssh;
+  input.placeholder = ui.placeholder;
+  input.inputMode = ssh ? 'url' : 'text';
+  input.value = _dbTargetValues[kind] || '';
+  picker.classList.toggle('ssh-mode', ssh);
+  browse.classList.toggle('hidden', ssh);
+  note.textContent = ui.note;
+  _dbDestinationKind = kind;
+  clearBackupTargetError();
+}
+
+function validateBackupTarget(options) {
+  const input = $('#db-target');
+  const error = $('#db-target-error');
+  if (!input || !error) return true;
+  const value = input.value.trim();
+
+  let message = '';
+  if (!value) {
+    message = $('#db-kind').value === 'ssh'
+      ? '请输入远程目标，例如 user@host:/data/backup'
+      : '请选择目标目录';
+  } else if ($('#db-kind').value === 'ssh') {
+    if (/\s/.test(value) || !/^[^@:\s]+@[^:\s]+:\/\S+/.test(value)) {
+      message = 'SSH 目标格式应为 user@host:/path，例如 backup@10.0.0.8:/data/backup';
+    }
+  }
+
+  error.textContent = message;
+  input.toggleAttribute('aria-invalid', Boolean(message));
+  if (message && options && options.focus) input.focus();
+  return !message;
+}
+
 async function loadFsPaths() {
   const dl = $('#db-paths');
   if (!dl || dl.dataset.filled) return;
@@ -5463,6 +5534,7 @@ async function loadDataBackup() {
 }
 
 async function startDataBackup() {
+  if (!validateBackupTarget({ focus: true })) return;
   const body = {
     kind: $('#db-kind').value,
     name: $('#db-name').value.trim() || 'backup',
@@ -5493,6 +5565,7 @@ async function loadBackupSchedule() {
 }
 
 async function saveBackupSchedule() {
+  if (!validateBackupTarget({ focus: true })) return;
   const schedule = {
     id: 'bkp-1',
     enabled: $('#db-sched-on').checked,
@@ -6672,6 +6745,19 @@ function bindUI() {
   const dbStart = $('#btn-dbackup-start');
   if (dbStart) dbStart.addEventListener('click', startDataBackup);
   $$('[data-pick]').forEach(b => b.addEventListener('click', () => pickServerDir(b.dataset.pick)));
+  const dbKind = $('#db-kind');
+  if (dbKind) {
+    if (dbKind.value === 'local') _dbTargetValues.local = $('#db-target')?.value || '';
+    dbKind.addEventListener('change', syncBackupDestination);
+    syncBackupDestination();
+  }
+  const dbTarget = $('#db-target');
+  if (dbTarget) {
+    dbTarget.addEventListener('input', clearBackupTargetError);
+    dbTarget.addEventListener('blur', () => {
+      if (dbTarget.value.trim()) validateBackupTarget();
+    });
+  }
   const dbSched = $('#btn-db-sched-save');
   if (dbSched) dbSched.addEventListener('click', saveBackupSchedule);
   const dbList = $('#btn-dbackup-list');

@@ -636,8 +636,12 @@
                 <div class="field"><label for="db-source">源目录</label>
                   <div class="path-pick"><input class="input" id="db-source" placeholder="/mnt/bcache0/data" readonly /><button class="btn sm" type="button" data-pick="db-source">选择</button></div></div>
                 <div class="field">
-                  <label for="db-target">目标目录 <span class="label-note">SSH 填 user@host:/path</span></label>
-                  <div class="path-pick"><input class="input" id="db-target" placeholder="/mnt/backup" readonly /><button class="btn sm" type="button" data-pick="db-target">选择</button></div>
+                  <label for="db-target">目标目录 <span class="label-note" id="db-target-mode">本地挂载目录</span></label>
+                  <div class="path-pick" id="db-target-picker">
+                    <input class="input" id="db-target" placeholder="/mnt/backup" readonly autocomplete="off" spellcheck="false" aria-describedby="db-target-mode db-target-error" />
+                    <button class="btn sm" type="button" data-pick="db-target" id="db-target-browse" aria-label="选择目标目录">选择</button>
+                  </div>
+                  <span class="field-error" id="db-target-error" role="alert"></span>
                 </div>
               </div>
             </div>

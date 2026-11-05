@@ -4427,6 +4427,13 @@ input[type="checkbox"], input[type="radio"] {
   padding-inline: 8px;
   white-space: nowrap;
 }
+.path-pick.ssh-mode {
+  grid-template-columns: minmax(0, 1fr);
+}
+.path-pick.ssh-mode .input {
+  font-family: var(--font-mono);
+  letter-spacing: -0.01em;
+}
 .label-note {
   margin-left: 5px;
   color: var(--ink-faint);
@@ -4434,6 +4441,13 @@ input[type="checkbox"], input[type="radio"] {
   font-weight: 400;
   white-space: nowrap;
 }
+.field-error {
+  display: none;
+  color: var(--crit);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.field-error:not(:empty) { display: block; }
 .backup-schedule-row {
   display: grid;
   grid-template-columns: minmax(160px, .8fr) 150px 140px minmax(220px, 1fr);
