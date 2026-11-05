@@ -4384,6 +4384,103 @@ input[type="checkbox"], input[type="radio"] {
 #card-data-backup .bench-form .input,
 #card-data-backup .bench-form .select { min-width: 0; width: 100%; }
 
+/* 备份作业：元数据一行，源/目标路径独立一行；路径输入与选择按钮
+   共用 32px 控件基线，避免长短标签把字段推成不同高度。 */
+.backup-job-form {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px 18px;
+  align-items: end;
+}
+.backup-path-grid {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+.backup-job-form .field,
+.backup-schedule-row .field {
+  min-width: 0;
+}
+.backup-job-form .input,
+.backup-job-form .select,
+.backup-schedule-row .input,
+.backup-schedule-row .select {
+  width: 100%;
+  min-width: 0;
+}
+.path-pick {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 62px;
+  gap: 8px;
+  align-items: center;
+}
+.path-pick .input {
+  width: 100%;
+  min-width: 0;
+}
+.path-pick .btn {
+  width: 100%;
+  height: 32px;
+  padding-inline: 8px;
+  white-space: nowrap;
+}
+.label-note {
+  margin-left: 5px;
+  color: var(--ink-faint);
+  font-size: 10.5px;
+  font-weight: 400;
+  white-space: nowrap;
+}
+.backup-schedule-row {
+  display: grid;
+  grid-template-columns: minmax(160px, .8fr) 150px 140px minmax(220px, 1fr);
+  gap: 16px 18px;
+  align-items: end;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+.backup-schedule-row .check-row {
+  height: 32px;
+  min-height: 32px;
+  align-items: center;
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+.backup-schedule-actions {
+  display: flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+.backup-schedule-actions .tiny {
+  color: var(--ink-faint);
+}
+@media (max-width: 1000px) {
+  .backup-schedule-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 700px) {
+  .backup-job-form,
+  .backup-path-grid,
+  .backup-schedule-row {
+    grid-template-columns: 1fr;
+  }
+  .backup-path-grid {
+    padding-top: 14px;
+  }
+  .label-note {
+    display: block;
+    margin: 2px 0 0;
+  }
+}
+
 
 /* 服务器目录选择器 */
 .dirpick-mask { position: fixed; inset: 0; z-index: 1200; background: rgba(10,12,14,.45); display: flex; align-items: center; justify-content: center; padding: 24px; }

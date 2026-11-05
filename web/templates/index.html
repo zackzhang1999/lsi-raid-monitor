@@ -621,7 +621,7 @@
               文件级全量 + 增量（tar + zstd）。<strong>源端只读</strong>；恢复默认不覆盖，先 dry-run 再执行。
               本机无快照能力，一致性等级为「崩溃一致」。
             </p>
-            <div class="bench-form" style="grid-template-columns:repeat(5,minmax(0,1fr))">
+            <div class="backup-job-form">
               <div class="field"><label for="db-kind">目的地类型</label>
                 <select class="select" id="db-kind">
                   <option value="local">第二块盘目录</option>
@@ -630,15 +630,20 @@
                 </select></div>
               <div class="field"><label for="db-name">作业名</label>
                 <input class="input" id="db-name" placeholder="appdata" /></div>
-              <div class="field"><label for="db-source">源目录</label>
-                <div class="path-pick"><input class="input" id="db-source" placeholder="/mnt/bcache0/data" readonly /><button class="btn sm" type="button" data-pick="db-source">选择</button></div></div>
-              <div class="field"><label for="db-target">目标（SSH 填 user@host:/path）</label>
-                <div class="path-pick"><input class="input" id="db-target" placeholder="/mnt/backup" readonly /><button class="btn sm" type="button" data-pick="db-target">选择</button></div></div>
               <div class="field"><label for="db-keep">保留份数</label>
                 <input class="input" id="db-keep" type="number" min="1" max="90" value="7" /></div>
+              <div class="backup-path-grid">
+                <div class="field"><label for="db-source">源目录</label>
+                  <div class="path-pick"><input class="input" id="db-source" placeholder="/mnt/bcache0/data" readonly /><button class="btn sm" type="button" data-pick="db-source">选择</button></div></div>
+                <div class="field">
+                  <label for="db-target">目标目录 <span class="label-note">SSH 填 user@host:/path</span></label>
+                  <div class="path-pick"><input class="input" id="db-target" placeholder="/mnt/backup" readonly /><button class="btn sm" type="button" data-pick="db-target">选择</button></div>
+                </div>
+              </div>
             </div>
-            <div class="bench-form" style="grid-template-columns:auto 160px 130px 1fr;margin-top:12px;align-items:end">
-              <div class="field" style="align-self:center">
+            <div class="backup-schedule-row">
+              <div class="field">
+                <label>定时计划</label>
                 <label class="check-row"><input type="checkbox" id="db-sched-on" />
                   <span>启用定时备份</span></label>
               </div>
@@ -648,9 +653,12 @@
                 </select></div>
               <div class="field"><label for="db-sched-time">时间</label>
                 <input class="input" id="db-sched-time" type="time" value="02:00" /></div>
-              <div class="field" style="align-self:end">
-                <button class="btn sm" id="btn-db-sched-save">保存定时</button>
-                <span class="tiny" id="db-sched-state" style="margin-left:8px"></span>
+              <div class="field">
+                <label>计划操作</label>
+                <div class="backup-schedule-actions">
+                  <button class="btn sm" id="btn-db-sched-save">保存定时</button>
+                  <span class="tiny" id="db-sched-state"></span>
+                </div>
               </div>
             </div>
 
