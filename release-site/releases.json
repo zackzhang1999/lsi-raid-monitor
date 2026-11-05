@@ -1,6 +1,15 @@
 {
-  "latest": "1.10.28",
+  "latest": "1.10.30",
   "releases": [
+    {
+      "version": "1.10.30",
+      "date": "2026-11-05",
+      "file": "datamax-lsi-1.10.30.tar.gz",
+      "sha256": "351e6f6e66a6e4ff7670882a1a9bb94c2fbfc51f0e1aab1d449613b7a5b6aaf0",
+      "size": 2678749,
+      "notes": "数据备份与恢复表单对齐优化",
+      "commit": "bd95a9f"
+    },
     {
       "version": "1.10.28",
       "date": "2026-11-04",
