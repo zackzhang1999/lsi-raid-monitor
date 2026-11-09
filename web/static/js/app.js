@@ -6081,6 +6081,8 @@ let _cmdkItems = [];
 let _cmdkIndex = 0;
 let _taskFilter = 'all';
 let _taskExpandedId = null;
+let _taskListSignature = '';
+const _taskOpenSections = new Map();
 
 function cmdkIsOpen() {
   const el = $('#cmdk');
@@ -6328,6 +6330,16 @@ async function renderTaskList() {
   }
   const tasks = d.tasks || [];
   applyTaskBadge(d.stats || {});
+  const signature = JSON.stringify({
+    filter: _taskFilter,
+    expanded: _taskExpandedId,
+    tasks: tasks.map(t => [
+      t.id, t.status, t.progress, t.title, t.target, t.message,
+      t.created_at, t.attempt, t.retryable,
+    ]),
+  });
+  if (signature === _taskListSignature) return;
+  _taskListSignature = signature;
 
   if (!tasks.length) {
     box.innerHTML = stateBlock('empty', '还没有任务记录', '执行一次阵列或磁盘操作后，这里会留下完整留痕。');
@@ -6362,7 +6374,7 @@ async function renderTaskList() {
 
   $$('#task-list .task-card').forEach(card =>
     card.addEventListener('click', ev => {
-      if (ev.target.closest && ev.target.closest('button')) return;
+      if (ev.target.closest && ev.target.closest('.task-detail, button')) return;
       toggleTaskDetail(Number(card.dataset.id));
     })
   );
@@ -6376,7 +6388,12 @@ async function renderTaskList() {
 }
 
 function toggleTaskDetail(id) {
-  _taskExpandedId = _taskExpandedId === id ? null : id;
+  if (_taskExpandedId === id) {
+    _taskExpandedId = null;
+    _taskOpenSections.delete(String(id));
+  } else {
+    _taskExpandedId = id;
+  }
   renderTaskList();
 }
 
@@ -6395,6 +6412,7 @@ async function renderTaskDetailInto(el, id) {
   const params = t.params && Object.keys(t.params).length
     ? JSON.stringify(t.params, null, 1)
     : '—';
+  const openSections = _taskOpenSections.get(String(id)) || new Set();
   el.innerHTML = `
     <dl class="kv task-kv">
       <dt>操作者</dt><dd>${esc(t.operator || '—')}</dd>
@@ -6403,8 +6421,8 @@ async function renderTaskDetailInto(el, id) {
       <dt>耗时</dt><dd>${esc(dur || '—')}</dd>
       <dt>命令</dt><dd class="mono">${esc(t.command || '—')}</dd>
     </dl>
-    <details class="task-sect"><summary>参数</summary><pre class="smart-pre">${esc(params)}</pre></details>
-    ${t.output ? `<details class="task-sect"><summary>执行输出</summary><pre class="smart-pre">${esc(t.output)}</pre></details>` : ''}
+    <details class="task-sect" data-task-section="params"${openSections.has('params') ? ' open' : ''}><summary>参数</summary><pre class="smart-pre">${esc(params)}</pre></details>
+    ${t.output ? `<details class="task-sect" data-task-section="output"${openSections.has('output') ? ' open' : ''}><summary>执行输出</summary><pre class="smart-pre">${esc(t.output)}</pre></details>` : ''}
     ${t.status === 'failed' && t.retryable
       ? `<div class="task-actions"><button class="btn sm" data-retry="${esc(t.id)}">重试此任务</button>
          <span class="tiny">该操作可安全重跑</span></div>`
@@ -6412,6 +6430,19 @@ async function renderTaskDetailInto(el, id) {
     ${t.status === 'failed' && !t.retryable
       ? '<div class="tiny task-hint">此操作不可重试：重复执行可能造成额外影响，请人工确认当前状态后再手动操作。</div>'
       : ''}`;
+  el.querySelectorAll('.task-sect').forEach(section => {
+    section.addEventListener('toggle', () => {
+      const key = section.dataset.taskSection;
+      if (!key) return;
+      let state = _taskOpenSections.get(String(id));
+      if (!state) {
+        state = new Set();
+        _taskOpenSections.set(String(id), state);
+      }
+      if (section.open) state.add(key);
+      else state.delete(key);
+    }, { passive: true });
+  });
   const rb = el.querySelector('[data-retry]');
   if (rb) {
     rb.addEventListener('click', async ev => {
