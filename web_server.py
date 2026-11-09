@@ -73,7 +73,7 @@ import data_backup_mgr
 PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_DIR = Path(os.environ.get("LSI_DATA_DIR", str(PROJECT_ROOT / "data")))
 
-VERSION = "1.10.32"
+VERSION = "1.10.33"
 AUTH_MODE = os.environ.get("LSI_AUTH_MODE", "pam")
 
 LOCAL_STORCLI = PROJECT_ROOT / "storcli64"
@@ -3006,6 +3006,7 @@ task_engine.register_info("disk_erase_start", "磁盘擦除")
 # RAID 操作 → 任务类型 与 中文名
 # 属于日常运维的 RAID 目标：只扫描、不改结构
 OPERATE_RAID_TARGETS = {"patrolread", "cc"}
+CC_SUPPORTED_RAID = {"RAID1", "RAID1E", "RAID5", "RAID6", "RAID10", "RAID50", "RAID60"}
 
 RAID_ACTION_LABEL = {
     "patrolread": "巡读",
@@ -4853,6 +4854,30 @@ def api_raid_action():
     if "{vd}" in RAID_ACTIONS[target][action] and vd is None:
         return jsonify(ok=False, error="缺少 VD 编号"), 400
     ctrl_id = _resolve_ctrl(data)
+    if target == "cc" and action == "start":
+        vds, err = _vd_detail_for_controller(ctrl_id)
+        if err:
+            return jsonify(ok=False, error=f"无法读取虚拟盘信息：{err}"), 503
+        selected = next((item for item in vds if _to_int(item.get("vd")) == vd), None)
+        if not selected:
+            return jsonify(ok=False, error=f"控制器 C{ctrl_id} 上不存在 VD {vd}"), 404
+        raid_type = re.sub(r"[\s_-]+", "", str(selected.get("type") or "").upper())
+        if raid_type not in CC_SUPPORTED_RAID:
+            message = (
+                f"VD {vd} 的类型是 {selected.get('type') or '未知'}，没有镜像或校验数据，"
+                "控制器不支持一致性检查。RAID0 请使用 SMART、介质错误监控和定期备份保障数据安全。"
+            )
+            lsi_alert.log_event(
+                "warning",
+                f"C{ctrl_id} VD {vd} 一致性检查被阻止：{message}（{session.get('username', '')}）",
+            )
+            return jsonify(ok=False, error=message, raid_type=selected.get("type")), 400
+        operation = str(selected.get("current_operation") or "None").strip()
+        if operation and operation.lower() != "none":
+            return jsonify(
+                ok=False,
+                error=f"VD {vd} 当前正在执行「{operation}」，请等待后台任务结束后再启动一致性检查。",
+            ), 409
     cmd = RAID_ACTIONS[target][action].format(
         ctrl=f"/c{ctrl_id}", vd=vd if vd is not None else 0
     )

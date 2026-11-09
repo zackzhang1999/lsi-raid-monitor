@@ -1194,6 +1194,14 @@ function renderTopology(st) {
 }
 
 /* ---------- 巡读 / 一致性检查 ---------- */
+function ccSupportedRaid(type) {
+  const normalized = String(type || '').toUpperCase().replace(/[\s_-]/g, '');
+  return new Set([
+    'RAID1', 'RAID1E', 'RAID5', 'RAID6',
+    'RAID10', 'RAID50', 'RAID60',
+  ]).has(normalized);
+}
+
 function renderMaintenance(st) {
   const wrap = $('#maint-cards');
 
@@ -1226,17 +1234,32 @@ function renderMaintenance(st) {
     </div>` : '';
 
   const vdsOfCur = (state.vds || []).filter(v => Number(v.ctrl != null ? v.ctrl : 0) === cur);
-  const vdOpts = vdsOfCur.map(v =>
+  const ccVds = vdsOfCur.filter(v => ccSupportedRaid(v.type));
+  const unsupportedCcVds = vdsOfCur.filter(v => !ccSupportedRaid(v.type));
+  const vdOpts = ccVds.map(v =>
     `<option value="${esc(v.ctrl != null ? v.ctrl : 0)}:${esc(v.vd)}">C${esc(v.ctrl != null ? v.ctrl : 0)} · VD ${esc(v.vd)}（${esc(v.dg_vd || '')} ${esc(v.name || '')}）</option>`).join('');
+  let ccNote = '';
+  if (!vdsOfCur.length) {
+    ccNote = '正在读取虚拟盘信息，暂不能启动一致性检查。';
+  } else if (!ccVds.length) {
+    const types = [...new Set(unsupportedCcVds.map(v => String(v.type || '未知')))]
+      .filter(Boolean).join('、');
+    ccNote = `${types || '当前阵列'} 没有数据冗余，控制器不支持一致性检查。RAID0 主要依靠 SMART、介质错误和定期备份保障数据安全。`;
+  } else if (unsupportedCcVds.length) {
+    ccNote = 'RAID0 等无冗余阵列不会出现在列表中；请选择 RAID1/5/6/10/50/60 阵列。';
+  }
+  const ccState = !vdsOfCur.length
+    ? ((m.consistency_check && m.consistency_check.state) || '读取中')
+    : (!ccVds.length ? '不适用' : ((m.consistency_check && m.consistency_check.state) || '—'));
   const ccOps = state.isAdmin ? `
     <div class="maint-ops">
       ${controllers.length > 1 ? '' : ''}
-      <select class="select" id="sel-cc-vd">${vdOpts || '<option value="">无虚拟盘</option>'}</select>
-      <button class="btn sm" id="btn-cc-start" ${vdsOfCur.length ? '' : 'disabled'}>启动</button>
-      <button class="btn sm danger" id="btn-cc-stop" ${vdsOfCur.length ? '' : 'disabled'}>停止</button>
+      <select class="select" id="sel-cc-vd" ${ccVds.length ? '' : 'disabled'}>${vdOpts || '<option value="">无可检查的冗余阵列</option>'}</select>
+      <button class="btn sm" id="btn-cc-start" ${ccVds.length ? '' : 'disabled'}>启动</button>
+      <button class="btn sm danger" id="btn-cc-stop" ${ccVds.length ? '' : 'disabled'}>停止</button>
     </div>` : '';
 
-  const mk = (title, eyebrow, o, opsHtml) => `
+  const mk = (title, eyebrow, o, opsHtml, noteHtml) => `
     <div class="card">
       <div class="card-head">
         <div><div class="eyebrow">${eyebrow}</div><strong>${title}</strong></div>
@@ -1248,11 +1271,13 @@ function renderMaintenance(st) {
         <dt>下次执行</dt><dd>${esc((o && o.next) || '—')}</dd>
         <dt>迭代次数</dt><dd>${o && o.iterations != null ? esc(o.iterations) : '—'}</dd>
       </dl>
+      ${noteHtml ? `<div class="maint-note">${esc(noteHtml)}</div>` : ''}
       ${opsHtml}
     </div>`;
   wrap.innerHTML =
     mk('巡读 (Patrol Read)', 'Patrol read', m.patrol_read, prOps) +
-    mk('一致性检查', 'Consistency check', m.consistency_check, ccOps);
+    mk('一致性检查', 'Consistency check',
+      Object.assign({}, m.consistency_check || {}, { state: ccState }), ccOps, ccNote);
 
   if (state.isAdmin) {
     const maintCtrlSel = $('#sel-maint-ctrl');
