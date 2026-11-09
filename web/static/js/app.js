@@ -1224,13 +1224,27 @@ function renderMaintenance(st) {
       ).join('')}</select>`
     : '';
 
+  const disksOfCur = (st.physical_disks || []).filter(d => Number(d.ctrl != null ? d.ctrl : 0) === cur);
+  const allDisksAreSsd = disksOfCur.length > 0 && disksOfCur.every(d => String(d.med || '').toUpperCase() === 'SSD');
+  const pr = (m && m.patrol_read) || {};
+  const prSsdEnabled = String(pr.ssd || '').toLowerCase() === 'enabled';
+  const prUnavailable = allDisksAreSsd && String(pr.ssd || '') !== '' && !prSsdEnabled;
+  const prActive = /^active/i.test(String(pr.state || ''));
+  const prNote = prUnavailable
+    ? '当前控制器只连接了 SSD，但“SSD 巡读”未启用，所以没有物理盘能参与巡读。可先启用 SSD 巡读，或保持该功能关闭并使用 SMART 与备份。'
+    : (allDisksAreSsd && prSsdEnabled
+      ? '当前控制器只连接了 SSD；SSD 巡读已启用，巡读可以覆盖这些磁盘。'
+      : '');
   const prOps = state.isAdmin ? `
     <div class="maint-ops">
       ${ctrlPicker}
-      <button class="btn sm" data-pr="start">启动</button>
+      <button class="btn sm" data-pr="start" ${prUnavailable || prActive ? 'disabled' : ''}>启动</button>
       <button class="btn sm" data-pr="pause">暂停</button>
       <button class="btn sm" data-pr="resume">恢复</button>
       <button class="btn sm danger" data-pr="stop">停止</button>
+      ${String(pr.ssd || '') !== ''
+        ? `<button class="btn sm${prSsdEnabled ? ' ghost' : ''}" data-pr-ssd="${prSsdEnabled ? 'off' : 'on'}">${prSsdEnabled ? '排除 SSD 巡读' : '启用 SSD 巡读'}</button>`
+        : ''}
     </div>` : '';
 
   const vdsOfCur = (state.vds || []).filter(v => Number(v.ctrl != null ? v.ctrl : 0) === cur);
@@ -1270,12 +1284,15 @@ function renderMaintenance(st) {
         <dt>状态</dt><dd>${esc((o && o.state) || '—')}</dd>
         <dt>下次执行</dt><dd>${esc((o && o.next) || '—')}</dd>
         <dt>迭代次数</dt><dd>${o && o.iterations != null ? esc(o.iterations) : '—'}</dd>
+        ${o && o.ssd ? `<dt>SSD 巡读</dt><dd>${o.ssd === 'Enabled'
+          ? '<span class="badge ok">已启用</span>'
+          : '<span class="badge">未启用</span>'}</dd>` : ''}
       </dl>
       ${noteHtml ? `<div class="maint-note">${esc(noteHtml)}</div>` : ''}
       ${opsHtml}
     </div>`;
   wrap.innerHTML =
-    mk('巡读 (Patrol Read)', 'Patrol read', m.patrol_read, prOps) +
+    mk('巡读 (Patrol Read)', 'Patrol read', pr, prOps, prNote) +
     mk('一致性检查', 'Consistency check',
       Object.assign({}, m.consistency_check || {}, { state: ccState }), ccOps, ccNote);
 
@@ -1293,6 +1310,13 @@ function renderMaintenance(st) {
       raidAction({ target: 'patrolread', action, ctrl: cur }, `巡读：${text}`,
         `确认对控制器 C${cur} ${text}巡读 (Patrol Read)？`, action === 'stop');
     }));
+    $('[data-pr-ssd]', wrap)?.addEventListener('click', ev => {
+      const enable = ev.currentTarget.dataset.prSsd === 'on';
+      raidAction({ target: 'patrolread', action: enable ? 'ssd_on' : 'ssd_off', ctrl: cur },
+        enable ? '启用 SSD 巡读' : '排除 SSD 巡读',
+        `确认${enable ? '允许' : '不再允许'}控制器 C${cur} 将 SSD 纳入巡读范围？该操作只改变巡读范围，不会重建或擦除阵列。`,
+        false);
+    });
     const ccVd = () => {
       const v = $('#sel-cc-vd').value;
       if (v === '') return null;

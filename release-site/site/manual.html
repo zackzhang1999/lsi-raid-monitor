@@ -240,6 +240,9 @@ curl -I http://127.0.0.1:5200/</code></pre>
         <h3>维护计划</h3>
         <p>巡读、一致性检查和 SMART 自检可以按日、周、月安排。执行前确认业务峰谷，并在控制器策略中设置合理的重建和巡检速率限制。
           RAID0 没有镜像或校验数据，控制器不允许执行一致性检查，界面会显示“不适用”；这类阵列应依靠 SMART、介质错误监控和备份保障数据安全。</p>
+        <p>如果控制器只连接 SSD，巡读还要求开启“SSD 巡读”。未开启时 StorCLI 可能返回
+          <code>no physical disk(s) available</code> 或 <code>ErrCd 88</code>；可在巡读卡片中点击
+          “启用 SSD 巡读”，无需修改阵列或磁盘数据。</p>
       </section>
 
       <section id="alerts-reports">

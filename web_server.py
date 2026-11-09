@@ -73,7 +73,7 @@ import data_backup_mgr
 PROJECT_ROOT = Path(__file__).resolve().parent
 BASE_DIR = Path(os.environ.get("LSI_DATA_DIR", str(PROJECT_ROOT / "data")))
 
-VERSION = "1.10.33"
+VERSION = "1.10.34"
 AUTH_MODE = os.environ.get("LSI_AUTH_MODE", "pam")
 
 LOCAL_STORCLI = PROJECT_ROOT / "storcli64"
@@ -1094,6 +1094,7 @@ def build_status() -> dict:
                 "state": pr.get("pr_state", ""),
                 "next": pr.get("pr_next", ""),
                 "iterations": _to_int(pr.get("pr_iterations"), 0),
+                "ssd": pr.get("pr_ssd", ""),
             },
             "consistency_check": {
                 "mode": cc.get("cc_mode", ""),
@@ -2901,6 +2902,8 @@ _register_storcli_task("patrolread_start", "启动巡读", retryable=True)
 _register_storcli_task("patrolread_stop", "停止巡读", retryable=True)
 _register_storcli_task("patrolread_pause", "暂停巡读", retryable=True)
 _register_storcli_task("patrolread_resume", "恢复巡读", retryable=True)
+_register_storcli_task("patrolread_ssd_on", "启用 SSD 巡读", retryable=True)
+_register_storcli_task("patrolread_ssd_off", "排除 SSD 巡读", retryable=True)
 _register_storcli_task("ctrl_policy_set", "修改控制器策略", retryable=True)
 _register_storcli_task("vd_policy_set", "修改虚拟盘策略", retryable=True)
 _register_storcli_task("phy_reset", "复位 PHY 错误计数", retryable=True)
@@ -3021,6 +3024,8 @@ TASK_KIND_BY_ACTION = {
     ("patrolread", "stop"): "patrolread_stop",
     ("patrolread", "pause"): "patrolread_pause",
     ("patrolread", "resume"): "patrolread_resume",
+    ("patrolread", "ssd_on"): "patrolread_ssd_on",
+    ("patrolread", "ssd_off"): "patrolread_ssd_off",
     ("cc", "start"): "cc_start",
     ("cc", "stop"): "cc_stop",
     ("vd_init", "start"): "vd_init",
@@ -4813,6 +4818,8 @@ RAID_ACTIONS = {
         "stop": "{ctrl} stop patrolread",
         "pause": "{ctrl} pause patrolread",
         "resume": "{ctrl} resume patrolread",
+        "ssd_on": "{ctrl} set patrolread includessds=on",
+        "ssd_off": "{ctrl} set patrolread includessds=off",
     },
     "cc": {
         "start": "{ctrl}/v{vd} start cc",
@@ -4878,11 +4885,40 @@ def api_raid_action():
                 ok=False,
                 error=f"VD {vd} 当前正在执行「{operation}」，请等待后台任务结束后再启动一致性检查。",
             ), 409
+    if target == "patrolread" and action == "start":
+        pr = lsi_collectd.collect_patrol_read(ctrl_id)
+        if not pr:
+            return jsonify(ok=False, error=f"无法读取控制器 C{ctrl_id} 的巡读状态"), 503
+        if str(pr.get("pr_state") or "").lower().startswith("active"):
+            return jsonify(ok=False, error=f"控制器 C{ctrl_id} 的巡读已经在执行"), 409
+        disks = [
+            d for d in build_status().get("physical_disks", [])
+            if _to_int(d.get("ctrl"), 0) == ctrl_id
+        ]
+        if not disks:
+            return jsonify(ok=False, error=f"控制器 C{ctrl_id} 下没有可用于巡读的物理盘"), 409
+        all_ssd = all(str(d.get("med") or "").upper() == "SSD" for d in disks)
+        pr_ssd_enabled = str(pr.get("pr_ssd") or "").lower() == "enabled"
+        if all_ssd and not pr_ssd_enabled:
+            message = (
+                f"控制器 C{ctrl_id} 当前只连接了 SSD，且 SSD 巡读未启用，"
+                "因此没有物理盘能参与巡读。请先在巡读卡片中启用 SSD 巡读。"
+            )
+            lsi_alert.log_event(
+                "warning",
+                f"巡读被阻止：{message}（{session.get('username', '')}）",
+            )
+            return jsonify(ok=False, error=message, feature="patrolread_ssd"), 400
     cmd = RAID_ACTIONS[target][action].format(
         ctrl=f"/c{ctrl_id}", vd=vd if vd is not None else 0
     )
+    action_label = RAID_ACTION_LABEL.get(target, target)
+    if target == "patrolread" and action == "ssd_on":
+        action_label = "启用 SSD 巡读"
+    elif target == "patrolread" and action == "ssd_off":
+        action_label = "排除 SSD 巡读"
     desc = (
-        f"C{ctrl_id} {RAID_ACTION_LABEL.get(target, target)}"
+        f"C{ctrl_id} {action_label}"
         + (f" (v{vd})" if vd is not None else "")
     )
     # 改为任务化：CC / 初始化这类操作可能跑几十分钟，同步等待会把

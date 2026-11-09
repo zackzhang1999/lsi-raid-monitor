@@ -1037,6 +1037,7 @@ def collect_patrol_read(ctrl_id: int = 0) -> dict | None:
             "pr_iterations": _to_int(p.get("PR iterations completed", 0)),
             "pr_next": p.get("PR Next Start time", ""),
             "pr_state": p.get("PR Current State", ""),
+            "pr_ssd": p.get("PR on SSD", ""),
             "pr_max_concurrent": _to_int(p.get("PR MaxConcurrentPd", 1)),
         }
     except Exception as e:
@@ -1242,6 +1243,7 @@ def _run_collection(now: datetime, force: bool = False, quick: bool = False):
         "pr_iterations",
         "pr_next",
         "pr_state",
+        "pr_ssd",
         "pr_max_concurrent",
     ]
     cc_fields = [
