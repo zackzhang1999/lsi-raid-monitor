@@ -1,6 +1,15 @@
 {
-  "latest": "1.10.31",
+  "latest": "1.10.32",
   "releases": [
+    {
+      "version": "1.10.32",
+      "date": "2026-11-09",
+      "file": "datamax-lsi-1.10.32.tar.gz",
+      "sha256": "4870bf90cb438d7e972681897d7fdc2ab4ce34069d76daebf4ef49665bfae40f",
+      "size": 2681107,
+      "notes": "修复任务参数与执行输出无法保持展开",
+      "commit": "a8c4254"
+    },
     {
       "version": "1.10.31",
       "date": "2026-11-05",
