@@ -1,6 +1,15 @@
 {
-  "latest": "1.10.32",
+  "latest": "1.10.33",
   "releases": [
+    {
+      "version": "1.10.33",
+      "date": "2026-11-09",
+      "file": "datamax-lsi-1.10.33.tar.gz",
+      "sha256": "56bba4d8d2f053ce9bcf5d2a71fe31ad371a642507547da14ce4b6daa185d3d9",
+      "size": 2682043,
+      "notes": "修正 RAID0 一致性检查误报与失败任务",
+      "commit": "83ecfeb"
+    },
     {
       "version": "1.10.32",
       "date": "2026-11-09",
