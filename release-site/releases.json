@@ -1,6 +1,15 @@
 {
-  "latest": "1.10.33",
+  "latest": "1.10.34",
   "releases": [
+    {
+      "version": "1.10.34",
+      "date": "2026-11-09",
+      "file": "datamax-lsi-1.10.34.tar.gz",
+      "sha256": "26566461e0197541380eb0b8c118f9f072a0812246beda67a04d735458392a75",
+      "size": 2682989,
+      "notes": "修复全 SSD 控制器巡读 ErrCd 88，并新增 SSD 巡读开关",
+      "commit": "2231e7f"
+    },
     {
       "version": "1.10.33",
       "date": "2026-11-09",
