@@ -1712,9 +1712,40 @@ table.data .admin-col.col-hidden { display: none; }
   font-family: var(--font-mono);
   font-size: 11px;
 }
+.vd-op-summary {
+  display: inline-flex;
+  max-width: 320px;
+  height: 24px;
+  align-items: center;
+  gap: 7px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--ink-soft);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+.vd-op-dot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--warn);
+}
 .op-name {
   font-weight: 600;
   color: var(--foreground);
+  white-space: nowrap;
+}
+.op-live {
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: var(--warn-bg);
+  color: var(--warn);
+  font-size: 10px;
+  font-weight: 700;
   white-space: nowrap;
 }
 .migrate-bar {

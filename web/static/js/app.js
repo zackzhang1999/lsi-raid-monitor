@@ -212,6 +212,8 @@ const state = {
   nfsLoaded: false,
   refreshTimer: null,
   realtimeTimer: null,
+  vdProgressTimer: null,
+  vdDetailLoading: false,
   bcacheTrendDevice: null,
   bcacheTrendTimer: null,
   raidSel: new Set(), // 勾选用于创建阵列的磁盘，键为 "eid:slot"
@@ -1362,6 +1364,13 @@ function raidAction(body, title, desc, danger) {
     }
     await loadStatus();
     await loadVdDetail();
+    if (payload.target === 'vd_init' && payload.action === 'start') {
+      [2000, 6000, 15000, 30000].forEach(delay => {
+        setTimeout(() => {
+          if (state.view === 'overview') loadVdDetail().catch(() => {});
+        }, delay);
+      });
+    }
   });
 }
 
@@ -1409,9 +1418,12 @@ function stopTaskPoll() {
 
 /* ---------- 虚拟磁盘（vd_detail） ---------- */
 async function loadVdDetail() {
+  if (state.vdDetailLoading) return;
+  state.vdDetailLoading = true;
   let data;
   try { data = await api('/api/vd_detail'); }
   catch (e) { return; }
+  finally { state.vdDetailLoading = false; }
   state.vds = data.vds || [];
   renderVirtualDisks();
   if (state.status) renderMaintenance(state.status); // VD 列表就绪后重绘维护卡的 VD 下拉
@@ -1430,30 +1442,78 @@ function opLabel(op) {
 }
 
 function currentOpDisplay(v) {
-  const mg = v.migrate_progress != null && v.migrate_progress > 0;
-  if (mg) {
-    const name = opLabel(v.migrate_operation || 'Migrate');
-    return `<span class="op-cell">
-      <span class="op-name">${esc(name)}</span>
-      <span class="migrate-bar"><i style="width:${v.migrate_progress}%"></i></span>
-      <span class="migrate-pct">${v.migrate_progress}%</span>
-      ${v.migrate_eta ? `<span class="migrate-eta">${esc(v.migrate_eta)}</span>` : ''}
-    </span>`;
-  }
-  const raw = String(v.current_operation || 'None');
-  if (!raw || raw === 'None') return '<span class="muted">—</span>';
-  const m = raw.match(/^([^(]+?)\s*(?:\((\d+)%\))?/);
-  const name = opLabel((m && m[1] || raw).trim());
-  const pct = m && m[2] ? m[2] : null;
+  const op = vdOperationInfo(v);
+  if (!op || !op.active) return '<span class="muted">—</span>';
+  const pct = op.progress == null ? null : Math.max(0, Math.min(100, op.progress));
   return `<span class="op-cell">
-    <span class="op-name">${esc(name)}</span>
+    <span class="op-name">${esc(op.name)}</span>
+    ${pct != null ? `<span class="migrate-bar"><i style="width:${pct}%"></i></span>` : '<span class="op-live">进行中</span>'}
     ${pct != null ? `<span class="migrate-pct">${pct}%</span>` : ''}
+    ${op.eta ? `<span class="migrate-eta">${esc(op.eta)}</span>` : ''}
   </span>`;
+}
+
+function vdOperationInfo(v) {
+  const migrateStatus = String(v.migrate_status || '');
+  if (v.migrate_operation && v.migrate_progress != null) {
+    const active = /in progress|paused/i.test(migrateStatus);
+    return {
+      name: opLabel(v.migrate_operation),
+      progress: Number(v.migrate_progress),
+      eta: v.migrate_eta || '',
+      active,
+    };
+  }
+  const raw = String(v.current_operation || '').trim();
+  if (!raw || /^none$/i.test(raw) || /not in progress/i.test(raw)) return null;
+  const pctMatch = raw.match(/\((\d+)%\)/);
+  const name = opLabel(raw.replace(/\s*\(\d+%\)\s*$/, '').trim());
+  return {
+    name,
+    progress: pctMatch ? Number(pctMatch[1]) : null,
+    eta: '',
+    active: !/completed|aborted|failed/i.test(raw),
+  };
+}
+
+function syncVdProgressPoll() {
+  const active = (state.vds || []).some(v => vdOperationInfo(v)?.active);
+  if (active && !state.vdProgressTimer) {
+    state.vdProgressTimer = setInterval(() => {
+      if (!document.hidden && state.view === 'overview') loadVdDetail().catch(() => {});
+    }, 8000);
+  } else if (!active && state.vdProgressTimer) {
+    clearInterval(state.vdProgressTimer);
+    state.vdProgressTimer = null;
+  }
+}
+
+function renderVdOpSummary(vds) {
+  const box = $('#vd-op-summary');
+  if (!box) return;
+  const active = (vds || [])
+    .map(v => ({ vd: v, op: vdOperationInfo(v) }))
+    .filter(x => x.op && x.op.active);
+  if (!active.length) {
+    box.classList.add('hidden');
+    box.innerHTML = '';
+    return;
+  }
+  const first = active[0];
+  const pct = first.op.progress == null ? '' : ` ${Math.max(0, Math.min(100, first.op.progress))}%`;
+  box.classList.remove('hidden');
+  box.innerHTML = `<span class="vd-op-dot"></span>
+    <span>${active.length > 1 ? `${active.length} 个后台操作` : `${esc(first.op.name)}${pct}`}</span>`;
+  box.title = active.map(x =>
+    `C${x.vd.ctrl != null ? x.vd.ctrl : 0} / VD ${x.vd.vd}：${x.op.name}${x.op.progress == null ? '' : ' ' + x.op.progress + '%'}`
+  ).join('\n');
 }
 
 function renderVirtualDisks() {
   const vds = state.vds || [];
   const tb = $('#vd-table tbody');
+  renderVdOpSummary(vds);
+  syncVdProgressPoll();
   const hideOps = !state.isAdmin;
   $$('#vd-table .admin-col').forEach(el => el.classList.toggle('col-hidden', hideOps));
   if (!vds.length) { tb.innerHTML = '<tr><td colspan="10" class="muted">无虚拟磁盘</td></tr>'; return; }
