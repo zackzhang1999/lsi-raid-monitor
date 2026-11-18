@@ -2,38 +2,38 @@
 
 ## Visual world
 
-The release station looks like a field dossier assembled beside a running
-storage appliance: deep forest rails, warm document surfaces, fine rules,
-tabular coordinates, and one acid-green signal color. Real product screenshots
-are the primary material.
+The release station follows the supplied SYSMAX release reference: a warm
+editorial canvas, near-black technical ink, one burnt-orange signal color,
+compact 1240px layouts, a split product hero, restrained feature cards and a
+dark download panel. Real product screenshots remain the primary material.
 
 ## Tokens
 
-- Forest: `#0b1310`
-- Forest raised: `#14211c`
-- Paper: `#f1f0eb`
-- Paper raised: `#fbfaf7`
-- Ink: `#17201e`
-- Ink secondary: `#59655f`
-- Signal: `#d9f07b`
-- Teal: `#55cdb5`
-- Warning: `#d5a452`
-- Danger: `#d97b6e`
-- Border on paper: `rgba(23,32,30,.14)`
-- Border on forest: `rgba(255,255,255,.11)`
-- Radius: 8px controls, 14px surfaces
+- Canvas: `#f4f1ea`
+- Paper: `#fffdfa`
+- Ink: `#12161b`
+- Ink secondary: `#3d454e`
+- Ink muted: `#737b84`
+- Signal: `#c96835`
+- Signal light: `#e7a06b`
+- Dark panel: `#0b0f14`
+- Success: `#4f8d64`
+- Border on paper: `#ded9cf`
+- Border on dark: `rgba(255,255,255,.10)`
+- Radius: 9px controls, 18px surfaces
 - UI face: self-hosted DM Sans
 - Data face: self-hosted JetBrains Mono
 
 ## Composition
 
-The landing page opens as an operations wall. Release facts and the primary
-download action sit above a full-width, real 2K product screenshot. Capability
-sections alternate between evidence-led rows and a dark installation runway.
-The manual is a separate reading surface with a persistent contents rail.
+The landing page opens with a two-column editorial hero: copy and measurable
+release facts on the left, a browser-framed real product screenshot on the
+right. A compact capability marquee leads into a 3x2 feature grid and a
+screenshot gallery. Download and installation are grouped in one dark panel;
+release history closes the page as a compact table.
 
 ## Motion
 
-One restrained screenshot settle on first load, plus 160–220 ms state
+One restrained browser settle on first load, plus 180–220 ms hover and state
 transitions. Content is visible without JavaScript, and reduced-motion users
 receive no entrance movement.
