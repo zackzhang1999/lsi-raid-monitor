@@ -25,5 +25,12 @@ bash publish.sh
 another host. The publishing key is restricted by `rrsync -wo` to the release
 directory and cannot install system packages or start application services.
 
+When only the landing page or manual changes, publish the static site without
+rebuilding the current application archive:
+
+```bash
+DATAMAX_SKIP_BUILD=1 bash publish.sh
+```
+
 The public package intentionally does not contain Broadcom `storcli64`.
 Provide a licensed copy through `install.sh --storcli-source`.

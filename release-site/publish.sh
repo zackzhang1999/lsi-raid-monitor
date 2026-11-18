@@ -8,10 +8,14 @@ TARGET="${DATAMAX_RELEASE_TARGET:-datamax-release@hub.amax.xyz:/}"
 SSH_KEY="${DATAMAX_RELEASE_SSH_KEY:-/root/.ssh/datamax-release_ed25519}"
 NOTES="${DATAMAX_RELEASE_NOTES:-正式发布}"
 
-python3 "$SITE_DIR/build_release.py" \
-  --source "$PROJECT_ROOT" \
-  --site "$SITE_DIR" \
-  --notes "$NOTES"
+if [[ "${DATAMAX_SKIP_BUILD:-0}" == "1" ]]; then
+  echo "仅同步发布站，不重新生成安装包"
+else
+  python3 "$SITE_DIR/build_release.py" \
+    --source "$PROJECT_ROOT" \
+    --site "$SITE_DIR" \
+    --notes "$NOTES"
+fi
 
 SSH_ARGS=(-o StrictHostKeyChecking=accept-new)
 if [[ -n "$SSH_KEY" ]]; then
